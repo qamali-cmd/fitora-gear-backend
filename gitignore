@@ -1,0 +1,11 @@
+# Huwag isama sa GitHub ang mga ito
+
+# Dependencies (malaki, at ma-download ulit ng "npm install" anyway)
+node_modules/
+
+# Environment files (may laman itong password/secrets - HUWAG i-upload)
+.env
+
+# OS/editor files
+.DS_Store
+Thumbs.db

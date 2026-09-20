@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fitora Gear - Admin</title>
+<link rel="stylesheet" href="style.css">
+  <link rel="icon" tyope="image/png" href="logo.png">
+
+</head>
+<body>
+
+<!-- =========================================================
+     LOGIN SCREEN
+     Lumalabas ito kapag hindi pa naka-login.
+     ========================================================= -->
+<div id="loginScreen" class="login-screen">
+  <div class="login-card">
+    <!-- EDIT DITO: pangalan ng company at tagline -->
+    <h1>Fitora Gear</h1>
+    <p class="subtitle">Admin panel</p>
+
+    <form id="loginForm">
+      <label for="username">Username</label>
+      <input type="text" id="username" autocomplete="username" required>
+
+      <label for="password">Password</label>
+      <input type="password" id="password" autocomplete="current-password" required>
+
+      <button type="submit">Log in</button>
+      <p id="loginError" class="error-msg"></p>
+    </form>
+  </div>
+</div>
+
+<!-- =========================================================
+     ADMIN APP (Dashboard, Products, Categories, Orders)
+     Lumalabas ito pagkatapos ma-login.
+     ========================================================= -->
+<div id="adminApp" class="app-layout hidden">
+
+  <!-- Mobile menu toggle button -->
+  <button id="menuToggle" class="menu-toggle" aria-label="Toggle menu">&#9776;</button>
+
+  <!-- SIDEBAR -->
+  <aside id="sidebar" class="sidebar">
+    <!-- EDIT DITO: pangalan ng company sa sidebar -->
+    <h2>Fitora Gear <span class="admin-tag">ADMIN</span></h2>
+    <nav>
+      <a href="#dashboard" data-page="dashboard" class="nav-link active">Dashboard</a>
+      <a href="#products" data-page="products" class="nav-link">Products</a>
+      <a href="#categories" data-page="categories" class="nav-link">Categories</a>
+      <a href="#inventory" data-page="inventory" class="nav-link">Inventory</a>
+      <a href="#customers" data-page="customers" class="nav-link">Customers</a>
+      <a href="#orders" data-page="orders" class="nav-link">Orders</a>
+      <a href="#reports" data-page="reports" class="nav-link">Sales Reports</a>
+      <a href="#reviews" data-page="reviews" class="nav-link">Reviews</a>
+      <a href="#admins" data-page="admins" class="nav-link">Admins</a>
+    </nav>
+    <button id="logoutBtn" class="logout-btn">Log out</button>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-content">
+
+    <div class="topbar">  
+      <h1 id="pageTitle">Dashboard</h1>
+      <div class="topbar-right">
+        <div class="notif-wrap">
+          <button id="notifBtn" class="notif-btn">🔔<span id="notifBadge" class="notif-badge hidden">0</span></button>
+          <div id="notifDropdown" class="notif-dropdown hidden">
+            <h4>Notifications</h4>
+            <ul id="notifList" class="simple-list"><li>Loading...</li></ul>
+          </div>
+        </div>
+        <!-- EDIT DITO: papalitan ng totoong pangalan ng admin pagka-login -->
+        <span id="adminName" class="admin-name"></span>
+      </div>
+    </div>
+
+    <!-- ---------------- DASHBOARD PAGE ---------------- -->
+    <section id="page-dashboard" class="page active">
+      <div class="stats-row">
+        <div class="stat-card">
+          <h3>Total products</h3>
+          <div class="value" id="statTotalProducts">--</div>
+        </div>
+        <div class="stat-card">
+          <h3>Total orders</h3>
+          <div class="value" id="statTotalOrders">--</div>
+        </div>
+        <div class="stat-card">
+          <h3>Pending orders</h3>
+          <div class="value" id="statPendingOrders">--</div>
+        </div>
+        <div class="stat-card">
+          <h3>Revenue</h3>
+          <div class="value" id="statRevenue">--</div>
+        </div>
+      </div>
+
+      <div class="dashboard-columns">
+        <div class="card">
+          <h3>Low stock</h3>
+          <ul id="lowStockList" class="simple-list"><li>Loading...</li></ul>
+        </div>
+        <div class="card">
+          <h3>Recent orders</h3>
+          <ul id="recentOrdersList" class="simple-list"><li>Loading...</li></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------- PRODUCTS PAGE ---------------- -->
+    <section id="page-products" class="page">
+      <div class="section-header">
+        <h2>Products</h2>
+        <button id="addProductBtn" class="primary-btn">+ Add product</button>
+      </div>
+
+      <div class="filter-bar">
+        <input type="text" id="productSearch" placeholder="Search product name...">
+        <select id="productCategoryFilter">
+          <option value="all">All categories</option>
+        </select>
+        <select id="productSort">
+          <option value="default">Sort by...</option>
+          <option value="price_asc">Price: Low to high</option>
+          <option value="price_desc">Price: High to low</option>
+          <option value="stock_asc">Stock: Low to high</option>
+          <option value="stock_desc">Stock: High to low</option>
+        </select>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Category</th>
+              <th>Price</th>
+              <th>Stock</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="productsTableBody">
+            <tr><td colspan="6">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------------- CATEGORIES PAGE ---------------- -->
+    <section id="page-categories" class="page">
+      <div class="section-header">
+        <h2>Categories</h2>
+        <button id="addCategoryBtn" class="primary-btn">+ Add category</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Description</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="categoriesTableBody">
+            <tr><td colspan="3">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------------- INVENTORY PAGE ---------------- -->
+    <section id="page-inventory" class="page">
+      <div class="section-header">
+        <h2>Inventory</h2>
+        <select id="inventoryFilter" class="status-select">
+          <option value="all">All products</option>
+          <option value="low">Low stock only</option>
+        </select>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Product</th>
+              <th>Category</th>
+              <th>Current stock</th>
+              <th>Adjust</th>
+            </tr>
+          </thead>
+          <tbody id="inventoryTableBody">
+            <tr><td colspan="4">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h3>Recent stock changes</h3>
+        <ul id="stockLogsList" class="simple-list"><li>Loading...</li></ul>
+      </div>
+    </section>
+
+    <!-- ---------------- CUSTOMERS PAGE ---------------- -->
+    <section id="page-customers" class="page">
+      <div class="section-header">
+        <h2>Customers</h2>
+        <input type="text" id="customerSearch" placeholder="Search name or email..." style="max-width:260px;">
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Email</th>
+              <th>Phone</th>
+              <th>Orders</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="customersTableBody">
+            <tr><td colspan="6">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------------- ORDERS PAGE ---------------- -->
+    <section id="page-orders" class="page">
+      <div class="section-header">
+        <h2>Orders</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Order #</th>
+              <th>Customer</th>
+              <th>Total</th>
+              <th>Status</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody id="ordersTableBody">
+            <tr><td colspan="5">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------------- SALES REPORTS PAGE ---------------- -->
+    <section id="page-reports" class="page">
+      <div class="stats-row">
+        <div class="stat-card">
+          <h3>Completed orders</h3>
+          <div class="value" id="reportCompletedOrders">--</div>
+        </div>
+        <div class="stat-card">
+          <h3>Total revenue</h3>
+          <div class="value" id="reportTotalRevenue">--</div>
+        </div>
+        <div class="stat-card">
+          <h3>Avg. order value</h3>
+          <div class="value" id="reportAvgOrder">--</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h3>Sales, last 7 days</h3>
+        <div id="salesChart" class="bar-chart"></div>
+      </div>
+
+      <div class="dashboard-columns">
+        <div class="card">
+          <h3>Best-selling products</h3>
+          <ul id="bestSellersList" class="simple-list"><li>Loading...</li></ul>
+        </div>
+        <div class="card">
+          <h3>Revenue by category</h3>
+          <ul id="categoryRevenueList" class="simple-list"><li>Loading...</li></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------- REVIEWS PAGE ---------------- -->
+    <section id="page-reviews" class="page">
+      <div class="section-header">
+        <h2>Reviews</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Product</th>
+              <th>Customer</th>
+              <th>Rating</th>
+              <th>Comment</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="reviewsTableBody">
+            <tr><td colspan="6">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------------- ADMIN MANAGEMENT PAGE ---------------- -->
+    <section id="page-admins" class="page">
+      <div class="section-header">
+        <h2>Admins</h2>
+        <button id="addAdminBtn" class="primary-btn">+ Add admin</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Full name</th>
+              <th>Username</th>
+              <th>Email</th>
+              <th>Role</th>
+              <th>Permissions</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="adminsTableBody">
+            <tr><td colspan="6">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- =========================================================
+     MODAL (ginagamit para sa Add/Edit ng Product at Category)
+     ========================================================= -->
+<div id="modalOverlay" class="modal-overlay hidden">
+  <div class="modal">
+    <h3 id="modalTitle">Add product</h3>
+    <form id="modalForm"></form>
+  </div>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
