@@ -9,9 +9,9 @@
 // ang mga backend services mo (hindi na localhost)
 // ---------------------------------------------------------
 const API = {
-  AUTH: 'http://localhost:4000/api/auth',
-  PRODUCTS: 'http://localhost:4001/api',
-  ORDERS: 'http://localhost:4002/api',
+  AUTH: 'https://fitora-auth-backend.onrender.com/api/auth',
+  PRODUCTS: 'https://fitora-product-service.onrender.com/api',
+  ORDERS: 'https://fitora-order-service.onrender.com/api',
 };
 
 // ---------------------------------------------------------
