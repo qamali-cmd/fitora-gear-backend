@@ -1,5 +1,5 @@
 // server.js - Order Service
-// Ito ang API na hahawak ng ORDERS - kapwa para sa ADMIN at para sa CUSTOMER (mobile app).
+// Ito ang API na hahawak ng ORDERS.
 // Tumatakbo ito sa http://localhost:4002
 
 require('dotenv').config();
@@ -13,13 +13,181 @@ app.use(cors());
 app.use(express.json());
 
 // =====================================================
+// ORDERS
+// =====================================================
+
+// GET /api/orders - kunin lahat ng orders (kasama pangalan ng customer)
+app.get('/api/orders', verifyToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT o.*, u.full_name AS customer_name
+      FROM orders o
+      LEFT JOIN users u ON o.user_id = u.user_id
+      ORDER BY o.order_date DESC
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// GET /api/orders/:id - detalye ng isang order kasama ang mga item nito
+app.get('/api/orders/:id', verifyToken, async (req, res) => {
+  try {
+    const [orderRows] = await pool.query(
+      `SELECT o.*, u.full_name AS customer_name, u.email
+       FROM orders o LEFT JOIN users u ON o.user_id = u.user_id
+       WHERE o.order_id = ?`,
+      [req.params.id]
+    );
+    if (orderRows.length === 0) return res.status(404).json({ error: 'Hindi nahanap ang order.' });
+
+    const [itemRows] = await pool.query(
+      `SELECT oi.*, p.product_name
+       FROM order_items oi LEFT JOIN products p ON oi.product_id = p.product_id
+       WHERE oi.order_id = ?`,
+      [req.params.id]
+    );
+
+    res.json({ ...orderRows[0], items: itemRows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// PUT /api/orders/:id/status - i-update ang status ng order
+// (hal. pending -> processing -> shipped -> completed)
+app.put('/api/orders/:id/status', verifyToken, requirePermission('orders'), async (req, res) => {
+  try {
+    const { status } = req.body;
+    const validStatuses = ['pending', 'processing', 'shipped', 'completed', 'cancelled'];
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Hindi valid na status.' });
+    }
+
+    await pool.query('UPDATE orders SET status = ? WHERE order_id = ?', [status, req.params.id]);
+    res.json({ message: 'Na-update na ang order status.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// =====================================================
+// DASHBOARD STATS
+// (ginagamit ng admin dashboard para sa summary cards)
+// =====================================================
+app.get('/api/orders/stats/summary', verifyToken, async (req, res) => {
+  try {
+    const [[{ totalOrders }]] = await pool.query('SELECT COUNT(*) AS totalOrders FROM orders');
+    const [[{ pendingOrders }]] = await pool.query(
+      "SELECT COUNT(*) AS pendingOrders FROM orders WHERE status = 'pending'"
+    );
+    const [[{ totalRevenue }]] = await pool.query(
+      "SELECT COALESCE(SUM(total_amount), 0) AS totalRevenue FROM orders WHERE status != 'cancelled'"
+    );
+
+    res.json({
+      totalOrders,
+      pendingOrders,
+      totalRevenue,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// =====================================================
+// SALES REPORTS
+// (mga endpoint na ginagamit ng Sales Reports page)
+// =====================================================
+
+// GET /api/orders/reports/summary - pangkalahatang buod ng sales
+app.get('/api/orders/reports/summary', verifyToken, requirePermission('reports'), async (req, res) => {
+  try {
+    const [[{ completedOrders }]] = await pool.query(
+      "SELECT COUNT(*) AS completedOrders FROM orders WHERE status = 'completed'"
+    );
+    const [[{ totalRevenue }]] = await pool.query(
+      "SELECT COALESCE(SUM(total_amount), 0) AS totalRevenue FROM orders WHERE status != 'cancelled'"
+    );
+    const [[{ avgOrderValue }]] = await pool.query(
+      "SELECT COALESCE(AVG(total_amount), 0) AS avgOrderValue FROM orders WHERE status != 'cancelled'"
+    );
+
+    res.json({ completedOrders, totalRevenue, avgOrderValue });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// GET /api/orders/reports/sales-by-day - revenue kada araw, huling 7 araw
+app.get('/api/orders/reports/sales-by-day', verifyToken, requirePermission('reports'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT DATE(order_date) AS day, COALESCE(SUM(total_amount), 0) AS revenue
+      FROM orders
+      WHERE status != 'cancelled' AND order_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+      GROUP BY DATE(order_date)
+      ORDER BY day ASC
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// GET /api/orders/reports/best-sellers - top 5 products base sa dami ng nabenta
+app.get('/api/orders/reports/best-sellers', verifyToken, requirePermission('reports'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT p.product_name, SUM(oi.quantity) AS totalSold, SUM(oi.quantity * oi.price) AS totalRevenue
+      FROM order_items oi
+      JOIN products p ON oi.product_id = p.product_id
+      JOIN orders o ON oi.order_id = o.order_id
+      WHERE o.status != 'cancelled'
+      GROUP BY oi.product_id, p.product_name
+      ORDER BY totalSold DESC
+      LIMIT 5
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// GET /api/orders/reports/by-category - revenue kada category
+app.get('/api/orders/reports/by-category', verifyToken, requirePermission('reports'), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT c.category_name, COALESCE(SUM(oi.quantity * oi.price), 0) AS revenue
+      FROM categories c
+      LEFT JOIN products p ON p.category_id = c.category_id
+      LEFT JOIN order_items oi ON oi.product_id = p.product_id
+      LEFT JOIN orders o ON oi.order_id = o.order_id AND o.status != 'cancelled'
+      GROUP BY c.category_id, c.category_name
+      ORDER BY revenue DESC
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// =====================================================
 // CUSTOMER-FACING ORDERS (para sa mobile app)
-// MAHALAGA: nauna ito ilagay BAGO ang "/api/orders/:id" sa ibaba,
-// dahil kung hindi, ang "/api/orders/my" ay masusukol ng ":id"
-// pattern (ituturing na "my" ang isang id) - ito yung dating bug.
 // =====================================================
 
 // POST /api/orders/place - gumawa ng bagong order (mula sa cart ng customer)
+// Tinatanggap: { items: [{ product_id, quantity }], shipping_address }
 app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
   const conn = await pool.getConnection();
   try {
@@ -35,6 +203,7 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
     let totalAmount = 0;
     const orderItemsData = [];
 
+    // I-check ang presyo at stock ng bawat product bago tayo tumuloy
     for (const item of items) {
       const [[product]] = await conn.query(
         'SELECT product_id, price, stock, product_name FROM products WHERE product_id = ? FOR UPDATE',
@@ -56,12 +225,14 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
       orderItemsData.push({ product_id: product.product_id, quantity: item.quantity, price: product.price });
     }
 
+    // Gumawa ng order
     const [orderResult] = await conn.query(
       'INSERT INTO orders (user_id, total_amount, status, shipping_address) VALUES (?, ?, ?, ?)',
       [req.customer.userId, totalAmount, 'pending', shipping_address || null]
     );
     const orderId = orderResult.insertId;
 
+    // Gumawa ng order_items at ibawas ang stock ng bawat isa
     for (const item of orderItemsData) {
       await conn.query(
         'INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)',
@@ -113,165 +284,6 @@ app.get('/api/orders/my/:id', verifyCustomerToken, async (req, res) => {
     );
 
     res.json({ ...order, items });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
-  }
-});
-
-// =====================================================
-// ORDERS (ginagamit ng ADMIN panel)
-// =====================================================
-
-// GET /api/orders - kunin lahat ng orders (kasama pangalan ng customer)
-app.get('/api/orders', verifyToken, async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT o.*, u.full_name AS customer_name
-      FROM orders o
-      LEFT JOIN users u ON o.user_id = u.user_id
-      ORDER BY o.order_date DESC
-    `);
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
-  }
-});
-
-// GET /api/orders/:id - detalye ng isang order kasama ang mga item nito (ADMIN)
-app.get('/api/orders/:id', verifyToken, async (req, res) => {
-  try {
-    const [orderRows] = await pool.query(
-      `SELECT o.*, u.full_name AS customer_name, u.email
-       FROM orders o LEFT JOIN users u ON o.user_id = u.user_id
-       WHERE o.order_id = ?`,
-      [req.params.id]
-    );
-    if (orderRows.length === 0) return res.status(404).json({ error: 'Hindi nahanap ang order.' });
-
-    const [itemRows] = await pool.query(
-      `SELECT oi.*, p.product_name
-       FROM order_items oi LEFT JOIN products p ON oi.product_id = p.product_id
-       WHERE oi.order_id = ?`,
-      [req.params.id]
-    );
-
-    res.json({ ...orderRows[0], items: itemRows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
-  }
-});
-
-// PUT /api/orders/:id/status - i-update ang status ng order (ADMIN)
-app.put('/api/orders/:id/status', verifyToken, requirePermission('orders'), async (req, res) => {
-  try {
-    const { status } = req.body;
-    const validStatuses = ['pending', 'processing', 'shipped', 'completed', 'cancelled'];
-
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ error: 'Hindi valid na status.' });
-    }
-
-    await pool.query('UPDATE orders SET status = ? WHERE order_id = ?', [status, req.params.id]);
-    res.json({ message: 'Na-update na ang order status.' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
-  }
-});
-
-// =====================================================
-// DASHBOARD STATS (ginagamit ng lahat ng naka-login na admin)
-// =====================================================
-app.get('/api/orders/stats/summary', verifyToken, async (req, res) => {
-  try {
-    const [[{ totalOrders }]] = await pool.query('SELECT COUNT(*) AS totalOrders FROM orders');
-    const [[{ pendingOrders }]] = await pool.query(
-      "SELECT COUNT(*) AS pendingOrders FROM orders WHERE status = 'pending'"
-    );
-    const [[{ totalRevenue }]] = await pool.query(
-      "SELECT COALESCE(SUM(total_amount), 0) AS totalRevenue FROM orders WHERE status != 'cancelled'"
-    );
-
-    res.json({ totalOrders, pendingOrders, totalRevenue });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
-  }
-});
-
-// =====================================================
-// SALES REPORTS
-// =====================================================
-
-app.get('/api/orders/reports/summary', verifyToken, requirePermission('reports'), async (req, res) => {
-  try {
-    const [[{ completedOrders }]] = await pool.query(
-      "SELECT COUNT(*) AS completedOrders FROM orders WHERE status = 'completed'"
-    );
-    const [[{ totalRevenue }]] = await pool.query(
-      "SELECT COALESCE(SUM(total_amount), 0) AS totalRevenue FROM orders WHERE status != 'cancelled'"
-    );
-    const [[{ avgOrderValue }]] = await pool.query(
-      "SELECT COALESCE(AVG(total_amount), 0) AS avgOrderValue FROM orders WHERE status != 'cancelled'"
-    );
-
-    res.json({ completedOrders, totalRevenue, avgOrderValue });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
-  }
-});
-
-app.get('/api/orders/reports/sales-by-day', verifyToken, requirePermission('reports'), async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT DATE(order_date) AS day, COALESCE(SUM(total_amount), 0) AS revenue
-      FROM orders
-      WHERE status != 'cancelled' AND order_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
-      GROUP BY DATE(order_date)
-      ORDER BY day ASC
-    `);
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
-  }
-});
-
-app.get('/api/orders/reports/best-sellers', verifyToken, requirePermission('reports'), async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT p.product_name, SUM(oi.quantity) AS totalSold, SUM(oi.quantity * oi.price) AS totalRevenue
-      FROM order_items oi
-      JOIN products p ON oi.product_id = p.product_id
-      JOIN orders o ON oi.order_id = o.order_id
-      WHERE o.status != 'cancelled'
-      GROUP BY oi.product_id, p.product_name
-      ORDER BY totalSold DESC
-      LIMIT 5
-    `);
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
-  }
-});
-
-app.get('/api/orders/reports/by-category', verifyToken, requirePermission('reports'), async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT c.category_name, COALESCE(SUM(oi.quantity * oi.price), 0) AS revenue
-      FROM categories c
-      LEFT JOIN products p ON p.category_id = c.category_id
-      LEFT JOIN order_items oi ON oi.product_id = p.product_id
-      LEFT JOIN orders o ON oi.order_id = o.order_id AND o.status != 'cancelled'
-      GROUP BY c.category_id, c.category_name
-      ORDER BY revenue DESC
-    `);
-    res.json(rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'May problema sa server.' });
