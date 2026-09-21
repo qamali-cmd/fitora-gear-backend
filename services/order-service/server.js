@@ -281,4 +281,4 @@ app.get('/api/orders/reports/by-category', verifyToken, requirePermission('repor
 const PORT = process.env.PORT || 4002;
 app.listen(PORT, () => {
   console.log(`Order service running sa http://localhost:${PORT}`);
-});
+}); //test change
