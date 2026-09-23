@@ -14,6 +14,11 @@ const API = {
   ORDERS: 'https://fitora-order-service.onrender.com/api',
 };
 
+// EDIT DITO: Cloudinary config - para sa pag-upload ng product images
+// mula sa computer (sa halip na paste-URL lang)
+const CLOUDINARY_CLOUD_NAME = 'roit6yup';
+const CLOUDINARY_UPLOAD_PRESET = 'IMAGES';
+
 // ---------------------------------------------------------
 // Helper: kunin ang saved token, gamitin sa lahat ng
 // protektadong request (products add/edit/delete, orders, etc.)
@@ -267,6 +272,9 @@ function renderProductsTable() {
 
   tbody.innerHTML = list.map(p => `
     <tr>
+      <td>${p.image
+        ? `<img src="${p.image}" class="thumb" alt="${p.product_name}" onerror="this.replaceWith(Object.assign(document.createElement('div'), {className:'thumb-placeholder', textContent:'📦'}))">`
+        : `<div class="thumb-placeholder">📦</div>`}</td>
       <td>${p.product_name}</td>
       <td>${p.category_name || '-'}</td>
       <td>₱${Number(p.price).toLocaleString()}</td>
@@ -277,7 +285,7 @@ function renderProductsTable() {
         <button class="icon-btn danger" onclick="deleteProduct(${p.product_id})">Delete</button>
       </td>
     </tr>
-  `).join('') || '<tr><td colspan="6">Walang product na tumugma.</td></tr>';
+  `).join('') || '<tr><td colspan="7">Walang product na tumugma.</td></tr>';
 }
 
 document.getElementById('productSearch').addEventListener('input', renderProductsTable);
@@ -310,7 +318,7 @@ function closeModal() {
 }
 
 async function openProductModal(productId) {
-  let product = { product_name: '', category_id: '', price: '', stock: 0, status: 'active', description: '' };
+  let product = { product_name: '', category_id: '', price: '', stock: 0, status: 'active', description: '', image: '' };
 
   if (productId) {
     const res = await fetch(API.PRODUCTS + '/products/' + productId);
@@ -337,6 +345,13 @@ async function openProductModal(productId) {
     <label>Description</label>
     <textarea id="f_description" rows="2">${product.description || ''}</textarea>
 
+    <label>Image URL</label>
+    <input type="text" id="f_image" placeholder="https://..." value="${product.image || ''}">
+
+    <label>O i-upload mula sa computer mo</label>
+    <input type="file" id="f_image_file" accept="image/*">
+    <p id="uploadStatus" style="font-size:12px; color:#888; margin-top:4px;"></p>
+
     <label>Price (₱)</label>
     <input type="number" id="f_price" step="0.01" value="${product.price || ''}" required>
 
@@ -361,6 +376,7 @@ async function openProductModal(productId) {
       product_name: document.getElementById('f_name').value,
       category_id: document.getElementById('f_category').value || null,
       description: document.getElementById('f_description').value,
+      image: document.getElementById('f_image').value.trim(),
       price: parseFloat(document.getElementById('f_price').value),
       stock: parseInt(document.getElementById('f_stock').value),
       status: document.getElementById('f_status').value,
@@ -373,6 +389,39 @@ async function openProductModal(productId) {
     closeModal();
     loadProducts();
   };
+
+  // BAGO: pag-upload ng larawan mula sa computer papunta sa Cloudinary
+  const imageFileInput = document.getElementById('f_image_file');
+  const imageUrlInput = document.getElementById('f_image');
+  const uploadStatus = document.getElementById('uploadStatus');
+
+  imageFileInput.addEventListener('change', async () => {
+    const file = imageFileInput.files[0];
+    if (!file) return;
+
+    uploadStatus.textContent = 'Ina-upload...';
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+
+    try {
+      const res = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+
+      if (data.secure_url) {
+        imageUrlInput.value = data.secure_url;
+        uploadStatus.textContent = '✓ Successful ang upload!';
+      } else {
+        uploadStatus.textContent = 'May error sa upload. Subukan ulit.';
+      }
+    } catch (err) {
+      uploadStatus.textContent = 'Hindi ma-upload. I-check ang internet connection mo.';
+    }
+  });
 
   modalOverlay.classList.remove('hidden');
 }
