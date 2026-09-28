@@ -352,6 +352,13 @@ async function openProductModal(productId) {
     <input type="file" id="f_image_file" accept="image/*">
     <p id="uploadStatus" style="font-size:12px; color:#888; margin-top:4px;"></p>
 
+    ${productId ? `
+    <label>Gallery (dagdag na larawan - harap, likod, gilid, atbp.)</label>
+    <div id="galleryThumbs" class="gallery-thumbs"><p style="font-size:12px;color:#888;">Loading...</p></div>
+    <input type="file" id="f_gallery_file" accept="image/*" multiple>
+    <p id="galleryUploadStatus" style="font-size:12px; color:#888; margin-top:4px;"></p>
+    ` : ''}
+
     <label>Price (₱)</label>
     <input type="number" id="f_price" step="0.01" value="${product.price || ''}" required>
 
@@ -423,7 +430,79 @@ async function openProductModal(productId) {
     }
   });
 
+  // BAGO: gallery ng dagdag na larawan (harap, likod, gilid, atbp.)
+  // Makikita lang ito kapag nag-e-edit ng EXISTING product (kailangan ng
+  // productId bago tayo makapag-attach ng dagdag na larawan dito)
+  const galleryFileInput = document.getElementById('f_gallery_file');
+  if (galleryFileInput) {
+    loadProductGallery(productId);
+
+    galleryFileInput.addEventListener('change', async () => {
+      const files = Array.from(galleryFileInput.files);
+      if (files.length === 0) return;
+
+      const galleryUploadStatus = document.getElementById('galleryUploadStatus');
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        galleryUploadStatus.textContent = `Ina-upload ${i + 1} of ${files.length}...`;
+
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+
+        try {
+          const uploadRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
+            method: 'POST',
+            body: formData,
+          });
+          const uploadData = await uploadRes.json();
+
+          if (uploadData.secure_url) {
+            await fetch(API.PRODUCTS + '/products/' + productId + '/images', {
+              method: 'POST',
+              headers: authHeaders(),
+              body: JSON.stringify({ image_url: uploadData.secure_url }),
+            });
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      galleryUploadStatus.textContent = `✓ ${files.length} larawan naidagdag sa gallery!`;
+      galleryFileInput.value = '';
+      loadProductGallery(productId);
+    });
+  }
+
   modalOverlay.classList.remove('hidden');
+}
+
+// Kunin at ipakita ang lahat ng larawan sa gallery ng isang product
+async function loadProductGallery(productId) {
+  const container = document.getElementById('galleryThumbs');
+  if (!container) return;
+
+  try {
+    const res = await fetch(API.PRODUCTS + '/products/' + productId + '/images');
+    const images = await res.json();
+
+    container.innerHTML = images.map(img => `
+      <div class="gallery-thumb-wrap">
+        <img src="${img.image_url}" class="gallery-thumb">
+        <button type="button" class="gallery-remove-btn" onclick="deleteGalleryImage(${img.image_id}, ${productId})">×</button>
+      </div>
+    `).join('') || '<p style="font-size:12px;color:#888;">Wala pang dagdag na larawan.</p>';
+  } catch (err) {
+    container.innerHTML = '<p style="font-size:12px;color:#e74c3c;">Hindi ma-load ang gallery.</p>';
+  }
+}
+
+// Tanggalin ang isang larawan mula sa gallery
+async function deleteGalleryImage(imageId, productId) {
+  await fetch(API.PRODUCTS + '/products/images/' + imageId, { method: 'DELETE', headers: authHeaders() });
+  loadProductGallery(productId);
 }
 
 // ---------------- MODAL: CATEGORY ----------------

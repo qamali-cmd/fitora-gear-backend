@@ -329,6 +329,60 @@ app.post('/api/products/:id/reviews', verifyCustomerToken, async (req, res) => {
   }
 });
 
+// =====================================================
+// PRODUCT IMAGES (gallery - harap/likod/gilid, atbp.)
+// =====================================================
+
+// GET /api/products/:id/images - publiko, kunin lahat ng larawan ng isang product
+app.get('/api/products/:id/images', async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM product_images WHERE product_id = ? ORDER BY display_order ASC, image_id ASC',
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// POST /api/products/:id/images - magdagdag ng bagong larawan sa gallery (admin lang)
+app.post('/api/products/:id/images', verifyToken, requirePermission('products'), async (req, res) => {
+  try {
+    const { image_url } = req.body;
+    if (!image_url) {
+      return res.status(400).json({ error: 'Kailangan ng image_url.' });
+    }
+
+    const [[{ maxOrder }]] = await pool.query(
+      'SELECT COALESCE(MAX(display_order), -1) AS maxOrder FROM product_images WHERE product_id = ?',
+      [req.params.id]
+    );
+
+    const [result] = await pool.query(
+      'INSERT INTO product_images (product_id, image_url, display_order) VALUES (?, ?, ?)',
+      [req.params.id, image_url, maxOrder + 1]
+    );
+
+    res.status(201).json({ image_id: result.insertId, product_id: req.params.id, image_url });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
+// DELETE /api/products/images/:imageId - tanggalin ang isang larawan sa gallery (admin lang)
+app.delete('/api/products/images/:imageId', verifyToken, requirePermission('products'), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM product_images WHERE image_id = ?', [req.params.imageId]);
+    res.json({ message: 'Na-delete na ang larawan.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'May problema sa server.' });
+  }
+});
+
 const PORT = process.env.PORT || 4001;
 app.listen(PORT, () => {
   console.log(`Product service running sa http://localhost:${PORT}`);
