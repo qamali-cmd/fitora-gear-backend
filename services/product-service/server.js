@@ -24,7 +24,7 @@ app.get('/api/categories', async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -33,7 +33,7 @@ app.post('/api/categories', verifyToken, requirePermission('categories'), async 
   try {
     const { category_name, description } = req.body;
     if (!category_name) {
-      return res.status(400).json({ error: 'Kailangan ng category name.' });
+      return res.status(400).json({ error: 'Category name is required.' });
     }
     const [result] = await pool.query(
       'INSERT INTO categories (category_name, description) VALUES (?, ?)',
@@ -42,7 +42,7 @@ app.post('/api/categories', verifyToken, requirePermission('categories'), async 
     res.status(201).json({ category_id: result.insertId, category_name, description });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -54,10 +54,10 @@ app.put('/api/categories/:id', verifyToken, requirePermission('categories'), asy
       'UPDATE categories SET category_name = ?, description = ? WHERE category_id = ?',
       [category_name, description || null, req.params.id]
     );
-    res.json({ message: 'Na-update na ang category.' });
+    res.json({ message: 'Category updated.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -65,10 +65,10 @@ app.put('/api/categories/:id', verifyToken, requirePermission('categories'), asy
 app.delete('/api/categories/:id', verifyToken, requirePermission('categories'), async (req, res) => {
   try {
     await pool.query('DELETE FROM categories WHERE category_id = ?', [req.params.id]);
-    res.json({ message: 'Na-delete na ang category.' });
+    res.json({ message: 'Category deleted.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -88,7 +88,7 @@ app.get('/api/products', async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -101,7 +101,7 @@ app.get('/api/products/low-stock', async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -118,7 +118,7 @@ app.post('/api/products/:id/stock-adjustment', verifyToken, requirePermission('i
 
     if (!change_amount || !reason) {
       conn.release();
-      return res.status(400).json({ error: 'Kailangan ng change_amount at reason.' });
+      return res.status(400).json({ error: 'change_amount and reason are required.' });
     }
 
     await conn.beginTransaction();
@@ -127,14 +127,14 @@ app.post('/api/products/:id/stock-adjustment', verifyToken, requirePermission('i
     if (!product) {
       await conn.rollback();
       conn.release();
-      return res.status(404).json({ error: 'Hindi nahanap ang product.' });
+      return res.status(404).json({ error: 'Product not found.' });
     }
 
     const newStock = product.stock + parseInt(change_amount);
     if (newStock < 0) {
       await conn.rollback();
       conn.release();
-      return res.status(400).json({ error: 'Hindi pwedeng negative ang stock.' });
+      return res.status(400).json({ error: 'Stock cannot go below zero.' });
     }
 
     await conn.query('UPDATE products SET stock = ? WHERE product_id = ?', [newStock, productId]);
@@ -146,12 +146,12 @@ app.post('/api/products/:id/stock-adjustment', verifyToken, requirePermission('i
     await conn.commit();
     conn.release();
 
-    res.json({ message: 'Na-update na ang stock.', newStock });
+    res.json({ message: 'Stock updated.', newStock });
   } catch (err) {
     await conn.rollback();
     conn.release();
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -169,7 +169,7 @@ app.get('/api/products/stock-logs/recent', verifyToken, requirePermission('inven
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -177,11 +177,11 @@ app.get('/api/products/stock-logs/recent', verifyToken, requirePermission('inven
 app.get('/api/products/:id', async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT * FROM products WHERE product_id = ?', [req.params.id]);
-    if (rows.length === 0) return res.status(404).json({ error: 'Hindi nahanap ang product.' });
+    if (rows.length === 0) return res.status(404).json({ error: 'Product not found.' });
     res.json(rows[0]);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -191,7 +191,7 @@ app.post('/api/products', verifyToken, requirePermission('products'), async (req
     const { category_id, product_name, description, price, stock, image, status } = req.body;
 
     if (!product_name || price == null) {
-      return res.status(400).json({ error: 'Kailangan ng product name at price.' });
+      return res.status(400).json({ error: 'Product name and price are required.' });
     }
 
     const [result] = await pool.query(
@@ -203,7 +203,7 @@ app.post('/api/products', verifyToken, requirePermission('products'), async (req
     res.status(201).json({ product_id: result.insertId, ...req.body });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -219,10 +219,10 @@ app.put('/api/products/:id', verifyToken, requirePermission('products'), async (
       [category_id || null, product_name, description || null, price, stock, image || null, status, req.params.id]
     );
 
-    res.json({ message: 'Na-update na ang product.' });
+    res.json({ message: 'Product updated.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -230,10 +230,10 @@ app.put('/api/products/:id', verifyToken, requirePermission('products'), async (
 app.delete('/api/products/:id', verifyToken, requirePermission('products'), async (req, res) => {
   try {
     await pool.query('DELETE FROM products WHERE product_id = ?', [req.params.id]);
-    res.json({ message: 'Na-delete na ang product.' });
+    res.json({ message: 'Product deleted.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -254,7 +254,7 @@ app.get('/api/reviews', verifyToken, requirePermission('reviews'), async (req, r
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -264,13 +264,13 @@ app.put('/api/reviews/:id/status', verifyToken, requirePermission('reviews'), as
     const { status } = req.body;
     const validStatuses = ['pending', 'approved', 'hidden'];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({ error: 'Hindi valid na status.' });
+      return res.status(400).json({ error: 'Invalid status.' });
     }
     await pool.query('UPDATE reviews SET status = ? WHERE review_id = ?', [status, req.params.id]);
-    res.json({ message: 'Na-update na ang review.' });
+    res.json({ message: 'Review updated.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -278,10 +278,10 @@ app.put('/api/reviews/:id/status', verifyToken, requirePermission('reviews'), as
 app.delete('/api/reviews/:id', verifyToken, requirePermission('reviews'), async (req, res) => {
   try {
     await pool.query('DELETE FROM reviews WHERE review_id = ?', [req.params.id]);
-    res.json({ message: 'Na-delete na ang review.' });
+    res.json({ message: 'Review deleted.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -303,7 +303,7 @@ app.get('/api/products/:id/reviews', async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -314,7 +314,7 @@ app.post('/api/products/:id/reviews', verifyCustomerToken, async (req, res) => {
     const { rating, comment } = req.body;
 
     if (!rating || rating < 1 || rating > 5) {
-      return res.status(400).json({ error: 'Kailangan ng rating na 1-5.' });
+      return res.status(400).json({ error: 'A rating from 1 to 5 is required.' });
     }
 
     const [result] = await pool.query(
@@ -322,10 +322,10 @@ app.post('/api/products/:id/reviews', verifyCustomerToken, async (req, res) => {
       [req.params.id, req.customer.userId, rating, comment || null, 'pending']
     );
 
-    res.status(201).json({ review_id: result.insertId, message: 'Na-submit na ang review mo.' });
+    res.status(201).json({ review_id: result.insertId, message: 'Your review was submitted.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -343,7 +343,7 @@ app.get('/api/products/:id/images', async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -352,7 +352,7 @@ app.post('/api/products/:id/images', verifyToken, requirePermission('products'),
   try {
     const { image_url } = req.body;
     if (!image_url) {
-      return res.status(400).json({ error: 'Kailangan ng image_url.' });
+      return res.status(400).json({ error: 'image_url is required.' });
     }
 
     const [[{ maxOrder }]] = await pool.query(
@@ -368,7 +368,7 @@ app.post('/api/products/:id/images', verifyToken, requirePermission('products'),
     res.status(201).json({ image_id: result.insertId, product_id: req.params.id, image_url });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -376,10 +376,10 @@ app.post('/api/products/:id/images', verifyToken, requirePermission('products'),
 app.delete('/api/products/images/:imageId', verifyToken, requirePermission('products'), async (req, res) => {
   try {
     await pool.query('DELETE FROM product_images WHERE image_id = ?', [req.params.imageId]);
-    res.json({ message: 'Na-delete na ang larawan.' });
+    res.json({ message: 'Image deleted.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 

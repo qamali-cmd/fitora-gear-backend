@@ -7,14 +7,165 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const pool = require('./db');
 const { verifyToken, requireSuperAdmin, requirePermission } = require('./middleware');
 
 const app = express();
+app.set('trust proxy', 1); // Render is behind a proxy; needed to read the real client IP
 app.use(cors()); // para pwedeng tumawag ang admin-web (HTML/JS) sa API na ito
 app.use(express.json()); // para ma-basa natin ang JSON na ipinadala ng frontend
 
 const JWT_SECRET = process.env.JWT_SECRET;
+
+// -----------------------------------------------------
+// Helpers: validation, email sending, verification codes
+// -----------------------------------------------------
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const STRONG_PASSWORD_RE = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
+const PASSWORD_MESSAGE = 'Password must be at least 8 characters with uppercase and lowercase letters, a number, and a special character (e.g. !@#$%).';
+
+const CODE_MINUTES = 10;      // how long a code stays valid
+const MAX_CODE_ATTEMPTS = 5;  // wrong guesses allowed per code
+const RESEND_SECONDS = 60;    // wait time before another code can be requested
+
+function isDatabaseDown(err) {
+  return ['ENOTFOUND', 'ECONNREFUSED', 'ETIMEDOUT', 'PROTOCOL_CONNECTION_LOST', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code);
+}
+
+// Used by the new routes below: turns known problems into clear messages
+function handleError(res, err) {
+  console.error(err);
+  if (err.code === 'COOLDOWN') return res.status(429).json({ error: err.message, wait: err.wait });
+  if (err.code === 'EMAIL_NOT_CONFIGURED') return res.status(503).json({ error: 'Email sending is not set up on the server yet.' });
+  if (err.code === 'EMAIL_FAILED') return res.status(502).json({ error: 'We could not send the email right now. Please try again in a few minutes.' });
+  if (isDatabaseDown(err)) return res.status(503).json({ error: 'The database is temporarily unavailable. Please try again in a moment.' });
+  return res.status(500).json({ error: 'Something went wrong on the server.' });
+}
+
+function parsePermissions(value) {
+  return value ? String(value).split(',').map(p => p.trim()).filter(Boolean) : [];
+}
+
+function escapeHtml(text) {
+  return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// A profile photo is a link (the photo itself is stored on Cloudinary)
+function cleanPhotoUrl(value) {
+  const v = String(value == null ? '' : value).trim();
+  if (!v) return { value: null };
+  if (!/^https?:\/\/\S+$/i.test(v) || v.length > 500) return { error: 'The profile photo must be a valid http(s) link.' };
+  return { value: v };
+}
+
+// Tiny in-memory limiter (protects the free email quota from abuse)
+const hits = new Map();
+function allow(key, max, windowMs) {
+  const now = Date.now();
+  const entry = hits.get(key);
+  if (!entry || now - entry.first > windowMs) {
+    hits.set(key, { count: 1, first: now });
+    return true;
+  }
+  if (entry.count >= max) return false;
+  entry.count += 1;
+  return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of hits) if (now - entry.first > 3600000) hits.delete(key);
+}, 600000).unref();
+
+// Sends an email through Brevo's HTTPS API (Render's free tier blocks normal SMTP)
+async function sendEmail({ to, subject, html }) {
+  if (!process.env.BREVO_API_KEY || !process.env.EMAIL_FROM) {
+    const err = new Error('Email sending is not configured.');
+    err.code = 'EMAIL_NOT_CONFIGURED';
+    throw err;
+  }
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { accept: 'application/json', 'content-type': 'application/json', 'api-key': process.env.BREVO_API_KEY },
+    body: JSON.stringify({
+      sender: { name: process.env.EMAIL_FROM_NAME || 'Fitora Gear', email: process.env.EMAIL_FROM },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    console.error('Brevo rejected the email:', response.status, await response.text());
+    const err = new Error('The email provider rejected the message.');
+    err.code = 'EMAIL_FAILED';
+    throw err;
+  }
+}
+
+function codeEmailHtml(name, code) {
+  return `<div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px">
+    <h2 style="color:#6C5CE7;margin:0 0 12px">Fitora Gear</h2>
+    <p>Hi ${escapeHtml(name)},</p>
+    <p>Use this code to verify your email address:</p>
+    <p style="font-size:32px;letter-spacing:8px;font-weight:bold;color:#2B2140;margin:16px 0">${code}</p>
+    <p style="color:#666;font-size:13px">This code expires in ${CODE_MINUTES} minutes. If you did not request it, you can ignore this email.</p>
+  </div>`;
+}
+
+// Creates a 6-digit code (stored hashed) and emails it. Throws if the email cannot be sent.
+async function issueVerificationCode(accountType, accountId, email, name) {
+  const [recent] = await pool.query(
+    'SELECT TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age FROM email_verifications WHERE account_type = ? AND account_id = ? ORDER BY verification_id DESC LIMIT 1',
+    [accountType, accountId]
+  );
+  if (recent.length > 0 && recent[0].age < RESEND_SECONDS) {
+    const wait = RESEND_SECONDS - recent[0].age;
+    const err = new Error(`Please wait ${wait} seconds before requesting another code.`);
+    err.code = 'COOLDOWN';
+    err.wait = wait;
+    throw err;
+  }
+
+  const code = String(crypto.randomInt(100000, 1000000));
+  const hash = await bcrypt.hash(code, 8);
+  await pool.query('DELETE FROM email_verifications WHERE account_type = ? AND account_id = ?', [accountType, accountId]);
+  await pool.query(
+    'INSERT INTO email_verifications (account_type, account_id, email, code_hash, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? MINUTE))',
+    [accountType, accountId, email, hash, CODE_MINUTES]
+  );
+
+  try {
+    await sendEmail({ to: email, subject: 'Your Fitora Gear verification code', html: codeEmailHtml(name, code) });
+  } catch (err) {
+    // The email never left, so remove the code and let the user try again right away
+    await pool.query('DELETE FROM email_verifications WHERE account_type = ? AND account_id = ?', [accountType, accountId]);
+    throw err;
+  }
+}
+
+// Checks a code typed by the user. Returns { ok: true } or { ok: false, status, message }.
+async function checkVerificationCode(accountType, accountId, email, code) {
+  const [rows] = await pool.query(
+    'SELECT verification_id, code_hash, attempts, (expires_at < UTC_TIMESTAMP()) AS expired FROM email_verifications WHERE account_type = ? AND account_id = ? AND email = ? ORDER BY verification_id DESC LIMIT 1',
+    [accountType, accountId, email]
+  );
+  if (rows.length === 0) return { ok: false, status: 400, message: 'No code found. Please request a new code.' };
+
+  const row = rows[0];
+  if (row.expired) return { ok: false, status: 400, message: 'This code has expired. Please request a new code.' };
+  if (row.attempts >= MAX_CODE_ATTEMPTS) return { ok: false, status: 429, message: 'Too many wrong attempts. Please request a new code.' };
+
+  const matches = await bcrypt.compare(code, row.code_hash);
+  if (!matches) {
+    await pool.query('UPDATE email_verifications SET attempts = attempts + 1 WHERE verification_id = ?', [row.verification_id]);
+    const left = MAX_CODE_ATTEMPTS - row.attempts - 1;
+    return { ok: false, status: 400, message: left > 0 ? `Incorrect code. ${left} attempt(s) left.` : 'Incorrect code. Please request a new code.' };
+  }
+
+  await pool.query('DELETE FROM email_verifications WHERE account_type = ? AND account_id = ?', [accountType, accountId]);
+  return { ok: true };
+}
 
 // -----------------------------------------------------
 // POST /api/auth/login (ADMIN login)
@@ -61,6 +212,9 @@ app.post('/api/auth/login', async (req, res) => {
         fullName: admin.full_name,
         role: admin.role,
         permissions: permissionsArray,
+        email: admin.email,
+        emailVerified: !!admin.email_verified,
+        profilePhoto: admin.profile_photo || null,
       },
     });
   } catch (err) {
@@ -103,6 +257,13 @@ app.post('/api/auth/customers/register', async (req, res) => {
       return res.status(400).json({ error: 'Full name, email, password, phone number, and birthday are required.' });
     }
 
+    if (!EMAIL_RE.test(String(email).trim())) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (!allow('register|' + req.ip, 10, 3600000)) {
+      return res.status(429).json({ error: 'Too many sign-ups from this connection. Please try again later.' });
+    }
+
     // Mas strict na password rule: min. 8 characters, may uppercase, lowercase,
     // number, at special character
     const strongPassword = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
@@ -112,22 +273,36 @@ app.post('/api/auth/customers/register', async (req, res) => {
       });
     }
 
+    const emailClean = String(email).trim().toLowerCase();
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const [result] = await pool.query(
-      'INSERT INTO users (full_name, email, password, phone, address, birthday) VALUES (?, ?, ?, ?, ?, ?)',
-      [full_name, email, hashedPassword, phone, address || null, birthday]
+      'INSERT INTO users (full_name, email, password, phone, address, birthday, email_verified) VALUES (?, ?, ?, ?, ?, ?, 0)',
+      [full_name, emailClean, hashedPassword, phone, address || null, birthday]
     );
 
     const token = jwt.sign(
-      { userId: result.insertId, email, type: 'customer' },
+      { userId: result.insertId, email: emailClean, type: 'customer' },
       JWT_SECRET,
       { expiresIn: '30d' }
     );
 
+    // Email the 6-digit code. If sending fails the account still exists and the app can ask for a new code.
+    let emailSent = true;
+    try {
+      await issueVerificationCode('customer', result.insertId, emailClean, full_name);
+    } catch (mailErr) {
+      console.error('Could not send the verification email:', mailErr.message);
+      emailSent = false;
+    }
+
     res.status(201).json({
       token,
-      customer: { id: result.insertId, fullName: full_name, email, phone, address: address || null, birthday },
+      emailSent,
+      customer: {
+        id: result.insertId, fullName: full_name, email: emailClean, emailVerified: false,
+        phone, address: address || null, birthday, profilePhoto: null,
+      },
     });
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') {
@@ -171,7 +346,10 @@ app.post('/api/auth/customers/login', async (req, res) => {
 
     res.json({
       token,
-      customer: { id: user.user_id, fullName: user.full_name, email: user.email, phone: user.phone, address: user.address, birthday: user.birthday },
+      customer: {
+        id: user.user_id, fullName: user.full_name, email: user.email, emailVerified: !!user.email_verified,
+        phone: user.phone, address: user.address, birthday: user.birthday, profilePhoto: user.profile_photo || null,
+      },
     });
   } catch (err) {
     console.error(err);
@@ -180,46 +358,144 @@ app.post('/api/auth/customers/login', async (req, res) => {
 });
 
 // BAGO: guard para sa customer-only routes (ginagamit lang dito sa auth-service)
-function verifyCustomerToken(req, res, next) {
+async function verifyCustomerToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Please log in first.' });
   }
-  const token = authHeader.split(' ')[1];
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded.type !== 'customer') {
-      return res.status(403).json({ error: 'Customer accounts only.' });
-    }
-    req.customer = decoded;
-    next();
+    decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
   } catch (err) {
     return res.status(401).json({ error: 'Your session has expired. Please log in again.' });
   }
+  if (decoded.type !== 'customer') {
+    return res.status(403).json({ error: 'Customer accounts only.' });
+  }
+  try {
+    const [rows] = await pool.query(
+      'SELECT user_id, full_name, email, email_verified, is_active FROM users WHERE user_id = ?',
+      [decoded.userId]
+    );
+    if (rows.length === 0 || !rows[0].is_active) {
+      return res.status(401).json({ error: 'This account is no longer available. Please log in again.' });
+    }
+    req.customer = {
+      userId: rows[0].user_id, fullName: rows[0].full_name, email: rows[0].email,
+      emailVerified: !!rows[0].email_verified, type: 'customer',
+    };
+    next();
+  } catch (err) {
+    return handleError(res, err);
+  }
 }
 
-// BAGO: PUT /api/auth/customers/me - i-update ng customer ang sariling profile
-// (pangalan, phone, address - ginagamit ng "Edit profile" sa mobile app)
+function customerProfile(u) {
+  return {
+    id: u.user_id, fullName: u.full_name, email: u.email, emailVerified: !!u.email_verified,
+    phone: u.phone, address: u.address, birthday: u.birthday, profilePhoto: u.profile_photo || null,
+    createdAt: u.created_at, orderCount: Number(u.order_count || 0),
+  };
+}
+
+// GET /api/auth/customers/me - the logged-in customer's full profile
+app.get('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT u.user_id, u.full_name, u.email, u.email_verified, u.phone, u.address, u.profile_photo, u.created_at,
+              DATE_FORMAT(u.birthday, '%Y-%m-%d') AS birthday,
+              (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.user_id) AS order_count
+       FROM users u WHERE u.user_id = ?`,
+      [req.customer.userId]
+    );
+    res.json(customerProfile(rows[0]));
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// PUT /api/auth/customers/me - update name, phone, address and (optionally) the profile photo
 app.put('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
   try {
-    const { full_name, phone, address } = req.body;
+    const body = req.body || {};
+    const fullName = String(body.full_name || '').trim();
+    const phone = String(body.phone || '').replace(/[\s()-]/g, '');
+    const address = String(body.address || '').trim();
 
-    if (!full_name) {
-      return res.status(400).json({ error: 'Full name is required.' });
+    if (fullName.length < 2 || fullName.length > 100) {
+      return res.status(400).json({ error: 'Full name must be 2-100 characters.' });
+    }
+    if (phone && !/^\+?\d{7,15}$/.test(phone)) {
+      return res.status(400).json({ error: 'Please enter a valid phone number (7-15 digits).' });
+    }
+    if (address.length > 255) {
+      return res.status(400).json({ error: 'Address is too long (255 characters maximum).' });
     }
 
-    await pool.query(
-      'UPDATE users SET full_name = ?, phone = ?, address = ? WHERE user_id = ?',
-      [full_name, phone || null, address || null, req.customer.userId]
-    );
-
-    res.json({
-      message: 'Profile updated.',
-      customer: { fullName: full_name, phone: phone || null, address: address || null },
-    });
+    const customer = { fullName, phone: phone || null, address: address || null };
+    if (body.profile_photo !== undefined) {
+      const photo = cleanPhotoUrl(body.profile_photo);
+      if (photo.error) return res.status(400).json({ error: photo.error });
+      await pool.query('UPDATE users SET full_name = ?, phone = ?, address = ?, profile_photo = ? WHERE user_id = ?', [
+        fullName, customer.phone, customer.address, photo.value, req.customer.userId,
+      ]);
+      customer.profilePhoto = photo.value;
+    } else {
+      await pool.query('UPDATE users SET full_name = ?, phone = ?, address = ? WHERE user_id = ?', [
+        fullName, customer.phone, customer.address, req.customer.userId,
+      ]);
+    }
+    res.json({ message: 'Profile updated.', customer });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Something went wrong on the server.' });
+    handleError(res, err);
+  }
+});
+
+// POST /api/auth/customers/me/send-code - email a new 6-digit code
+app.post('/api/auth/customers/me/send-code', verifyCustomerToken, async (req, res) => {
+  try {
+    if (req.customer.emailVerified) return res.status(400).json({ error: 'Your email is already verified.' });
+    if (!allow('send|customer|' + req.customer.userId, 6, 3600000)) {
+      return res.status(429).json({ error: 'Too many code requests. Please try again in an hour.' });
+    }
+    await issueVerificationCode('customer', req.customer.userId, req.customer.email, req.customer.fullName);
+    res.json({ message: `We sent a 6-digit code to ${req.customer.email}.`, email: req.customer.email });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// POST /api/auth/customers/me/verify-code - confirm the code
+app.post('/api/auth/customers/me/verify-code', verifyCustomerToken, async (req, res) => {
+  try {
+    const code = String((req.body || {}).code || '').trim();
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Please enter the 6-digit code.' });
+
+    const result = await checkVerificationCode('customer', req.customer.userId, req.customer.email, code);
+    if (!result.ok) return res.status(result.status).json({ error: result.message });
+
+    await pool.query('UPDATE users SET email_verified = 1 WHERE user_id = ?', [req.customer.userId]);
+    res.json({ message: 'Your email is verified.', emailVerified: true });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// PUT /api/auth/customers/me/password
+app.put('/api/auth/customers/me/password', verifyCustomerToken, async (req, res) => {
+  try {
+    const currentPassword = String((req.body || {}).current_password || '');
+    const newPassword = String((req.body || {}).new_password || '');
+    if (!STRONG_PASSWORD_RE.test(newPassword)) return res.status(400).json({ error: PASSWORD_MESSAGE });
+
+    const [rows] = await pool.query('SELECT password FROM users WHERE user_id = ?', [req.customer.userId]);
+    if (!(await bcrypt.compare(currentPassword, rows[0].password))) {
+      return res.status(400).json({ error: 'Your current password is incorrect.' });
+    }
+    await pool.query('UPDATE users SET password = ? WHERE user_id = ?', [await bcrypt.hash(newPassword, 10), req.customer.userId]);
+    res.json({ message: 'Password changed.' });
+  } catch (err) {
+    handleError(res, err);
   }
 });
 
@@ -232,7 +508,7 @@ app.put('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
 app.get('/api/auth/customers', verifyToken, requirePermission('customers'), async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT u.user_id, u.full_name, u.email, u.phone, u.address, u.is_active, u.created_at,
+      SELECT u.user_id, u.full_name, u.email, u.phone, u.address, u.is_active, u.email_verified, u.created_at,
              COUNT(o.order_id) AS order_count
       FROM users u
       LEFT JOIN orders o ON o.user_id = u.user_id
@@ -263,12 +539,130 @@ app.put('/api/auth/customers/:id/status', verifyToken, requirePermission('custom
 // (para sa mga miyembro ng grupo na kailangan din ng sariling admin login)
 // =====================================================
 
+// =====================================================
+// ADMIN PROFILE (the logged-in admin)
+// =====================================================
+function adminProfile(r) {
+  return {
+    id: r.admin_id, username: r.username, fullName: r.full_name, email: r.email,
+    emailVerified: !!r.email_verified, role: r.role, permissions: parsePermissions(r.permissions),
+    profilePhoto: r.profile_photo || null, createdAt: r.created_at,
+  };
+}
+
+async function loadAdmin(adminId) {
+  const [rows] = await pool.query(
+    'SELECT admin_id, username, full_name, email, email_verified, role, permissions, profile_photo, created_at FROM admins WHERE admin_id = ?',
+    [adminId]
+  );
+  return rows[0];
+}
+
+app.get('/api/auth/admins/me', verifyToken, async (req, res) => {
+  try {
+    const admin = await loadAdmin(req.admin.adminId);
+    if (!admin) return res.status(404).json({ error: 'Admin not found.' });
+    res.json(adminProfile(admin));
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// Changing the email marks it as "not verified" until the new code is confirmed
+app.put('/api/auth/admins/me', verifyToken, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const fullName = String(body.full_name || '').trim();
+    const email = String(body.email || '').trim().toLowerCase();
+
+    if (fullName.length < 2 || fullName.length > 100) {
+      return res.status(400).json({ error: 'Full name must be 2-100 characters.' });
+    }
+    if (email && (!EMAIL_RE.test(email) || email.length > 100)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+
+    const current = await loadAdmin(req.admin.adminId);
+    if (!current) return res.status(404).json({ error: 'Admin not found.' });
+
+    let photo = current.profile_photo;
+    if (body.profile_photo !== undefined) {
+      const cleaned = cleanPhotoUrl(body.profile_photo);
+      if (cleaned.error) return res.status(400).json({ error: cleaned.error });
+      photo = cleaned.value;
+    }
+
+    const currentEmail = current.email ? String(current.email).toLowerCase() : null;
+    const emailChanged = (email || null) !== currentEmail;
+    const verified = emailChanged ? 0 : (current.email_verified ? 1 : 0);
+
+    await pool.query('UPDATE admins SET full_name = ?, email = ?, profile_photo = ?, email_verified = ? WHERE admin_id = ?', [
+      fullName, email || null, photo, verified, req.admin.adminId,
+    ]);
+    res.json({ message: 'Profile updated.', emailChanged, admin: adminProfile(await loadAdmin(req.admin.adminId)) });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+app.post('/api/auth/admins/me/send-code', verifyToken, async (req, res) => {
+  try {
+    const admin = await loadAdmin(req.admin.adminId);
+    if (!admin) return res.status(404).json({ error: 'Admin not found.' });
+    if (!admin.email) return res.status(400).json({ error: 'Add an email address to your profile first.' });
+    if (admin.email_verified) return res.status(400).json({ error: 'Your email is already verified.' });
+    if (!allow('send|admin|' + admin.admin_id, 6, 3600000)) {
+      return res.status(429).json({ error: 'Too many code requests. Please try again in an hour.' });
+    }
+    await issueVerificationCode('admin', admin.admin_id, admin.email, admin.full_name);
+    res.json({ message: `We sent a 6-digit code to ${admin.email}.`, email: admin.email });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+app.post('/api/auth/admins/me/verify-code', verifyToken, async (req, res) => {
+  try {
+    const code = String((req.body || {}).code || '').trim();
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Please enter the 6-digit code.' });
+
+    const admin = await loadAdmin(req.admin.adminId);
+    if (!admin || !admin.email) return res.status(400).json({ error: 'Add an email address to your profile first.' });
+
+    const result = await checkVerificationCode('admin', admin.admin_id, admin.email, code);
+    if (!result.ok) return res.status(result.status).json({ error: result.message });
+
+    await pool.query('UPDATE admins SET email_verified = 1 WHERE admin_id = ?', [admin.admin_id]);
+    res.json({ message: 'Your email is verified.', emailVerified: true });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+app.put('/api/auth/admins/me/password', verifyToken, async (req, res) => {
+  try {
+    const currentPassword = String((req.body || {}).current_password || '');
+    const newPassword = String((req.body || {}).new_password || '');
+    if (!STRONG_PASSWORD_RE.test(newPassword)) return res.status(400).json({ error: PASSWORD_MESSAGE });
+
+    const [rows] = await pool.query('SELECT password FROM admins WHERE admin_id = ?', [req.admin.adminId]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Admin not found.' });
+    if (!(await bcrypt.compare(currentPassword, rows[0].password))) {
+      return res.status(400).json({ error: 'Your current password is incorrect.' });
+    }
+    await pool.query('UPDATE admins SET password = ? WHERE admin_id = ?', [await bcrypt.hash(newPassword, 10), req.admin.adminId]);
+    res.json({ message: 'Password changed.' });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
 // GET /api/auth/admins - listahan ng lahat ng admin accounts (walang kasamang password)
 // Super Admin lang ang makakakita nito
 app.get('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) => {
   try {
     const [rows] = await pool.query(
-      'SELECT admin_id, username, full_name, email, role, permissions, created_at FROM admins ORDER BY created_at DESC'
+      'SELECT admin_id, username, full_name, email, email_verified, profile_photo, role, permissions, created_at FROM admins ORDER BY created_at DESC'
     );
     res.json(rows);
   } catch (err) {
