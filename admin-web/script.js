@@ -281,6 +281,7 @@ function renderProductsTable() {
       <td>${p.stock}</td>
       <td><span class="badge badge-${p.status}">${p.status}</span></td>
       <td>
+        <button class="icon-btn" onclick="openImagesModal(${p.product_id})">Photos</button>
         <button class="icon-btn" onclick="openProductModal(${p.product_id})">Edit</button>
         <button class="icon-btn danger" onclick="deleteProduct(${p.product_id})">Delete</button>
       </td>
@@ -503,6 +504,196 @@ async function loadProductGallery(productId) {
 async function deleteGalleryImage(imageId, productId) {
   await fetch(API.PRODUCTS + '/products/images/' + imageId, { method: 'DELETE', headers: authHeaders() });
   loadProductGallery(productId);
+}
+
+// ---------------- MODAL: PRODUCT PHOTOS ----------------
+// Shows ALL photos of one product. The admin can add many photos at once,
+// delete a specific photo, and choose which photo is the Main one.
+function imgEsc(text) {
+  return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function openImagesModal(productId) {
+  const product = allProductsList.find(p => p.product_id === productId);
+  modalTitle.textContent = 'Photos - ' + (product ? product.product_name : 'Product');
+  modalForm.onsubmit = (e) => { e.preventDefault(); };
+  modalForm.innerHTML = `
+    <p style="font-size:13px; color:#666; margin-bottom:6px;">
+      The photo marked <b>Main</b> is the one shown in the shop list. Add as many extra photos as you like (front, back, side...).
+    </p>
+    <div id="imagesGrid" class="images-grid"><p style="font-size:12px; color:#888;">Loading...</p></div>
+
+    <label>Add photos (you can select many at once)</label>
+    <input type="file" id="img_add_files" accept="image/*" multiple>
+    <p id="imgAddStatus" style="font-size:12px; color:#888; margin-top:4px;"></p>
+
+    <div class="modal-actions">
+      <button type="button" class="secondary-btn" onclick="closeModal()">Close</button>
+    </div>
+  `;
+
+  document.getElementById('img_add_files').addEventListener('change', (e) => addProductImages(productId, e.target));
+
+  modalOverlay.classList.remove('hidden');
+  renderImagesGrid(productId);
+}
+
+async function renderImagesGrid(productId) {
+  const grid = document.getElementById('imagesGrid');
+  if (!grid) return;
+  const product = allProductsList.find(p => p.product_id === productId);
+
+  try {
+    const res = await fetch(API.PRODUCTS + '/products/' + productId + '/images');
+    if (!res.ok) throw new Error('Could not load photos');
+    const gallery = await res.json();
+    const mainUrl = product && product.image ? product.image : null;
+    const galleryUrls = gallery.map(g => g.image_url);
+
+    let tiles = '';
+    // The main photo may have been pasted as a link and not be in the gallery list
+    if (mainUrl && !galleryUrls.includes(mainUrl)) {
+      tiles += `
+        <div class="image-tile">
+          <img src="${imgEsc(mainUrl)}" alt="Main photo">
+          <span class="image-tag">Main</span>
+          <div class="tile-actions">
+            <button type="button" class="icon-btn danger" onclick="removeMainImage(${productId})">Remove</button>
+          </div>
+        </div>`;
+    }
+    gallery.forEach(img => {
+      const isMain = img.image_url === mainUrl;
+      tiles += `
+        <div class="image-tile">
+          <img src="${imgEsc(img.image_url)}" alt="Product photo">
+          ${isMain ? '<span class="image-tag">Main</span>' : ''}
+          <div class="tile-actions">
+            ${isMain ? '' : `<button type="button" class="icon-btn" onclick="setMainImage(${productId}, ${img.image_id})">Make main</button>`}
+            <button type="button" class="icon-btn danger" onclick="deleteProductImage(${img.image_id}, ${productId})">Delete</button>
+          </div>
+        </div>`;
+    });
+
+    grid.innerHTML = tiles || '<p style="font-size:12px; color:#888;">No photos yet. Add some below.</p>';
+  } catch (err) {
+    grid.innerHTML = '<p style="font-size:12px; color:#e74c3c;">Could not load the photos. Make sure the latest product service is deployed and the product_images table exists in the database.</p>';
+  }
+}
+
+// Saves (or clears) the main photo of a product. Uses the freshest product data so stock is never overwritten with an old number.
+async function saveMainImage(productId, url) {
+  const freshRes = await fetch(API.PRODUCTS + '/products/' + productId);
+  const p = await freshRes.json();
+  const body = {
+    product_name: p.product_name,
+    category_id: p.category_id,
+    description: p.description || '',
+    price: parseFloat(p.price),
+    stock: parseInt(p.stock),
+    status: p.status,
+    image: url || '',
+  };
+  const res = await fetch(API.PRODUCTS + '/products/' + productId, {
+    method: 'PUT',
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Could not update the main photo.');
+  }
+  await loadProducts(); // refresh the table and the product list
+}
+
+async function addProductImages(productId, input) {
+  const files = Array.from(input.files);
+  const status = document.getElementById('imgAddStatus');
+  if (files.length === 0) return;
+
+  let added = 0;
+  let firstUrl = null;
+  for (let i = 0; i < files.length; i++) {
+    status.textContent = `Uploading ${i + 1} of ${files.length}...`;
+    try {
+      const formData = new FormData();
+      formData.append('file', files[i]);
+      formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+      const upload = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      const uploaded = await upload.json();
+      if (!uploaded.secure_url) continue;
+
+      const saved = await fetch(API.PRODUCTS + '/products/' + productId + '/images', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ image_url: uploaded.secure_url }),
+      });
+      if (saved.ok) {
+        added++;
+        if (!firstUrl) firstUrl = uploaded.secure_url;
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  }
+  input.value = '';
+
+  // If the product has no main photo yet, the first new photo becomes the main one
+  const product = allProductsList.find(p => p.product_id === productId);
+  if (firstUrl && product && !product.image) {
+    try { await saveMainImage(productId, firstUrl); } catch (err) { console.error(err); }
+  }
+
+  status.textContent = added === files.length
+    ? `✓ ${added} photo(s) added!`
+    : `${added} of ${files.length} photo(s) added. Some uploads failed, please try again.`;
+  renderImagesGrid(productId);
+}
+
+async function setMainImage(productId, imageId) {
+  try {
+    const res = await fetch(API.PRODUCTS + '/products/' + productId + '/images');
+    const gallery = await res.json();
+    const img = gallery.find(g => g.image_id === imageId);
+    if (img) await saveMainImage(productId, img.image_url);
+  } catch (err) {
+    alert(err.message);
+  }
+  renderImagesGrid(productId);
+}
+
+async function removeMainImage(productId) {
+  if (!confirm('Remove the main photo? The product will show a placeholder until you choose another one.')) return;
+  try {
+    await saveMainImage(productId, '');
+  } catch (err) {
+    alert(err.message);
+  }
+  renderImagesGrid(productId);
+}
+
+async function deleteProductImage(imageId, productId) {
+  if (!confirm('Delete this photo?')) return;
+  try {
+    const galleryRes = await fetch(API.PRODUCTS + '/products/' + productId + '/images');
+    const gallery = await galleryRes.json();
+    const img = gallery.find(g => g.image_id === imageId);
+    const product = allProductsList.find(p => p.product_id === productId);
+
+    const res = await fetch(API.PRODUCTS + '/products/images/' + imageId, { method: 'DELETE', headers: authHeaders() });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Could not delete the photo.');
+    }
+    // If the deleted photo was the main one, clear the main photo too
+    if (img && product && product.image === img.image_url) await saveMainImage(productId, '');
+  } catch (err) {
+    alert(err.message);
+  }
+  renderImagesGrid(productId);
 }
 
 // ---------------- MODAL: CATEGORY ----------------
