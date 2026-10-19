@@ -6,7 +6,7 @@ function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Kailangan mag-login muna.' });
+    return res.status(401).json({ error: 'Please log in first.' });
   }
 
   const token = authHeader.split(' ')[1];
@@ -17,12 +17,12 @@ function verifyToken(req, res, next) {
     // (parehong JWT_SECRET ang ginagamit ng buong system, kaya kailangan
     // itong i-check para hindi magamit ng customer account ang admin routes)
     if (decoded.type !== 'admin') {
-      return res.status(403).json({ error: 'Admin account lang ang pwedeng gumamit nito.' });
+      return res.status(403).json({ error: 'Admin accounts only.' });
     }
     req.admin = decoded;
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'Expired o invalid na ang session mo.' });
+    return res.status(401).json({ error: 'Your session has expired. Please log in again.' });
   }
 }
 
@@ -32,7 +32,7 @@ module.exports = { verifyToken };
 // (hal. pag-add/delete ng ibang admin account)
 function requireSuperAdmin(req, res, next) {
   if (req.admin.role !== 'super_admin') {
-    return res.status(403).json({ error: 'Super Admin lang ang may access dito.' });
+    return res.status(403).json({ error: 'Only a Super Admin can do this.' });
   }
   next();
 }
@@ -43,7 +43,7 @@ function requirePermission(key) {
   return (req, res, next) => {
     if (req.admin.role === 'super_admin') return next(); // buong access
     if ((req.admin.permissions || []).includes(key)) return next();
-    return res.status(403).json({ error: 'Wala kang access sa parteng ito.' });
+    return res.status(403).json({ error: 'You do not have access to this section.' });
   };
 }
 

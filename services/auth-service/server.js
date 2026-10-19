@@ -26,20 +26,20 @@ app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
 
     if (!username || !password) {
-      return res.status(400).json({ error: 'Kailangan ng username at password.' });
+      return res.status(400).json({ error: 'Username and password are required.' });
     }
 
     const [rows] = await pool.query('SELECT * FROM admins WHERE username = ?', [username]);
 
     if (rows.length === 0) {
-      return res.status(401).json({ error: 'Mali ang username o password.' });
+      return res.status(401).json({ error: 'Incorrect username or password.' });
     }
 
     const admin = rows[0];
     const isMatch = await bcrypt.compare(password, admin.password);
 
     if (!isMatch) {
-      return res.status(401).json({ error: 'Mali ang username o password.' });
+      return res.status(401).json({ error: 'Incorrect username or password.' });
     }
 
     // Gawing array ang permissions (naka-store bilang comma-separated text sa DB)
@@ -65,7 +65,7 @@ app.post('/api/auth/login', async (req, res) => {
     });
   } catch (err) {
     console.error('Login error:', err);
-    res.status(500).json({ error: 'May problema sa server. Subukan ulit.' });
+    res.status(500).json({ error: 'Something went wrong on the server. Please try again.' });
   }
 });
 
@@ -76,7 +76,7 @@ app.get('/api/auth/verify', (req, res) => {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ valid: false, error: 'Walang token.' });
+    return res.status(401).json({ valid: false, error: 'No token provided.' });
   }
 
   const token = authHeader.split(' ')[1];
@@ -85,7 +85,7 @@ app.get('/api/auth/verify', (req, res) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     res.json({ valid: true, admin: decoded });
   } catch (err) {
-    res.status(401).json({ valid: false, error: 'Expired o invalid na ang token.' });
+    res.status(401).json({ valid: false, error: 'The token is invalid or has expired.' });
   }
 });
 
@@ -100,7 +100,7 @@ app.post('/api/auth/customers/register', async (req, res) => {
 
     // EDIT DITO: kung gusto mong baguhin ang mga required fields
     if (!full_name || !email || !password || !phone || !birthday) {
-      return res.status(400).json({ error: 'Kailangan ng pangalan, email, password, phone number, at birthday.' });
+      return res.status(400).json({ error: 'Full name, email, password, phone number, and birthday are required.' });
     }
 
     // Mas strict na password rule: min. 8 characters, may uppercase, lowercase,
@@ -108,7 +108,7 @@ app.post('/api/auth/customers/register', async (req, res) => {
     const strongPassword = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
     if (!strongPassword.test(password)) {
       return res.status(400).json({
-        error: 'Ang password ay dapat hindi bababa sa 8 characters, may malaki at maliit na letra, numero, at special character (hal. !@#$%).',
+        error: 'Password must be at least 8 characters with uppercase and lowercase letters, a number, and a special character (e.g. !@#$%).',
       });
     }
 
@@ -131,10 +131,10 @@ app.post('/api/auth/customers/register', async (req, res) => {
     });
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ error: 'May account na gamit ang email na ito.' });
+      return res.status(400).json({ error: 'An account with this email already exists.' });
     }
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -144,23 +144,23 @@ app.post('/api/auth/customers/login', async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ error: 'Kailangan ng email at password.' });
+      return res.status(400).json({ error: 'Email and password are required.' });
     }
 
     const [rows] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
     if (rows.length === 0) {
-      return res.status(401).json({ error: 'Mali ang email o password.' });
+      return res.status(401).json({ error: 'Incorrect email or password.' });
     }
 
     const user = rows[0];
 
     if (!user.is_active) {
-      return res.status(403).json({ error: 'Naka-deactivate ang account mo. I-contact ang support.' });
+      return res.status(403).json({ error: 'Your account has been deactivated. Please contact support.' });
     }
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
-      return res.status(401).json({ error: 'Mali ang email o password.' });
+      return res.status(401).json({ error: 'Incorrect email or password.' });
     }
 
     const token = jwt.sign(
@@ -175,7 +175,7 @@ app.post('/api/auth/customers/login', async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -183,18 +183,18 @@ app.post('/api/auth/customers/login', async (req, res) => {
 function verifyCustomerToken(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Kailangan mag-login muna.' });
+    return res.status(401).json({ error: 'Please log in first.' });
   }
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.type !== 'customer') {
-      return res.status(403).json({ error: 'Customer account lang ang pwedeng gumamit nito.' });
+      return res.status(403).json({ error: 'Customer accounts only.' });
     }
     req.customer = decoded;
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'Expired o invalid na ang session mo.' });
+    return res.status(401).json({ error: 'Your session has expired. Please log in again.' });
   }
 }
 
@@ -205,7 +205,7 @@ app.put('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
     const { full_name, phone, address } = req.body;
 
     if (!full_name) {
-      return res.status(400).json({ error: 'Kailangan ng pangalan.' });
+      return res.status(400).json({ error: 'Full name is required.' });
     }
 
     await pool.query(
@@ -214,12 +214,12 @@ app.put('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
     );
 
     res.json({
-      message: 'Na-update na ang profile mo.',
+      message: 'Profile updated.',
       customer: { fullName: full_name, phone: phone || null, address: address || null },
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -242,7 +242,7 @@ app.get('/api/auth/customers', verifyToken, requirePermission('customers'), asyn
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -251,10 +251,10 @@ app.put('/api/auth/customers/:id/status', verifyToken, requirePermission('custom
   try {
     const { is_active } = req.body;
     await pool.query('UPDATE users SET is_active = ? WHERE user_id = ?', [is_active ? 1 : 0, req.params.id]);
-    res.json({ message: 'Na-update na ang status ng customer.' });
+    res.json({ message: 'Customer status updated.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -273,7 +273,7 @@ app.get('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) => 
     res.json(rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -283,7 +283,7 @@ app.post('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) =>
     const { username, password, full_name, email, role, permissions } = req.body;
 
     if (!username || !password || !full_name) {
-      return res.status(400).json({ error: 'Kailangan ng username, password, at full name.' });
+      return res.status(400).json({ error: 'Username, password, and full name are required.' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -298,10 +298,10 @@ app.post('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) =>
     res.status(201).json({ admin_id: result.insertId, username, full_name, email, role: finalRole, permissions });
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ error: 'Ginagamit na ang username na ito.' });
+      return res.status(400).json({ error: 'This username is already taken.' });
     }
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
@@ -309,13 +309,13 @@ app.post('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) =>
 app.delete('/api/auth/admins/:id', verifyToken, requireSuperAdmin, async (req, res) => {
   try {
     if (parseInt(req.params.id) === req.admin.adminId) {
-      return res.status(400).json({ error: 'Hindi mo pwedeng tanggalin ang sarili mong account.' });
+      return res.status(400).json({ error: 'You cannot delete your own account.' });
     }
     await pool.query('DELETE FROM admins WHERE admin_id = ?', [req.params.id]);
-    res.json({ message: 'Na-delete na ang admin account.' });
+    res.json({ message: 'Admin account deleted.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'May problema sa server.' });
+    res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 });
 
