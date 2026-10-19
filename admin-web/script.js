@@ -58,7 +58,7 @@ loginForm.addEventListener('submit', async (e) => {
     const data = await res.json();
 
     if (!res.ok) {
-      loginError.textContent = data.error || 'Hindi ma-login.';
+      loginError.textContent = data.error || 'Unable to log in.';
       return;
     }
 
@@ -66,7 +66,7 @@ loginForm.addEventListener('submit', async (e) => {
     sessionStorage.setItem('fitora_admin', JSON.stringify(data.admin));
     showApp();
   } catch (err) {
-    loginError.textContent = 'Hindi ma-reach ang server. Siguraduhing tumatakbo ang auth-service (port 4000).';
+    loginError.textContent = 'Cannot reach the server. Please check your internet connection and try again. (The server may take up to a minute to wake up.)';
   }
 });
 
@@ -191,12 +191,12 @@ async function loadDashboard() {
     const lowStockList = document.getElementById('lowStockList');
     lowStockList.innerHTML = lowStock.length
       ? lowStock.map(p => `<li><span>${p.product_name}</span><span>${p.stock} left</span></li>`).join('')
-      : '<li>Wala pang mababang stock.</li>';
+      : '<li>No low-stock products.</li>';
 
     const recentList = document.getElementById('recentOrdersList');
     recentList.innerHTML = orders.slice(0, 5).map(o =>
       `<li><span>Order #${o.order_id} - ${o.customer_name || 'N/A'}</span><span>₱${Number(o.total_amount).toLocaleString()}</span></li>`
-    ).join('') || '<li>Wala pang orders.</li>';
+    ).join('') || '<li>No orders yet.</li>';
 
   } catch (err) {
     console.error(err);
@@ -224,7 +224,7 @@ async function loadCategories(renderTable) {
             <button class="icon-btn danger" onclick="deleteCategory(${c.category_id})">Delete</button>
           </td>
         </tr>
-      `).join('') || '<tr><td colspan="3">Wala pang categories.</td></tr>';
+      `).join('') || '<tr><td colspan="3">No categories yet.</td></tr>';
     }
   } catch (err) {
     console.error(err);
@@ -241,7 +241,7 @@ async function loadProducts() {
     populateProductCategoryFilter();
     renderProductsTable();
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="6">Hindi ma-reach ang product-service (port 4001).</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6">Cannot reach the product service. Please try again.</td></tr>';
   }
 }
 
@@ -285,7 +285,7 @@ function renderProductsTable() {
         <button class="icon-btn danger" onclick="deleteProduct(${p.product_id})">Delete</button>
       </td>
     </tr>
-  `).join('') || '<tr><td colspan="7">Walang product na tumugma.</td></tr>';
+  `).join('') || '<tr><td colspan="7">No matching products.</td></tr>';
 }
 
 document.getElementById('productSearch').addEventListener('input', renderProductsTable);
@@ -293,13 +293,13 @@ document.getElementById('productCategoryFilter').addEventListener('change', rend
 document.getElementById('productSort').addEventListener('change', renderProductsTable);
 
 async function deleteProduct(id) {
-  if (!confirm('Sigurado ka bang gusto mong i-delete ang product na ito?')) return;
+  if (!confirm('Are you sure you want to delete this product?')) return;
   await fetch(API.PRODUCTS + '/products/' + id, { method: 'DELETE', headers: authHeaders() });
   loadProducts();
 }
 
 async function deleteCategory(id) {
-  if (!confirm('Sigurado ka bang gusto mong i-delete ang category na ito?')) return;
+  if (!confirm('Are you sure you want to delete this category?')) return;
   await fetch(API.PRODUCTS + '/categories/' + id, { method: 'DELETE', headers: authHeaders() });
   loadCategories(true);
 }
@@ -338,7 +338,7 @@ async function openProductModal(productId) {
 
     <label>Category</label>
     <select id="f_category">
-      <option value="">-- Walang category --</option>
+      <option value="">-- No category --</option>
       ${categoryOptions}
     </select>
 
@@ -348,12 +348,12 @@ async function openProductModal(productId) {
     <label>Image URL</label>
     <input type="text" id="f_image" placeholder="https://..." value="${product.image || ''}">
 
-    <label>O i-upload mula sa computer mo</label>
+    <label>Or upload from your computer</label>
     <input type="file" id="f_image_file" accept="image/*">
     <p id="uploadStatus" style="font-size:12px; color:#888; margin-top:4px;"></p>
 
     ${productId ? `
-    <label>Gallery (dagdag na larawan - harap, likod, gilid, atbp.)</label>
+    <label>Gallery (extra photos: front, back, side, etc.)</label>
     <div id="galleryThumbs" class="gallery-thumbs"><p style="font-size:12px;color:#888;">Loading...</p></div>
     <input type="file" id="f_gallery_file" accept="image/*" multiple>
     <p id="galleryUploadStatus" style="font-size:12px; color:#888; margin-top:4px;"></p>
@@ -406,7 +406,7 @@ async function openProductModal(productId) {
     const file = imageFileInput.files[0];
     if (!file) return;
 
-    uploadStatus.textContent = 'Ina-upload...';
+    uploadStatus.textContent = 'Uploading...';
 
     const formData = new FormData();
     formData.append('file', file);
@@ -421,12 +421,12 @@ async function openProductModal(productId) {
 
       if (data.secure_url) {
         imageUrlInput.value = data.secure_url;
-        uploadStatus.textContent = '✓ Successful ang upload!';
+        uploadStatus.textContent = '✓ Upload successful!';
       } else {
-        uploadStatus.textContent = 'May error sa upload. Subukan ulit.';
+        uploadStatus.textContent = 'Upload failed. Please try again.';
       }
     } catch (err) {
-      uploadStatus.textContent = 'Hindi ma-upload. I-check ang internet connection mo.';
+      uploadStatus.textContent = 'Could not upload. Please check your internet connection.';
     }
   });
 
@@ -445,7 +445,7 @@ async function openProductModal(productId) {
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        galleryUploadStatus.textContent = `Ina-upload ${i + 1} of ${files.length}...`;
+        galleryUploadStatus.textContent = `Uploading ${i + 1} of ${files.length}...`;
 
         const formData = new FormData();
         formData.append('file', file);
@@ -470,7 +470,7 @@ async function openProductModal(productId) {
         }
       }
 
-      galleryUploadStatus.textContent = `✓ ${files.length} larawan naidagdag sa gallery!`;
+      galleryUploadStatus.textContent = `✓ ${files.length} photo(s) added to the gallery!`;
       galleryFileInput.value = '';
       loadProductGallery(productId);
     });
@@ -493,9 +493,9 @@ async function loadProductGallery(productId) {
         <img src="${img.image_url}" class="gallery-thumb">
         <button type="button" class="gallery-remove-btn" onclick="deleteGalleryImage(${img.image_id}, ${productId})">×</button>
       </div>
-    `).join('') || '<p style="font-size:12px;color:#888;">Wala pang dagdag na larawan.</p>';
+    `).join('') || '<p style="font-size:12px;color:#888;">No extra photos yet.</p>';
   } catch (err) {
-    container.innerHTML = '<p style="font-size:12px;color:#e74c3c;">Hindi ma-load ang gallery.</p>';
+    container.innerHTML = '<p style="font-size:12px;color:#e74c3c;">Could not load the gallery.</p>';
   }
 }
 
@@ -565,7 +565,7 @@ async function loadInventory() {
     renderInventoryTable();
     loadStockLogs();
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="4">Hindi ma-reach ang product-service (port 4001).</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4">Cannot reach the product service. Please try again.</td></tr>';
   }
 }
 
@@ -583,7 +583,7 @@ function renderInventoryTable() {
       <td>${p.stock < 10 ? '<span class="badge badge-cancelled">' + p.stock + '</span>' : p.stock}</td>
       <td><button class="icon-btn" onclick="openStockModal(${p.product_id})">Adjust stock</button></td>
     </tr>
-  `).join('') || '<tr><td colspan="4">Wala pang products.</td></tr>';
+  `).join('') || '<tr><td colspan="4">No products yet.</td></tr>';
 }
 
 document.getElementById('inventoryFilter').addEventListener('change', renderInventoryTable);
@@ -597,9 +597,9 @@ async function loadStockLogs() {
     list.innerHTML = logs.map(l => {
       const sign = l.change_amount > 0 ? '+' : '';
       return `<li><span>${l.product_name} - ${l.reason}</span><span>${sign}${l.change_amount}</span></li>`;
-    }).join('') || '<li>Wala pang stock changes.</li>';
+    }).join('') || '<li>No stock changes yet.</li>';
   } catch (err) {
-    list.innerHTML = '<li>Hindi ma-load ang stock logs.</li>';
+    list.innerHTML = '<li>Could not load the stock history.</li>';
   }
 }
 
@@ -614,8 +614,8 @@ function openStockModal(productId) {
 
     <label>Reason</label>
     <select id="f_reason">
-      <option value="Restock">Restock (dagdag)</option>
-      <option value="Damaged">Damaged goods (bawas)</option>
+      <option value="Restock">Restock (add)</option>
+      <option value="Damaged">Damaged goods (remove)</option>
       <option value="Correction">Correction</option>
     </select>
 
@@ -643,7 +643,7 @@ function openStockModal(productId) {
     const data = await res.json();
 
     if (!res.ok) {
-      alert(data.error || 'May error sa pag-adjust ng stock.');
+      alert(data.error || 'Could not adjust the stock.');
       return;
     }
 
@@ -678,9 +678,9 @@ async function loadOrders() {
         </td>
         <td>${new Date(o.order_date).toLocaleDateString()}</td>
       </tr>
-    `).join('') || '<tr><td colspan="5">Wala pang orders.</td></tr>';
+    `).join('') || '<tr><td colspan="5">No orders yet.</td></tr>';
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="5">Hindi ma-reach ang order-service (port 4002).</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5">Cannot reach the order service. Please try again.</td></tr>';
   }
 }
 
@@ -714,12 +714,12 @@ async function loadReports() {
     const bestList = document.getElementById('bestSellersList');
     bestList.innerHTML = bestSellers.map(p =>
       `<li><span>${p.product_name}</span><span>${p.totalSold} sold - ₱${Number(p.totalRevenue).toLocaleString()}</span></li>`
-    ).join('') || '<li>Wala pang sales data.</li>';
+    ).join('') || '<li>No sales data yet.</li>';
 
     const catList = document.getElementById('categoryRevenueList');
     catList.innerHTML = byCategory.map(c =>
       `<li><span>${c.category_name}</span><span>₱${Number(c.revenue).toLocaleString()}</span></li>`
-    ).join('') || '<li>Wala pang categories.</li>';
+    ).join('') || '<li>No categories yet.</li>';
 
   } catch (err) {
     console.error(err);
@@ -769,7 +769,7 @@ async function loadCustomers() {
     allCustomers = await res.json();
     renderCustomersTable();
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="6">Hindi ma-reach ang auth-service (port 4000).</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6">Cannot reach the auth service. Please try again.</td></tr>';
   }
 }
 
@@ -796,7 +796,7 @@ function renderCustomersTable() {
         </button>
       </td>
     </tr>
-  `).join('') || '<tr><td colspan="6">Wala pang customers na naka-register.</td></tr>';
+  `).join('') || '<tr><td colspan="6">No registered customers yet.</td></tr>';
 }
 
 document.getElementById('customerSearch').addEventListener('input', renderCustomersTable);
@@ -832,7 +832,7 @@ async function loadNotifications() {
       ...lowStock.map(p => `<li><span>Low stock: ${p.product_name}</span><span>${p.stock} left</span></li>`),
       ...pendingOrders.map(o => `<li><span>Pending order #${o.order_id}</span><span>${o.customer_name || 'N/A'}</span></li>`),
     ];
-    list.innerHTML = items.join('') || '<li>Wala pang bagong notification.</li>';
+    list.innerHTML = items.join('') || '<li>No new notifications.</li>';
   } catch (err) {
     console.error(err);
   }
@@ -870,9 +870,9 @@ async function loadReviews() {
           <button class="icon-btn danger" onclick="deleteReview(${r.review_id})">Delete</button>
         </td>
       </tr>
-    `).join('') || '<tr><td colspan="6">Wala pang reviews.</td></tr>';
+    `).join('') || '<tr><td colspan="6">No reviews yet.</td></tr>';
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="6">Hindi ma-reach ang product-service (port 4001).</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6">Cannot reach the product service. Please try again.</td></tr>';
   }
 }
 
@@ -886,7 +886,7 @@ async function updateReviewStatus(reviewId, status) {
 }
 
 async function deleteReview(reviewId) {
-  if (!confirm('Sigurado ka bang gusto mong i-delete ang review na ito?')) return;
+  if (!confirm('Are you sure you want to delete this review?')) return;
   await fetch(API.PRODUCTS + '/reviews/' + reviewId, { method: 'DELETE', headers: authHeaders() });
   loadReviews();
 }
@@ -910,13 +910,13 @@ async function loadAdmins() {
         <td>${a.role === 'super_admin' ? 'Lahat' : (a.permissions || '').split(',').filter(Boolean).join(', ') || '-'}</td>
         <td>
           ${currentAdmin && currentAdmin.id === a.admin_id
-            ? '<span style="color:var(--text-muted); font-size:13px;">Ikaw ito</span>'
+            ? '<span style="color:var(--text-muted); font-size:13px;">You</span>'
             : `<button class="icon-btn danger" onclick="deleteAdmin(${a.admin_id})">Delete</button>`}
         </td>
       </tr>
-    `).join('') || '<tr><td colspan="6">Wala pang admins.</td></tr>';
+    `).join('') || '<tr><td colspan="6">No admins yet.</td></tr>';
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="4">Hindi ma-reach ang auth-service (port 4000).</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4">Cannot reach the auth service. Please try again.</td></tr>';
   }
 }
 
@@ -948,12 +948,12 @@ document.getElementById('addAdminBtn').addEventListener('click', () => {
 
     <label>Role</label>
     <select id="f_admin_role">
-      <option value="staff">Staff (limitadong access)</option>
-      <option value="super_admin">Super Admin (buong access)</option>
+      <option value="staff">Staff (limited access)</option>
+      <option value="super_admin">Super Admin (full access)</option>
     </select>
 
     <div id="permissionsGroup">
-      <label>Pwedeng buksan (para sa Staff lang)</label>
+      <label>Modules this staff member can open (Staff only)</label>
       ${PERMISSION_OPTIONS.map(([key, label]) => `
         <label style="display:flex; align-items:center; gap:8px; font-weight:normal; margin-top:6px;">
           <input type="checkbox" class="perm-checkbox" value="${key}"> ${label}
@@ -995,7 +995,7 @@ document.getElementById('addAdminBtn').addEventListener('click', () => {
     const data = await res.json();
 
     if (!res.ok) {
-      alert(data.error || 'May error sa pag-add ng admin.');
+      alert(data.error || 'Could not add the admin.');
       return;
     }
 
@@ -1007,11 +1007,11 @@ document.getElementById('addAdminBtn').addEventListener('click', () => {
 });
 
 async function deleteAdmin(adminId) {
-  if (!confirm('Sigurado ka bang gusto mong i-delete ang admin account na ito?')) return;
+  if (!confirm('Are you sure you want to delete this admin account?')) return;
   const res = await fetch(API.AUTH + '/admins/' + adminId, { method: 'DELETE', headers: authHeaders() });
   const data = await res.json();
   if (!res.ok) {
-    alert(data.error || 'Hindi ma-delete.');
+    alert(data.error || 'Could not delete.');
     return;
   }
   loadAdmins();
