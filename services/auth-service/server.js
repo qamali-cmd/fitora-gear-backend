@@ -29,6 +29,42 @@ const CODE_MINUTES = 10;      // how long a code stays valid
 const MAX_CODE_ATTEMPTS = 5;  // wrong guesses allowed per code
 const RESEND_SECONDS = 60;    // wait time before another code can be requested
 
+const NAME_RE = /^[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ .'-]{0,49}$/;
+const USERNAME_RE = /^[a-z0-9._]{4,20}$/;
+const USERNAME_MESSAGE = 'Username must be 4-20 characters: lowercase letters, numbers, dot, or underscore (with at least one letter).';
+const NAME_MESSAGE = "Names can only contain letters, spaces, and . ' - (up to 50 characters).";
+
+function cleanName(value) {
+  return String(value == null ? '' : value).trim().replace(/\s+/g, ' ');
+}
+
+function composeFullName(first, middle, last) {
+  return [first, middle, last].filter(Boolean).join(' ');
+}
+
+function validUsername(name) {
+  return USERNAME_RE.test(name) && /[a-z]/.test(name);
+}
+
+function isValidDate(text) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return false;
+  const date = new Date(text + 'T00:00:00Z');
+  return !isNaN(date.getTime()) && date.toISOString().slice(0, 10) === text;
+}
+
+function ageFromBirthday(text) {
+  const [y, m, d] = text.split('-').map(Number);
+  const now = new Date();
+  let age = now.getUTCFullYear() - y;
+  const diff = now.getUTCMonth() + 1 - m || now.getUTCDate() - d;
+  if (diff < 0) age -= 1;
+  return age;
+}
+
+function isUsernameDuplicate(err) {
+  return err.code === 'ER_DUP_ENTRY' && /uq_users_username/.test(err.sqlMessage || '');
+}
+
 function isDatabaseDown(err) {
   return ['ENOTFOUND', 'ECONNREFUSED', 'ETIMEDOUT', 'PROTOCOL_CONNECTION_LOST', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code);
 }
@@ -250,47 +286,51 @@ app.get('/api/auth/verify', (req, res) => {
 // POST /api/auth/customers/register - gumawa ng bagong customer account
 app.post('/api/auth/customers/register', async (req, res) => {
   try {
-    const { full_name, email, password, phone, address, birthday } = req.body;
+    const body = req.body || {};
+    const firstName = cleanName(body.first_name);
+    const middleName = cleanName(body.middle_name);
+    const lastName = cleanName(body.last_name);
+    const username = String(body.username || '').trim().toLowerCase();
+    const email = String(body.email || '').trim().toLowerCase();
+    const password = String(body.password || '');
+    const phone = String(body.phone || '').replace(/[\s()-]/g, '');
+    const address = String(body.address || '').trim();
+    const birthday = String(body.birthday || '').trim();
 
-    // EDIT DITO: kung gusto mong baguhin ang mga required fields
-    if (!full_name || !email || !password || !phone || !birthday) {
-      return res.status(400).json({ error: 'Full name, email, password, phone number, and birthday are required.' });
+    if (!firstName || !lastName || !username || !email || !password || !phone || !birthday) {
+      return res.status(400).json({ error: 'First name, last name, username, email, password, phone number, and birthday are required.' });
     }
+    if (!NAME_RE.test(firstName) || !NAME_RE.test(lastName) || (middleName && !NAME_RE.test(middleName))) {
+      return res.status(400).json({ error: NAME_MESSAGE });
+    }
+    if (!validUsername(username)) return res.status(400).json({ error: USERNAME_MESSAGE });
+    if (!EMAIL_RE.test(email) || email.length > 100) return res.status(400).json({ error: 'Please enter a valid email address.' });
+    if (!STRONG_PASSWORD_RE.test(password)) return res.status(400).json({ error: PASSWORD_MESSAGE });
+    if (!/^\+?\d{7,15}$/.test(phone)) return res.status(400).json({ error: 'Please enter a valid phone number (7-15 digits).' });
+    if (address.length > 255) return res.status(400).json({ error: 'Address is too long (255 characters maximum).' });
+    if (!isValidDate(birthday)) return res.status(400).json({ error: 'Birthday must be a real date in YYYY-MM-DD format.' });
+    const age = ageFromBirthday(birthday);
+    if (age < 13 || age > 120) return res.status(400).json({ error: 'You must be at least 13 years old to create an account.' });
 
-    if (!EMAIL_RE.test(String(email).trim())) {
-      return res.status(400).json({ error: 'Please enter a valid email address.' });
-    }
     if (!allow('register|' + req.ip, 10, 3600000)) {
       return res.status(429).json({ error: 'Too many sign-ups from this connection. Please try again later.' });
     }
 
-    // Mas strict na password rule: min. 8 characters, may uppercase, lowercase,
-    // number, at special character
-    const strongPassword = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
-    if (!strongPassword.test(password)) {
-      return res.status(400).json({
-        error: 'Password must be at least 8 characters with uppercase and lowercase letters, a number, and a special character (e.g. !@#$%).',
-      });
-    }
-
-    const emailClean = String(email).trim().toLowerCase();
+    const fullName = composeFullName(firstName, middleName, lastName);
     const hashedPassword = await bcrypt.hash(password, 10);
 
     const [result] = await pool.query(
-      'INSERT INTO users (full_name, email, password, phone, address, birthday, email_verified) VALUES (?, ?, ?, ?, ?, ?, 0)',
-      [full_name, emailClean, hashedPassword, phone, address || null, birthday]
+      `INSERT INTO users (full_name, first_name, middle_name, last_name, username, email, password, phone, address, birthday, email_verified)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      [fullName, firstName, middleName || null, lastName, username, email, hashedPassword, phone, address || null, birthday]
     );
 
-    const token = jwt.sign(
-      { userId: result.insertId, email: emailClean, type: 'customer' },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
+    const token = jwt.sign({ userId: result.insertId, email, type: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
 
     // Email the 6-digit code. If sending fails the account still exists and the app can ask for a new code.
     let emailSent = true;
     try {
-      await issueVerificationCode('customer', result.insertId, emailClean, full_name);
+      await issueVerificationCode('customer', result.insertId, email, firstName);
     } catch (mailErr) {
       console.error('Could not send the verification email:', mailErr.message);
       emailSent = false;
@@ -300,63 +340,74 @@ app.post('/api/auth/customers/register', async (req, res) => {
       token,
       emailSent,
       customer: {
-        id: result.insertId, fullName: full_name, email: emailClean, emailVerified: false,
-        phone, address: address || null, birthday, profilePhoto: null,
+        id: result.insertId, fullName, firstName, middleName: middleName || null, lastName, username, email,
+        emailVerified: false, phone, address: address || null, birthday, profilePhoto: null,
       },
     });
   } catch (err) {
-    if (err.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ error: 'An account with this email already exists.' });
-    }
-    console.error(err);
-    res.status(500).json({ error: 'Something went wrong on the server.' });
+    if (isUsernameDuplicate(err)) return res.status(400).json({ error: 'This username is already taken.' });
+    if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: 'An account with this email already exists.' });
+    handleError(res, err);
   }
 });
-
 // POST /api/auth/customers/login
 app.post('/api/auth/customers/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const body = req.body || {};
+    const identifier = String(body.identifier || body.email || '').trim().toLowerCase();
+    const password = String(body.password || '');
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required.' });
+    if (!identifier || !password) {
+      return res.status(400).json({ error: 'Email or username and password are required.' });
+    }
+    if (!allow('login|' + req.ip + '|' + identifier, 10, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Too many login attempts. Please wait 15 minutes and try again.' });
     }
 
-    const [rows] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
-    if (rows.length === 0) {
-      return res.status(401).json({ error: 'Incorrect email or password.' });
-    }
-
+    // An "@" means it is an email; usernames can never contain "@"
+    const column = identifier.includes('@') ? 'email' : 'username';
+    const [rows] = await pool.query(
+      `SELECT user_id, full_name, first_name, middle_name, last_name, username, email, password, phone, address,
+              profile_photo, is_active, email_verified, DATE_FORMAT(birthday, '%Y-%m-%d') AS birthday
+       FROM users WHERE ${column} = ?`,
+      [identifier]
+    );
     const user = rows[0];
+    const matches = user ? await bcrypt.compare(password, user.password) : false;
 
+    if (!matches) {
+      return res.status(401).json({ error: 'Incorrect email/username or password.' });
+    }
     if (!user.is_active) {
       return res.status(403).json({ error: 'Your account has been deactivated. Please contact support.' });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ error: 'Incorrect email or password.' });
-    }
-
-    const token = jwt.sign(
-      { userId: user.user_id, email: user.email, type: 'customer' },
-      JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
+    const token = jwt.sign({ userId: user.user_id, email: user.email, type: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
     res.json({
       token,
       customer: {
-        id: user.user_id, fullName: user.full_name, email: user.email, emailVerified: !!user.email_verified,
+        id: user.user_id, fullName: user.full_name, firstName: user.first_name, middleName: user.middle_name,
+        lastName: user.last_name, username: user.username, email: user.email, emailVerified: !!user.email_verified,
         phone: user.phone, address: user.address, birthday: user.birthday, profilePhoto: user.profile_photo || null,
       },
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Something went wrong on the server.' });
+    handleError(res, err);
   }
 });
 
+// Live check used by the sign-up screen
+app.get('/api/auth/customers/username-available', async (req, res) => {
+  try {
+    const username = String(req.query.username || '').trim().toLowerCase();
+    if (!validUsername(username)) return res.json({ available: false, reason: 'invalid' });
+    if (!allow('uname|' + req.ip, 60, 3600000)) return res.status(429).json({ error: 'Too many checks. Please try again later.' });
+    const [rows] = await pool.query('SELECT 1 FROM users WHERE username = ? LIMIT 1', [username]);
+    res.json({ available: rows.length === 0 });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
 // BAGO: guard para sa customer-only routes (ginagamit lang dito sa auth-service)
 async function verifyCustomerToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -392,17 +443,17 @@ async function verifyCustomerToken(req, res, next) {
 
 function customerProfile(u) {
   return {
-    id: u.user_id, fullName: u.full_name, email: u.email, emailVerified: !!u.email_verified,
+    id: u.user_id, fullName: u.full_name, firstName: u.first_name, middleName: u.middle_name, lastName: u.last_name,
+    username: u.username, email: u.email, emailVerified: !!u.email_verified,
     phone: u.phone, address: u.address, birthday: u.birthday, profilePhoto: u.profile_photo || null,
     createdAt: u.created_at, orderCount: Number(u.order_count || 0),
   };
 }
-
 // GET /api/auth/customers/me - the logged-in customer's full profile
 app.get('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT u.user_id, u.full_name, u.email, u.email_verified, u.phone, u.address, u.profile_photo, u.created_at,
+      `SELECT u.user_id, u.full_name, u.email, u.email_verified, u.first_name, u.middle_name, u.last_name, u.username, u.phone, u.address, u.profile_photo, u.created_at,
               DATE_FORMAT(u.birthday, '%Y-%m-%d') AS birthday,
               (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.user_id) AS order_count
        FROM users u WHERE u.user_id = ?`,
@@ -418,39 +469,73 @@ app.get('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
 app.put('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
   try {
     const body = req.body || {};
-    const fullName = String(body.full_name || '').trim();
-    const phone = String(body.phone || '').replace(/[\s()-]/g, '');
-    const address = String(body.address || '').trim();
+    const has = (key) => Object.prototype.hasOwnProperty.call(body, key);
+    const fields = [];
+    const values = [];
+    const customer = {};
 
-    if (fullName.length < 2 || fullName.length > 100) {
-      return res.status(400).json({ error: 'Full name must be 2-100 characters.' });
+    // Name: first/middle/last (or the old single "full_name")
+    let first = '', middle = '', last = '';
+    if (has('first_name') || has('last_name')) {
+      first = cleanName(body.first_name);
+      middle = cleanName(body.middle_name);
+      last = cleanName(body.last_name);
+      if (!first || !last) return res.status(400).json({ error: 'First name and last name are required.' });
+    } else if (has('full_name')) {
+      const parts = cleanName(body.full_name).split(' ');
+      first = parts[0] || '';
+      last = parts.slice(1).join(' ');
+      if (!first) return res.status(400).json({ error: 'Full name is required.' });
     }
-    if (phone && !/^\+?\d{7,15}$/.test(phone)) {
-      return res.status(400).json({ error: 'Please enter a valid phone number (7-15 digits).' });
-    }
-    if (address.length > 255) {
-      return res.status(400).json({ error: 'Address is too long (255 characters maximum).' });
+    if (first) {
+      if (!NAME_RE.test(first) || (last && !NAME_RE.test(last)) || (middle && !NAME_RE.test(middle))) {
+        return res.status(400).json({ error: NAME_MESSAGE });
+      }
+      const fullName = composeFullName(first, middle, last);
+      fields.push('full_name = ?', 'first_name = ?', 'middle_name = ?', 'last_name = ?');
+      values.push(fullName, first, middle || null, last);
+      Object.assign(customer, { fullName, firstName: first, middleName: middle || null, lastName: last });
     }
 
-    const customer = { fullName, phone: phone || null, address: address || null };
-    if (body.profile_photo !== undefined) {
+    if (has('username') && String(body.username).trim() !== '') {
+      const username = String(body.username).trim().toLowerCase();
+      if (!validUsername(username)) return res.status(400).json({ error: USERNAME_MESSAGE });
+      fields.push('username = ?');
+      values.push(username);
+      customer.username = username;
+    }
+    if (has('phone')) {
+      const phone = String(body.phone || '').replace(/[\s()-]/g, '');
+      if (phone && !/^\+?\d{7,15}$/.test(phone)) return res.status(400).json({ error: 'Please enter a valid phone number (7-15 digits).' });
+      fields.push('phone = ?');
+      values.push(phone || null);
+      customer.phone = phone || null;
+    }
+    if (has('address')) {
+      const address = String(body.address || '').trim();
+      if (address.length > 255) return res.status(400).json({ error: 'Address is too long (255 characters maximum).' });
+      fields.push('address = ?');
+      values.push(address || null);
+      customer.address = address || null;
+    }
+    if (has('profile_photo')) {
       const photo = cleanPhotoUrl(body.profile_photo);
       if (photo.error) return res.status(400).json({ error: photo.error });
-      await pool.query('UPDATE users SET full_name = ?, phone = ?, address = ?, profile_photo = ? WHERE user_id = ?', [
-        fullName, customer.phone, customer.address, photo.value, req.customer.userId,
-      ]);
+      fields.push('profile_photo = ?');
+      values.push(photo.value);
       customer.profilePhoto = photo.value;
-    } else {
-      await pool.query('UPDATE users SET full_name = ?, phone = ?, address = ? WHERE user_id = ?', [
-        fullName, customer.phone, customer.address, req.customer.userId,
-      ]);
     }
+
+    if (fields.length === 0) return res.status(400).json({ error: 'Nothing to update.' });
+
+    values.push(req.customer.userId);
+    await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE user_id = ?`, values);
     res.json({ message: 'Profile updated.', customer });
   } catch (err) {
+    if (isUsernameDuplicate(err)) return res.status(400).json({ error: 'This username is already taken.' });
     handleError(res, err);
   }
 });
-
 // POST /api/auth/customers/me/send-code - email a new 6-digit code
 app.post('/api/auth/customers/me/send-code', verifyCustomerToken, async (req, res) => {
   try {
@@ -508,7 +593,7 @@ app.put('/api/auth/customers/me/password', verifyCustomerToken, async (req, res)
 app.get('/api/auth/customers', verifyToken, requirePermission('customers'), async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT u.user_id, u.full_name, u.email, u.phone, u.address, u.is_active, u.email_verified, u.created_at,
+      SELECT u.user_id, u.full_name, u.username, u.email, u.phone, u.address, u.is_active, u.email_verified, u.created_at,
              COUNT(o.order_id) AS order_count
       FROM users u
       LEFT JOIN orders o ON o.user_id = u.user_id
