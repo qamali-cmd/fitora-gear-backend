@@ -27,6 +27,104 @@ function getToken() {
   return sessionStorage.getItem('fitora_token');
 }
 
+// ===========================================================
+// POP-UP MESSAGES (Fitora look, instead of the browser's plain alert and confirm boxes)
+// and the viewer for review photos and videos
+// ===========================================================
+(function addPopupStyles() {
+  const style = document.createElement('style');
+  style.textContent = `
+    .fx-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.62); display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 10000; animation: fxFade 0.15s ease-out; }
+    .fx-dialog { background: #fff; border-radius: 20px; width: 100%; max-width: 380px; padding: 28px 24px 22px; text-align: center; box-shadow: 0 18px 50px rgba(0,0,0,0.3); animation: fxPop 0.2s ease-out; }
+    .fx-ring { width: 84px; height: 84px; border-radius: 50%; margin: 0 auto 14px; display: flex; align-items: center; justify-content: center; }
+    .fx-icon { width: 62px; height: 62px; border-radius: 50%; color: #fff; font-size: 32px; font-weight: bold; display: flex; align-items: center; justify-content: center; }
+    .fx-success .fx-ring { background: #ffe8f1; } .fx-success .fx-icon { background: #fc408c; }
+    .fx-error .fx-ring { background: #fdeaea; } .fx-error .fx-icon { background: #e74c3c; }
+    .fx-warning .fx-ring { background: #fdf3e3; } .fx-warning .fx-icon { background: #f4a729; }
+    .fx-question .fx-ring, .fx-info .fx-ring { background: #eeeeee; } .fx-question .fx-icon, .fx-info .fx-icon { background: #111; }
+    .fx-dialog h3 { margin: 0; font-size: 19px; color: #111; }
+    .fx-dialog p { margin: 8px 0 0; font-size: 14px; color: #666; line-height: 1.5; }
+    .fx-buttons { display: flex; gap: 10px; margin-top: 22px; }
+    .fx-btn { flex: 1; border: 0; border-radius: 12px; padding: 13px 10px; font-size: 15px; font-weight: 600; cursor: pointer; color: #fff; background: #fc408c; }
+    .fx-btn:hover { filter: brightness(0.95); }
+    .fx-btn-cancel { background: #fff; color: #555; border: 1px solid #e2e2e2; }
+    .fx-btn-danger { background: #e74c3c; }
+    .fx-viewer-box { position: relative; max-width: 92vw; max-height: 88vh; }
+    .fx-viewer-box img, .fx-viewer-box video { max-width: 92vw; max-height: 84vh; border-radius: 12px; background: #000; display: block; }
+    .fx-viewer-close { position: absolute; top: -14px; right: -14px; width: 36px; height: 36px; border-radius: 50%; border: 0; background: #fc408c; color: #fff; font-size: 16px; cursor: pointer; }
+    @keyframes fxFade { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes fxPop { from { transform: scale(0.92); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  `;
+  document.head.appendChild(style);
+})();
+
+// Shows a pop-up and gives back the value of the button that was pressed
+function openPopup({ type, title, message, buttons }) {
+  return new Promise((resolve) => {
+    const symbols = { success: '✓', error: '!', warning: '!', question: '?', info: 'i' };
+    const overlay = document.createElement('div');
+    overlay.className = 'fx-overlay';
+    overlay.innerHTML = `
+      <div class="fx-dialog fx-${type}" role="dialog" aria-modal="true">
+        <div class="fx-ring"><div class="fx-icon">${symbols[type] || 'i'}</div></div>
+        <h3>${orderEsc(title)}</h3>
+        <p>${orderEsc(message)}</p>
+        <div class="fx-buttons">
+          ${buttons.map((b, i) => `<button type="button" class="fx-btn fx-btn-${b.style || 'primary'}" data-i="${i}">${orderEsc(b.text)}</button>`).join('')}
+        </div>
+      </div>`;
+    const choose = (value) => {
+      document.removeEventListener('keydown', onKey);
+      overlay.remove();
+      resolve(value);
+    };
+    const cancel = buttons.find(b => b.style === 'cancel');
+    const onKey = (e) => { if (e.key === 'Escape') choose(cancel ? cancel.value : buttons[0].value); };
+    overlay.querySelectorAll('button').forEach(btn => btn.addEventListener('click', () => choose(buttons[Number(btn.dataset.i)].value)));
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+    overlay.querySelector('button:last-child').focus();
+  });
+}
+
+// The old alert("...") calls now use the Fitora pop-up (the code after them keeps running, as before)
+window.alert = function (message) {
+  const text = String(message == null ? '' : message);
+  const problem = /could not|cannot|can't|unable|failed|invalid|not allowed|please allow|went wrong|error/i.test(text);
+  openPopup({ type: problem ? 'error' : 'info', title: problem ? 'Something went wrong' : 'Notice', message: text, buttons: [{ text: 'OK', value: true }] });
+};
+
+// Replaces confirm("..."): use it as   if (!(await askConfirm('...'))) return;
+function askConfirm(message, confirmText) {
+  const danger = /delete|remove/i.test(message);
+  const label = confirmText || (danger ? (/delete/i.test(message) ? 'Delete' : 'Remove') : 'Confirm');
+  return openPopup({
+    type: danger ? 'warning' : 'question',
+    title: 'Please confirm',
+    message,
+    buttons: [{ text: 'Cancel', style: 'cancel', value: false }, { text: label, style: danger ? 'danger' : 'primary', value: true }],
+  });
+}
+
+// Opens a review photo (full size) or plays a review video inside the admin panel
+function openMediaViewer(url, type) {
+  const overlay = document.createElement('div');
+  overlay.className = 'fx-overlay';
+  overlay.innerHTML = `
+    <div class="fx-viewer-box">
+      ${type === 'video'
+        ? `<video src="${orderEsc(url)}" controls autoplay playsinline></video>`
+        : `<img src="${orderEsc(url.replace('/image/upload/', '/image/upload/w_1400,q_auto/'))}" alt="Review photo">`}
+      <button type="button" class="fx-viewer-close" aria-label="Close">✕</button>
+    </div>`;
+  const close = () => { document.removeEventListener('keydown', onKey); overlay.remove(); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.querySelector('.fx-viewer-close').addEventListener('click', close);
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(overlay);
+}
+
 function authHeaders() {
   return {
     'Content-Type': 'application/json',
@@ -294,13 +392,13 @@ document.getElementById('productCategoryFilter').addEventListener('change', rend
 document.getElementById('productSort').addEventListener('change', renderProductsTable);
 
 async function deleteProduct(id) {
-  if (!confirm('Are you sure you want to delete this product?')) return;
+  if (!(await askConfirm('Are you sure you want to delete this product?'))) return;
   await fetch(API.PRODUCTS + '/products/' + id, { method: 'DELETE', headers: authHeaders() });
   loadProducts();
 }
 
 async function deleteCategory(id) {
-  if (!confirm('Are you sure you want to delete this category?')) return;
+  if (!(await askConfirm('Are you sure you want to delete this category?'))) return;
   await fetch(API.PRODUCTS + '/categories/' + id, { method: 'DELETE', headers: authHeaders() });
   loadCategories(true);
 }
@@ -670,7 +768,7 @@ async function setMainImage(productId, imageId) {
 }
 
 async function removeMainImage(productId) {
-  if (!confirm('Remove the main photo? The product will show a placeholder until you choose another one.')) return;
+  if (!(await askConfirm('Remove the main photo? The product will show a placeholder until you choose another one.'))) return;
   try {
     await saveMainImage(productId, '');
   } catch (err) {
@@ -680,7 +778,7 @@ async function removeMainImage(productId) {
 }
 
 async function deleteProductImage(imageId, productId) {
-  if (!confirm('Delete this photo?')) return;
+  if (!(await askConfirm('Delete this photo?'))) return;
   try {
     const galleryRes = await fetch(API.PRODUCTS + '/products/' + productId + '/images');
     const gallery = await galleryRes.json();
@@ -1080,7 +1178,7 @@ function openCancelModal(orderId) {
 }
 
 async function approveCancelRequest(orderId) {
-  if (!confirm('Approve this cancellation? The items will go back to stock.')) return;
+  if (!(await askConfirm('Approve this cancellation? The items will go back to stock.', 'Approve'))) return;
   if (await sendOrderAction('/orders/' + orderId + '/cancel-request', { decision: 'approve' })) {
     loadOrders();
     loadNotifications();
@@ -1270,11 +1368,17 @@ async function loadReviews() {
     const reviews = await res.json();
 
     tbody.innerHTML = reviews.map(r => {
-      // the photos and the video the customer added (click to open the full size)
-      const media = (r.media || []).map(m => m.type === 'video'
-        ? `<a href="${orderEsc(m.url)}" target="_blank" rel="noopener" style="display:inline-block; margin:4px 8px 0 0;">▶ Video</a>`
-        : `<a href="${orderEsc(m.url)}" target="_blank" rel="noopener"><img src="${orderEsc(m.url.replace('/image/upload/', '/image/upload/c_fill,w_80,h_80,q_auto/'))}" alt="Review photo" style="width:40px; height:40px; object-fit:cover; border-radius:6px; margin:4px 6px 0 0;"></a>`
-      ).join('');
+      // the photos and the video the customer added (click to view them here, without leaving the page)
+      const media = (r.media || []).map(m => {
+        const isVideo = m.type === 'video';
+        const picture = isVideo
+          ? m.url.replace('/video/upload/', '/video/upload/so_0,c_fill,w_88,h_88,q_auto/').replace(/\.[A-Za-z0-9]+$/, '.jpg')
+          : m.url.replace('/image/upload/', '/image/upload/c_fill,w_88,h_88,q_auto/');
+        return `<a href="${orderEsc(m.url)}" class="review-media" data-url="${orderEsc(m.url)}" data-type="${isVideo ? 'video' : 'image'}" target="_blank" rel="noopener" title="${isVideo ? 'Play video' : 'View photo'}" style="position:relative; display:inline-block; margin:4px 6px 0 0;">
+          <img src="${orderEsc(picture)}" alt="${isVideo ? 'Review video' : 'Review photo'}" style="width:44px; height:44px; object-fit:cover; border-radius:6px; display:block; background:#111;">
+          ${isVideo ? '<span style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-size:16px; text-shadow:0 0 4px #000;">▶</span>' : ''}
+        </a>`;
+      }).join('');
       return `
       <tr>
         <td>${orderEsc(r.product_name)}</td>
@@ -1289,6 +1393,15 @@ async function loadReviews() {
         </td>
       </tr>`;
     }).join('') || '<tr><td colspan="6">No reviews yet.</td></tr>';
+
+    // clicking a photo or the video opens the viewer
+    tbody.onclick = (e) => {
+      const link = e.target.closest('.review-media');
+      if (link) {
+        e.preventDefault();
+        openMediaViewer(link.dataset.url, link.dataset.type);
+      }
+    };
   } catch (err) {
     tbody.innerHTML = '<tr><td colspan="6">Cannot reach the product service. Please try again.</td></tr>';
   }
@@ -1304,7 +1417,7 @@ async function updateReviewStatus(reviewId, status) {
 }
 
 async function deleteReview(reviewId) {
-  if (!confirm('Are you sure you want to delete this review?')) return;
+  if (!(await askConfirm('Are you sure you want to delete this review?'))) return;
   await fetch(API.PRODUCTS + '/reviews/' + reviewId, { method: 'DELETE', headers: authHeaders() });
   loadReviews();
 }
@@ -1425,7 +1538,7 @@ document.getElementById('addAdminBtn').addEventListener('click', () => {
 });
 
 async function deleteAdmin(adminId) {
-  if (!confirm('Are you sure you want to delete this admin account?')) return;
+  if (!(await askConfirm('Are you sure you want to delete this admin account?'))) return;
   const res = await fetch(API.AUTH + '/admins/' + adminId, { method: 'DELETE', headers: authHeaders() });
   const data = await res.json();
   if (!res.ok) {
