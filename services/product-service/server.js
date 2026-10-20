@@ -251,6 +251,21 @@ app.delete('/api/products/:id', verifyToken, requirePermission('products'), asyn
 // REVIEWS MANAGEMENT (para sa ADMIN panel)
 // =====================================================
 
+// Adds the photos and the video to each review in the list: review.media = [{ url, type }]
+async function attachMedia(reviews) {
+  if (reviews.length === 0) return reviews;
+  const [media] = await pool.query(
+    'SELECT review_id, media_url AS url, media_type AS type FROM review_media WHERE review_id IN (?) ORDER BY media_id',
+    [reviews.map((r) => r.review_id)]
+  );
+  const byReview = new Map();
+  for (const item of media) {
+    if (!byReview.has(item.review_id)) byReview.set(item.review_id, []);
+    byReview.get(item.review_id).push({ url: item.url, type: item.type });
+  }
+  return reviews.map((r) => ({ ...r, media: byReview.get(r.review_id) || [] }));
+}
+
 // GET /api/reviews - lahat ng reviews kasama pangalan ng product at customer (admin lang)
 app.get('/api/reviews', verifyToken, requirePermission('reviews'), async (req, res) => {
   try {
@@ -261,7 +276,7 @@ app.get('/api/reviews', verifyToken, requirePermission('reviews'), async (req, r
       LEFT JOIN users u ON r.user_id = u.user_id
       ORDER BY r.created_at DESC
     `);
-    res.json(rows);
+    res.json(await attachMedia(rows));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -310,6 +325,22 @@ app.get('/api/products/:id/reviews', async (req, res) => {
       WHERE r.product_id = ? AND r.status = 'approved'
       ORDER BY r.created_at DESC
     `, [req.params.id]);
+    res.json(await attachMedia(rows));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// GET /api/reviews/my?order_id=7 - the reviews the customer already wrote for one order
+app.get('/api/reviews/my', verifyCustomerToken, async (req, res) => {
+  try {
+    const orderId = Number(req.query.order_id);
+    if (!Number.isInteger(orderId) || orderId <= 0) return res.status(400).json({ error: 'Invalid order.' });
+    const [rows] = await pool.query(
+      'SELECT review_id, product_id, rating, status FROM reviews WHERE user_id = ? AND order_id = ?',
+      [req.customer.userId, orderId]
+    );
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -317,25 +348,90 @@ app.get('/api/products/:id/reviews', async (req, res) => {
   }
 });
 
-// POST /api/products/:id/reviews - gumawa ng bagong review (kailangan naka-login
-// na CUSTOMER). Ang bagong review ay 'pending' muna hanggang ma-approve ng admin.
-app.post('/api/products/:id/reviews', verifyCustomerToken, async (req, res) => {
-  try {
-    const { rating, comment } = req.body;
+// Only photos and videos that were uploaded to the shop's Cloudinary are accepted
+const MEDIA_URL = /^https:\/\/res\.cloudinary\.com\/roit6yup\/(image|video)\/upload\/[A-Za-z0-9_\-./%,]+$/;
+const MAX_REVIEW_PHOTOS = 5;
+const MAX_REVIEW_VIDEOS = 1;
 
-    if (!rating || rating < 1 || rating > 5) {
-      return res.status(400).json({ error: 'A rating from 1 to 5 is required.' });
+function checkReviewMedia(media) {
+  if (media === undefined || media === null) return { items: [] };
+  if (!Array.isArray(media)) return { error: 'The photos and video are not valid.' };
+  const items = [];
+  let photos = 0;
+  let videos = 0;
+  for (const entry of media) {
+    const url = String((entry && entry.url) || '');
+    const match = MEDIA_URL.exec(url);
+    if (!match || url.length > 500 || match[1] !== (entry && entry.type)) return { error: 'One of the photos or videos is not valid.' };
+    if (match[1] === 'image') photos++;
+    else videos++;
+    items.push({ url, type: match[1] });
+  }
+  if (photos > MAX_REVIEW_PHOTOS) return { error: `You can add up to ${MAX_REVIEW_PHOTOS} photos.` };
+  if (videos > MAX_REVIEW_VIDEOS) return { error: `You can add only ${MAX_REVIEW_VIDEOS} video.` };
+  return { items };
+}
+
+// POST /api/products/:id/reviews - a customer reviews an item of their own COMPLETED order (once).
+// The review waits for the shop's approval before it appears on the product page.
+app.post('/api/products/:id/reviews', verifyCustomerToken, async (req, res) => {
+  const productId = Number(req.params.id);
+  const body = req.body || {};
+  const orderId = Number(body.order_id);
+  const stars = Number(body.rating);
+  const comment = String(body.comment || '').trim();
+
+  if (!Number.isInteger(productId) || productId <= 0 || !Number.isInteger(orderId) || orderId <= 0) {
+    return res.status(400).json({ error: 'Please review the item from your order.' });
+  }
+  if (!Number.isInteger(stars) || stars < 1 || stars > 5) return res.status(400).json({ error: 'A rating from 1 to 5 is required.' });
+  if (comment.length > 500) return res.status(400).json({ error: 'The review is too long (500 characters maximum).' });
+  const media = checkReviewMedia(body.media);
+  if (media.error) return res.status(400).json({ error: media.error });
+
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    const [orders] = await conn.query(
+      `SELECT o.status FROM orders o JOIN order_items oi ON oi.order_id = o.order_id
+       WHERE o.order_id = ? AND o.user_id = ? AND oi.product_id = ? LIMIT 1`,
+      [orderId, req.customer.userId, productId]
+    );
+    if (orders.length === 0) {
+      await conn.rollback();
+      return res.status(403).json({ error: 'You can only review items from your own orders.' });
+    }
+    if (orders[0].status !== 'completed') {
+      await conn.rollback();
+      return res.status(400).json({ error: 'You can review an item after you confirm that you received the order.' });
+    }
+    const [existing] = await conn.query(
+      'SELECT review_id FROM reviews WHERE user_id = ? AND order_id = ? AND product_id = ?',
+      [req.customer.userId, orderId, productId]
+    );
+    if (existing.length > 0) {
+      await conn.rollback();
+      return res.status(409).json({ error: 'You already reviewed this item.' });
     }
 
-    const [result] = await pool.query(
-      'INSERT INTO reviews (product_id, user_id, rating, comment, status) VALUES (?, ?, ?, ?, ?)',
-      [req.params.id, req.customer.userId, rating, comment || null, 'pending']
+    const [result] = await conn.query(
+      'INSERT INTO reviews (product_id, user_id, order_id, rating, comment, status) VALUES (?, ?, ?, ?, ?, ?)',
+      [productId, req.customer.userId, orderId, stars, comment || null, 'pending']
     );
-
+    for (const item of media.items) {
+      await conn.query('INSERT INTO review_media (review_id, media_url, media_type) VALUES (?, ?, ?)', [result.insertId, item.url, item.type]);
+    }
+    await conn.commit();
     res.status(201).json({ review_id: result.insertId, message: 'Your review was submitted.' });
   } catch (err) {
+    if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
+    if (err && err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'You already reviewed this item.' });
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
+  } finally {
+    if (conn) conn.release();
   }
 });
 

@@ -1269,20 +1269,26 @@ async function loadReviews() {
     const res = await fetch(API.PRODUCTS + '/reviews', { headers: authHeaders() });
     const reviews = await res.json();
 
-    tbody.innerHTML = reviews.map(r => `
+    tbody.innerHTML = reviews.map(r => {
+      // the photos and the video the customer added (click to open the full size)
+      const media = (r.media || []).map(m => m.type === 'video'
+        ? `<a href="${orderEsc(m.url)}" target="_blank" rel="noopener" style="display:inline-block; margin:4px 8px 0 0;">▶ Video</a>`
+        : `<a href="${orderEsc(m.url)}" target="_blank" rel="noopener"><img src="${orderEsc(m.url.replace('/image/upload/', '/image/upload/c_fill,w_80,h_80,q_auto/'))}" alt="Review photo" style="width:40px; height:40px; object-fit:cover; border-radius:6px; margin:4px 6px 0 0;"></a>`
+      ).join('');
+      return `
       <tr>
-        <td>${r.product_name}</td>
-        <td>${r.customer_name}</td>
+        <td>${orderEsc(r.product_name)}</td>
+        <td>${orderEsc(r.customer_name)}</td>
         <td>${'★'.repeat(r.rating)}${'☆'.repeat(5 - r.rating)}</td>
-        <td>${r.comment || '-'}</td>
+        <td>${orderEsc(r.comment || '-')}${media ? `<div>${media}</div>` : ''}</td>
         <td><span class="badge badge-${r.status === 'approved' ? 'active' : r.status === 'hidden' ? 'inactive' : 'pending'}">${r.status}</span></td>
         <td>
           ${r.status !== 'approved' ? `<button class="icon-btn" onclick="updateReviewStatus(${r.review_id}, 'approved')">Approve</button>` : ''}
           ${r.status !== 'hidden' ? `<button class="icon-btn" onclick="updateReviewStatus(${r.review_id}, 'hidden')">Hide</button>` : ''}
           <button class="icon-btn danger" onclick="deleteReview(${r.review_id})">Delete</button>
         </td>
-      </tr>
-    `).join('') || '<tr><td colspan="6">No reviews yet.</td></tr>';
+      </tr>`;
+    }).join('') || '<tr><td colspan="6">No reviews yet.</td></tr>';
   } catch (err) {
     tbody.innerHTML = '<tr><td colspan="6">Cannot reach the product service. Please try again.</td></tr>';
   }
