@@ -3,10 +3,10 @@
    EDIT DITO: mga kulay ng theme mo (line 5-10)
    ========================================================= */
 :root {
-  --primary: #6c5ce7;      /* main accent color - EDIT DITO */
-  --primary-dark: #5a4bd4;
+  --primary: #fc408c;      /* main accent color - EDIT DITO */
+  --primary-dark: #e22e78;
   --bg: #f4f5f7;
-  --sidebar-bg: #241c38;
+  --sidebar-bg: #0d0d0d;
   --text-dark: #222;
   --text-muted: #888;
   --danger: #e74c3c;
@@ -82,14 +82,14 @@ body {
   gap: 4px;
 }
 
-.admin-tag { font-size: 10px; color: #a29bd6; letter-spacing: 1px; }
+.admin-tag { font-size: 10px; color: #ff8fbb; letter-spacing: 1px; }
 
 .sidebar nav { display: flex; flex-direction: column; flex: 1; }
 
 .nav-link {
   display: block;
   padding: 12px 20px;
-  color: #cfcbe0;
+  color: #d9d9d9;
   text-decoration: none;
   font-size: 14px;
 }
@@ -103,8 +103,8 @@ body {
   margin: 12px 20px 0;
   padding: 10px;
   background: none;
-  border: 1px solid #4a4064;
-  color: #cfcbe0;
+  border: 1px solid #3a3a3a;
+  color: #d9d9d9;
   border-radius: 6px;
   cursor: pointer;
   font-size: 13px;
@@ -345,7 +345,7 @@ tr:hover { background-color: #fafafa; }
   width: 40px;
   height: 40px;
   border-radius: 6px;
-  background: #f0eefc;
+  background: #fff0f6;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -448,3 +448,9 @@ select.status-select {
 .image-tag { position: absolute; top: 4px; left: 4px; background: var(--primary); color: #fff; font-size: 10px; padding: 1px 6px; border-radius: 8px; }
 .tile-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px 6px; margin-top: 4px; }
 .tile-actions .icon-btn { margin-right: 0; font-size: 12px; }
+
+/* FITORA THEME: logo and branded login */
+.login-screen { background: #0d0d0d; }
+.login-logo { display: block; width: 96px; height: 96px; margin: 0 auto 12px; border-radius: 50%; }
+.sidebar-brand { display: flex; align-items: center; gap: 10px; }
+.sidebar-logo { width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0; }
