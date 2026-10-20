@@ -255,7 +255,7 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
     let paymentError = null;
     if (paymentMethod === 'gcash') {
       try {
-        const session = await createCheckoutSession({ order_id: orderId, total_amount: totalAmount }, publicBaseUrl(req));
+        const session = await createCheckoutSession({ order_id: orderId, total_amount: totalAmount }, publicBaseUrl(req), cleanAppLink(body.app_return_url));
         await pool.query('UPDATE orders SET paymongo_session_id = ?, checkout_url = ? WHERE order_id = ?', [session.id, session.url, orderId]);
         checkoutUrl = session.url;
       } catch (err) {
@@ -822,8 +822,16 @@ async function paymongo(method, path, body) {
   return data;
 }
 
+// The address that opens the Fitora Gear app (the app sends it). Only the app's own kinds of address are
+// accepted: never a normal web address, so nobody can use our page to send customers to another website.
+function cleanAppLink(value) {
+  if (typeof value !== 'string' || value.length > 300) return null;
+  return /^(exp|exps|fitoragear):\/\/[^\s"'<>\\]+$/.test(value) ? value : null;
+}
+
 // One checkout page for one order, for the full amount (items + shipping - discount)
-async function createCheckoutSession(order, baseUrl) {
+async function createCheckoutSession(order, baseUrl, appLink) {
+  const back = appLink ? `&app=${encodeURIComponent(appLink)}` : '';
   const amount = Math.round(Number(order.total_amount) * 100); // PayMongo counts in centavos
   const data = await paymongo('POST', '/checkout_sessions', {
     data: {
@@ -832,8 +840,8 @@ async function createCheckoutSession(order, baseUrl) {
         payment_method_types: ['gcash'],
         description: `Fitora Gear order #${order.order_id}`,
         reference_number: `FG-${order.order_id}`,
-        success_url: `${baseUrl}/pay/success?order=${order.order_id}`,
-        cancel_url: `${baseUrl}/pay/cancelled?order=${order.order_id}`,
+        success_url: `${baseUrl}/pay/success?order=${order.order_id}${back}`,
+        cancel_url: `${baseUrl}/pay/cancelled?order=${order.order_id}${back}`,
         send_email_receipt: false,
         show_line_items: true,
       },
@@ -929,10 +937,15 @@ app.post('/api/orders/my/:id/pay', verifyCustomerToken, async (req, res) => {
     }
     const checked = await verifyPayment(id); // maybe it was already paid
     if (checked && checked.payment_status === 'paid') return res.json({ payment_status: 'paid', checkout_url: null });
-    if (order.checkout_url) return res.json({ payment_status: 'awaiting_payment', checkout_url: order.checkout_url });
+    // With a return link we open a fresh page: each checkout page is single-use, and an old page may point
+    // to an old app session. Without one, the page that is already open is reused.
+    const appLink = cleanAppLink(req.body && req.body.app_return_url);
+    if (order.checkout_url && !appLink) return res.json({ payment_status: 'awaiting_payment', checkout_url: order.checkout_url });
 
-    const session = await createCheckoutSession(order, publicBaseUrl(req));
+    const previousSession = order.paymongo_session_id; // noted first, before it is replaced
+    const session = await createCheckoutSession(order, publicBaseUrl(req), appLink);
     await pool.query('UPDATE orders SET paymongo_session_id = ?, checkout_url = ? WHERE order_id = ?', [session.id, session.url, id]);
+    if (previousSession) await expireCheckout(previousSession); // the old page can no longer be paid
     res.json({ payment_status: 'awaiting_payment', checkout_url: session.url });
   } catch (err) {
     console.error('Could not open the GCash checkout:', err.message);
@@ -941,7 +954,11 @@ app.post('/api/orders/my/:id/pay', verifyCustomerToken, async (req, res) => {
 });
 
 // The page the customer sees after paying on the PayMongo page (it also confirms the payment)
-function paymentPage({ ok, title, message }) {
+function paymentPage({ ok, title, message, appLink }) {
+  const back = appLink
+    ? `<a class="back" href="${escapeHtml(appLink)}">Return to the Fitora Gear app</a>
+<script>setTimeout(function () { window.location.href = ${JSON.stringify(appLink).replace(/</g, '\\u003c')}; }, 700);</script>`
+    : '';
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title} - Fitora Gear</title>
 <style>
@@ -950,8 +967,9 @@ function paymentPage({ ok, title, message }) {
   .mark { width: 72px; height: 72px; border-radius: 50%; background: ${ok ? '#fc408c' : '#f4a729'}; color: #fff; font-size: 40px; font-weight: bold; line-height: 72px; margin: 0 auto 16px; }
   h1 { font-size: 21px; margin: 0 0 8px; color: #111; } p { color: #666; font-size: 15px; line-height: 1.5; margin: 0; }
   .brand { margin-top: 22px; color: #fc408c; font-weight: bold; letter-spacing: 2px; font-size: 13px; }
+  .back { display: block; margin-top: 22px; background: #fc408c; color: #fff; text-decoration: none; padding: 14px; border-radius: 12px; font-weight: bold; font-size: 15px; }
 </style></head>
-<body><div class="card"><div class="mark">${ok ? '✓' : '!'}</div><h1>${title}</h1><p>${message}</p><div class="brand">FITORA GEAR</div></div></body></html>`;
+<body><div class="card"><div class="mark">${ok ? '✓' : '!'}</div><h1>${title}</h1><p>${message}</p>${back}<div class="brand">FITORA GEAR</div></div></body></html>`;
 }
 
 app.get('/pay/success', async (req, res) => {
@@ -965,9 +983,10 @@ app.get('/pay/success', async (req, res) => {
       console.warn('Could not confirm the payment on the success page:', err.message);
     }
   }
+  const appLink = cleanAppLink(req.query.app);
   res.type('html').send(paymentPage(paid
-    ? { ok: true, title: 'Payment received', message: 'Thank you! Your GCash payment was received. You can close this page and go back to the Fitora Gear app.' }
-    : { ok: false, title: 'We are confirming your payment', message: 'Please go back to the Fitora Gear app. Your order will update in a moment.' }));
+    ? { ok: true, title: 'Payment received', message: 'Thank you! Your GCash payment was received. Taking you back to the Fitora Gear app...', appLink }
+    : { ok: false, title: 'We are confirming your payment', message: 'Please go back to the Fitora Gear app. Your order will update in a moment.', appLink }));
 });
 
 app.get('/pay/cancelled', (req, res) => {
@@ -975,6 +994,7 @@ app.get('/pay/cancelled', (req, res) => {
     ok: false,
     title: 'Payment not completed',
     message: `No money was taken. Go back to the Fitora Gear app and open your order to try again. Unpaid orders are cancelled after ${PAYMENT_WINDOW_MINUTES} minutes.`,
+    appLink: cleanAppLink(req.query.app),
   }));
 });
 
