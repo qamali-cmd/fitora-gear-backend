@@ -518,6 +518,15 @@ app.put('/api/auth/customers/me', verifyCustomerToken, async (req, res) => {
       values.push(address || null);
       customer.address = address || null;
     }
+    if (has('birthday') && String(body.birthday).trim() !== '') {
+      const birthday = String(body.birthday).trim();
+      if (!isValidDate(birthday)) return res.status(400).json({ error: 'Birthday must be a real date in YYYY-MM-DD format.' });
+      const age = ageFromBirthday(birthday);
+      if (age < 13 || age > 120) return res.status(400).json({ error: 'You must be at least 13 years old.' });
+      fields.push('birthday = ?');
+      values.push(birthday);
+      customer.birthday = birthday;
+    }
     if (has('profile_photo')) {
       const photo = cleanPhotoUrl(body.profile_photo);
       if (photo.error) return res.status(400).json({ error: photo.error });
@@ -795,6 +804,192 @@ app.delete('/api/auth/admins/:id', verifyToken, requireSuperAdmin, async (req, r
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// =====================================================
+// CUSTOMER ADDRESS BOOK (delivery addresses)
+// =====================================================
+const MAX_ADDRESSES = 10;
+
+function addressText(value, max) {
+  return String(value == null ? '' : value).trim().replace(/\s+/g, ' ').slice(0, max + 1);
+}
+function addressCode(value) {
+  return /^\d{1,12}$/.test(String(value == null ? '' : value)) ? String(value) : null;
+}
+
+// Checks the body of "add/edit address". Returns { error } or { data }.
+function parseAddressBody(body) {
+  const b = body || {};
+  const data = {
+    recipient_name: addressText(b.recipient_name, 100),
+    phone: String(b.phone || '').replace(/[\s()-]/g, ''),
+    region_code: addressCode(b.region_code),
+    region_name: addressText(b.region_name, 100),
+    province_code: addressCode(b.province_code),
+    province_name: addressText(b.province_name, 100),
+    city_code: addressCode(b.city_code),
+    city_name: addressText(b.city_name, 100),
+    barangay_code: addressCode(b.barangay_code),
+    barangay_name: addressText(b.barangay_name, 100),
+    street: addressText(b.street, 200),
+    zip_code: String(b.zip_code || '').trim(),
+    landmark: addressText(b.landmark, 150) || null,
+    label: b.label === 'office' ? 'office' : 'home',
+    is_default: b.is_default === true || b.is_default === 1,
+  };
+  if (data.recipient_name.length < 2 || data.recipient_name.length > 100) return { error: 'Please enter the recipient name (2-100 characters).' };
+  if (!/^\+?\d{7,15}$/.test(data.phone)) return { error: 'Please enter a valid phone number (7-15 digits).' };
+  const required = [['region_name', 'region'], ['province_name', 'province'], ['city_name', 'city or municipality'], ['barangay_name', 'barangay']];
+  for (const [key, label] of required) {
+    if (data[key].length < 2 || data[key].length > 100) return { error: `Please choose or enter the ${label}.` };
+  }
+  if (data.street.length < 3 || data.street.length > 200) return { error: 'Please enter the house number, street, or building (3-200 characters).' };
+  if (!/^\d{4}$/.test(data.zip_code)) return { error: 'The ZIP code must be exactly 4 digits.' };
+  if (data.landmark && data.landmark.length > 150) return { error: 'The landmark is too long (150 characters maximum).' };
+  return { data };
+}
+
+const ADDRESS_COLUMNS = [
+  'recipient_name', 'phone', 'region_code', 'region_name', 'province_code', 'province_name',
+  'city_code', 'city_name', 'barangay_code', 'barangay_name', 'street', 'zip_code', 'landmark', 'label',
+];
+
+app.get('/api/auth/customers/me/addresses', verifyCustomerToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM user_addresses WHERE user_id = ? ORDER BY is_default DESC, address_id DESC',
+      [req.customer.userId]
+    );
+    res.json(rows.map((row) => ({ ...row, is_default: !!row.is_default })));
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+app.post('/api/auth/customers/me/addresses', verifyCustomerToken, async (req, res) => {
+  let conn;
+  try {
+    const parsed = parseAddressBody(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const a = parsed.data;
+    const userId = req.customer.userId;
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    const [[{ total }]] = await conn.query('SELECT COUNT(*) AS total FROM user_addresses WHERE user_id = ?', [userId]);
+    if (total >= MAX_ADDRESSES) {
+      await conn.rollback();
+      return res.status(400).json({ error: `You can save up to ${MAX_ADDRESSES} addresses. Please delete one first.` });
+    }
+
+    // The first address, or one marked as default, becomes the default
+    const makeDefault = a.is_default || total === 0;
+    if (makeDefault) await conn.query('UPDATE user_addresses SET is_default = 0 WHERE user_id = ?', [userId]);
+
+    const [result] = await conn.query(
+      `INSERT INTO user_addresses (user_id, ${ADDRESS_COLUMNS.join(', ')}, is_default)
+       VALUES (?, ${ADDRESS_COLUMNS.map(() => '?').join(', ')}, ?)`,
+      [userId, ...ADDRESS_COLUMNS.map((column) => a[column]), makeDefault ? 1 : 0]
+    );
+    await conn.commit();
+    res.status(201).json({ address_id: result.insertId, message: 'Address saved.' });
+  } catch (err) {
+    if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
+    handleError(res, err);
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+app.put('/api/auth/customers/me/addresses/:id/default', verifyCustomerToken, async (req, res) => {
+  let conn;
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid address.' });
+    const userId = req.customer.userId;
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    const [rows] = await conn.query('SELECT address_id FROM user_addresses WHERE address_id = ? AND user_id = ?', [id, userId]);
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Address not found.' });
+    }
+    await conn.query('UPDATE user_addresses SET is_default = 0 WHERE user_id = ?', [userId]);
+    await conn.query('UPDATE user_addresses SET is_default = 1 WHERE address_id = ? AND user_id = ?', [id, userId]);
+    await conn.commit();
+    res.json({ message: 'Default address updated.' });
+  } catch (err) {
+    if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
+    handleError(res, err);
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+app.put('/api/auth/customers/me/addresses/:id', verifyCustomerToken, async (req, res) => {
+  let conn;
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid address.' });
+    const parsed = parseAddressBody(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const a = parsed.data;
+    const userId = req.customer.userId;
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    const [rows] = await conn.query('SELECT address_id, is_default FROM user_addresses WHERE address_id = ? AND user_id = ?', [id, userId]);
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Address not found.' });
+    }
+    if (a.is_default) await conn.query('UPDATE user_addresses SET is_default = 0 WHERE user_id = ?', [userId]);
+
+    await conn.query(
+      `UPDATE user_addresses SET ${ADDRESS_COLUMNS.map((column) => `${column} = ?`).join(', ')}, is_default = ?
+       WHERE address_id = ? AND user_id = ?`,
+      [...ADDRESS_COLUMNS.map((column) => a[column]), a.is_default ? 1 : (rows[0].is_default ? 1 : 0), id, userId]
+    );
+    await conn.commit();
+    res.json({ message: 'Address updated.' });
+  } catch (err) {
+    if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
+    handleError(res, err);
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+app.delete('/api/auth/customers/me/addresses/:id', verifyCustomerToken, async (req, res) => {
+  let conn;
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid address.' });
+    const userId = req.customer.userId;
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    const [rows] = await conn.query('SELECT address_id, is_default FROM user_addresses WHERE address_id = ? AND user_id = ?', [id, userId]);
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Address not found.' });
+    }
+    await conn.query('DELETE FROM user_addresses WHERE address_id = ? AND user_id = ?', [id, userId]);
+    // If the default address was deleted, the newest remaining one becomes the default
+    if (rows[0].is_default) {
+      await conn.query('UPDATE user_addresses SET is_default = 1 WHERE user_id = ? ORDER BY address_id DESC LIMIT 1', [userId]);
+    }
+    await conn.commit();
+    res.json({ message: 'Address deleted.' });
+  } catch (err) {
+    if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
+    handleError(res, err);
+  } finally {
+    if (conn) conn.release();
   }
 });
 

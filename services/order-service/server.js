@@ -34,11 +34,25 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
 
   const conn = await pool.getConnection();
   try {
-    const { items, shipping_address } = req.body;
+    const { items, shipping_address, address_id } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       conn.release();
       return res.status(400).json({ error: 'Your cart is empty.' });
+    }
+
+    // Delivery address: a saved address (address_id) is preferred; a plain text address still works
+    let ship = null;
+    let addressText = shipping_address || null;
+    if (address_id) {
+      const [addressRows] = await conn.query('SELECT * FROM user_addresses WHERE address_id = ? AND user_id = ?', [address_id, req.customer.userId]);
+      if (addressRows.length === 0) {
+        conn.release();
+        return res.status(400).json({ error: 'Please choose a valid delivery address.' });
+      }
+      ship = addressRows[0];
+      addressText = [ship.recipient_name, ship.phone, ship.street, 'Brgy. ' + ship.barangay_name, ship.city_name, ship.province_name, ship.region_name, ship.zip_code]
+        .join(', ').slice(0, 250);
     }
 
     await conn.beginTransaction();
@@ -68,8 +82,13 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
     }
 
     const [orderResult] = await conn.query(
-      'INSERT INTO orders (user_id, total_amount, status, shipping_address) VALUES (?, ?, ?, ?)',
-      [req.customer.userId, totalAmount, 'pending', shipping_address || null]
+      `INSERT INTO orders (user_id, total_amount, status, shipping_address, ship_name, ship_phone, ship_region, ship_province,
+                           ship_city, ship_barangay, ship_street, ship_zip, ship_landmark, ship_region_code, ship_province_code)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [req.customer.userId, totalAmount, 'pending', addressText,
+        ship ? ship.recipient_name : null, ship ? ship.phone : null, ship ? ship.region_name : null, ship ? ship.province_name : null,
+        ship ? ship.city_name : null, ship ? ship.barangay_name : null, ship ? ship.street : null, ship ? ship.zip_code : null,
+        ship ? ship.landmark : null, ship ? ship.region_code : null, ship ? ship.province_code : null]
     );
     const orderId = orderResult.insertId;
 
