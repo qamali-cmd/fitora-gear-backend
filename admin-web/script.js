@@ -967,6 +967,29 @@ function orderEsc(text) {
   return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// The payment of an order in words: "GCash · Paid", "Cash on Delivery · Collect ₱665", and so on
+function paymentLine(o) {
+  const method = o.payment_method === 'gcash' ? 'GCash' : 'Cash on Delivery';
+  const amount = '₱' + Number(o.total_amount).toLocaleString();
+  const labels = {
+    paid: ['Paid', '#27ae60'],
+    awaiting_payment: ['Awaiting payment', '#b9770e'],
+    refund_pending: ['Refund pending', '#e74c3c'],
+    refunded: ['Refunded', '#666'],
+    unpaid: o.payment_method === 'gcash' ? ['Not paid', '#666'] : [o.status === 'cancelled' ? 'Not collected' : 'Collect ' + amount + ' on delivery', '#b9770e'],
+  };
+  const [text, color] = labels[o.payment_status] || ['', '#666'];
+  return `<div style="font-size:12px; margin-top:6px; color:${color};"><b>${method}</b> · ${orderEsc(text)}</div>`;
+}
+
+async function markRefunded(orderId) {
+  if (!(await askConfirm('Mark this refund as done? Do this after you refunded the customer in your PayMongo dashboard.', 'Mark as refunded'))) return;
+  if (await sendOrderAction('/orders/' + orderId + '/refunded', {})) {
+    loadOrders();
+    loadNotifications();
+  }
+}
+
 async function loadOrders() {
   const tbody = document.getElementById('ordersTableBody');
   try {
@@ -977,7 +1000,9 @@ async function loadOrders() {
 
     tbody.innerHTML = orders.map(o => {
       const next = ORDER_NEXT_STATUS[o.status] || [];
-      const statusControl = next.length
+      // a GCash order cannot move forward until the payment is received
+      const awaitingPayment = o.status === 'pending' && o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment';
+      const statusControl = next.length && !awaitingPayment
         ? `<select class="status-select" onchange="updateOrderStatus(${o.order_id}, this.value)">
              <option value="${o.status}" selected>${o.status}</option>
              ${next.map(s => `<option value="${s}">${s}</option>`).join('')}
@@ -986,7 +1011,7 @@ async function loadOrders() {
 
       let note = '';
       if (o.status === 'cancelled') {
-        note = `<div style="${NOTE_STYLE}">Cancelled by ${o.cancelled_by === 'admin' ? 'the shop' : 'the customer'}: ${orderEsc(o.cancel_reason || 'no reason given')}</div>`;
+        note = `<div style="${NOTE_STYLE}">Cancelled by ${o.cancelled_by === 'admin' ? 'the shop' : o.cancelled_by === 'system' ? 'the system' : 'the customer'}: ${orderEsc(o.cancel_reason || 'no reason given')}</div>`;
       } else if (o.cancel_request_status === 'requested') {
         note = `<div style="${NOTE_STYLE} color:#b9770e;">Customer asks to cancel: ${orderEsc(o.cancel_request_reason)}
           <div style="margin-top:4px;">
@@ -1000,6 +1025,9 @@ async function loadOrders() {
       const shipNote = o.courier
         ? `<div style="${NOTE_STYLE}">Shipped via <b>${orderEsc(o.courier)}</b>${o.tracking_number ? ' · ' + orderEsc(o.tracking_number) : ''}
             ${o.status === 'shipped' ? `<button class="icon-btn" onclick="openShipModal(${o.order_id}, true)">Edit tracking</button>` : ''}</div>`
+        : '';
+      const refundButton = o.payment_status === 'refund_pending'
+        ? `<div style="margin-top:4px;"><button class="icon-btn" onclick="markRefunded(${o.order_id})">Mark as refunded</button></div>`
         : '';
       const slipButton = o.status !== 'cancelled'
         ? `<div style="margin-top:4px;"><button class="icon-btn" onclick="printPackingSlip(${o.order_id})">Print slip</button></div>`
@@ -1015,7 +1043,7 @@ async function loadOrders() {
         <td>#${o.order_id}</td>
         <td>${orderEsc(o.customer_name || 'N/A')}</td>
         <td>₱${Number(o.total_amount).toLocaleString()}</td>
-        <td>${statusControl}${shipNote}${note}${cancelButton}${slipButton}</td>
+        <td>${statusControl}${paymentLine(o)}${shipNote}${note}${refundButton}${cancelButton}${slipButton}</td>
         <td>${new Date(o.order_date).toLocaleDateString()}</td>
       </tr>`;
     }).join('') || '<tr><td colspan="5">No orders yet.</td></tr>';
@@ -1114,6 +1142,12 @@ async function printPackingSlip(orderId) {
     ? `<p><b>Courier:</b> ${orderEsc(order.courier)}${order.tracking_number ? ' &nbsp; <b>Tracking:</b> ' + orderEsc(order.tracking_number) : ''}</p>`
     : '';
 
+  const paymentBox = order.payment_method === 'gcash'
+    ? (order.payment_status === 'paid'
+        ? '<div class="pay paid">PAID via GCash<br><span>Do not collect any payment</span></div>'
+        : '<div class="pay">GCash payment not received yet</div>')
+    : `<div class="pay cod">CASH ON DELIVERY<br><span>Collect ${money(order.total_amount)} from the customer</span></div>`;
+
   win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Packing slip - Order #${order.order_id}</title>
     <style>
       body { font-family: Arial, sans-serif; color: #111; padding: 28px; font-size: 14px; }
@@ -1125,11 +1159,14 @@ async function printPackingSlip(orderId) {
       table { width: 100%; border-collapse: collapse; margin-top: 8px; }
       td, th { padding: 8px 6px; border-bottom: 1px solid #ddd; text-align: left; } th { font-size: 12px; text-transform: uppercase; color: #666; }
       .right { text-align: right; } .total td { font-weight: bold; font-size: 16px; border-top: 2px solid #111; }
+      .pay { border: 2px solid #111; border-radius: 8px; padding: 10px 14px; margin: 12px 0; font-weight: bold; font-size: 16px; text-align: center; }
+      .pay span { font-weight: normal; font-size: 13px; } .pay.cod { background: #fff0f6; border-color: #fc408c; } .pay.paid { background: #eafaf0; border-color: #27ae60; }
       .foot { margin-top: 28px; color: #666; font-size: 12px; text-align: center; }
     </style></head><body>
       <div class="head"><img src="${logo}" alt=""><div><h1>Fitora Gear</h1><p>Packing slip</p></div></div>
       <p><b>Order #${order.order_id}</b> &nbsp; ${new Date(order.order_date).toLocaleString()}</p>
       ${courier}
+      ${paymentBox}
       <div class="label">Ship to</div>
       <div class="shipto">${address}</div>
       <div class="label">Items</div>
@@ -1328,9 +1365,10 @@ async function loadNotifications() {
       fetch(API.ORDERS + '/orders', { headers: authHeaders() }).then(r => r.json()),
     ]);
 
-    const pendingOrders = orders.filter(o => o.status === 'pending');
+    const pendingOrders = orders.filter(o => o.status === 'pending' && o.payment_status !== 'awaiting_payment');
+    const refundsWaiting = orders.filter(o => o.payment_status === 'refund_pending');
     const cancelRequests = orders.filter(o => o.cancel_request_status === 'requested');
-    const total = lowStock.length + pendingOrders.length + cancelRequests.length;
+    const total = lowStock.length + pendingOrders.length + cancelRequests.length + refundsWaiting.length;
 
     const badge = document.getElementById('notifBadge');
     badge.textContent = total;
@@ -1339,6 +1377,7 @@ async function loadNotifications() {
     const list = document.getElementById('notifList');
     const items = [
       ...lowStock.map(p => `<li><span>Low stock: ${p.product_name}</span><span>${p.stock} left</span></li>`),
+      ...refundsWaiting.map(o => `<li><span>Refund pending: order #${o.order_id}</span><span>${orderEsc(o.customer_name || 'N/A')}</span></li>`),
       ...cancelRequests.map(o => `<li><span>Cancel request: order #${o.order_id}</span><span>${orderEsc(o.customer_name || 'N/A')}</span></li>`),
       ...pendingOrders.map(o => `<li><span>Pending order #${o.order_id}</span><span>${orderEsc(o.customer_name || 'N/A')}</span></li>`),
     ];
