@@ -849,39 +849,149 @@ function openStockModal(productId) {
 // ===========================================================
 // ORDERS
 // ===========================================================
+// Which status changes the shop can make (cancelling has its own button, so the stock always goes back)
+const ORDER_NEXT_STATUS = {
+  pending: ['processing', 'shipped', 'completed'],
+  processing: ['shipped', 'completed'],
+  shipped: ['completed'],
+  completed: [],
+  cancelled: [],
+};
+const ADMIN_CANCEL_REASONS = ['Out of stock', 'Customer asked to cancel', 'Customer cannot be reached', 'Payment problem', 'Address problem', 'Other'];
+const DECLINE_REASONS = ['The order is already packed', 'The order is already with the courier', 'Other'];
+const NOTE_STYLE = 'font-size:12px; color:#666; margin-top:6px;';
+
+function orderEsc(text) {
+  return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 async function loadOrders() {
   const tbody = document.getElementById('ordersTableBody');
   try {
     const res = await fetch(API.ORDERS + '/orders', { headers: authHeaders() });
     const orders = await res.json();
+    if (!res.ok) throw new Error(orders.error || 'Could not load the orders.');
 
-    tbody.innerHTML = orders.map(o => `
+    tbody.innerHTML = orders.map(o => {
+      const next = ORDER_NEXT_STATUS[o.status] || [];
+      const statusControl = next.length
+        ? `<select class="status-select" onchange="updateOrderStatus(${o.order_id}, this.value)">
+             <option value="${o.status}" selected>${o.status}</option>
+             ${next.map(s => `<option value="${s}">${s}</option>`).join('')}
+           </select>`
+        : `<span class="badge badge-${o.status}">${o.status}</span>`;
+
+      let note = '';
+      if (o.status === 'cancelled') {
+        note = `<div style="${NOTE_STYLE}">Cancelled by ${o.cancelled_by === 'admin' ? 'the shop' : 'the customer'}: ${orderEsc(o.cancel_reason || 'no reason given')}</div>`;
+      } else if (o.cancel_request_status === 'requested') {
+        note = `<div style="${NOTE_STYLE} color:#b9770e;">Customer asks to cancel: ${orderEsc(o.cancel_request_reason)}
+          <div style="margin-top:4px;">
+            <button class="icon-btn" onclick="approveCancelRequest(${o.order_id})">Approve</button>
+            <button class="icon-btn danger" onclick="openDeclineModal(${o.order_id})">Decline</button>
+          </div></div>`;
+      } else if (o.cancel_request_status === 'rejected') {
+        note = `<div style="${NOTE_STYLE}">Cancel request declined: ${orderEsc(o.cancel_reject_reason)}</div>`;
+      }
+
+      const canCancel = ['pending', 'processing', 'shipped'].includes(o.status) && o.cancel_request_status !== 'requested';
+      const cancelButton = canCancel
+        ? `<div style="margin-top:4px;"><button class="icon-btn danger" onclick="openCancelModal(${o.order_id})">Cancel order</button></div>`
+        : '';
+
+      return `
       <tr>
         <td>#${o.order_id}</td>
-        <td>${o.customer_name || 'N/A'}</td>
+        <td>${orderEsc(o.customer_name || 'N/A')}</td>
         <td>₱${Number(o.total_amount).toLocaleString()}</td>
-        <td>
-          <select class="status-select" onchange="updateOrderStatus(${o.order_id}, this.value)">
-            ${['pending','processing','shipped','completed','cancelled'].map(s =>
-              `<option value="${s}" ${s === o.status ? 'selected' : ''}>${s}</option>`
-            ).join('')}
-          </select>
-        </td>
+        <td>${statusControl}${note}${cancelButton}</td>
         <td>${new Date(o.order_date).toLocaleDateString()}</td>
-      </tr>
-    `).join('') || '<tr><td colspan="5">No orders yet.</td></tr>';
+      </tr>`;
+    }).join('') || '<tr><td colspan="5">No orders yet.</td></tr>';
   } catch (err) {
     tbody.innerHTML = '<tr><td colspan="5">Cannot reach the order service. Please try again.</td></tr>';
   }
 }
 
+// Sends one of the order actions and shows the server's message if it is refused
+async function sendOrderAction(path, body) {
+  try {
+    const res = await fetch(API.ORDERS + path, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.error || 'Could not complete this action.');
+      return false;
+    }
+    return true;
+  } catch (err) {
+    alert('Cannot reach the order service. Please try again.');
+    return false;
+  }
+}
+
 async function updateOrderStatus(orderId, status) {
-  await fetch(API.ORDERS + '/orders/' + orderId + '/status', {
-    method: 'PUT',
-    headers: authHeaders(),
-    body: JSON.stringify({ status }),
-  });
-  loadNotifications(); // agad i-refresh ang bell, baka nabago ang bilang ng pending orders
+  await sendOrderAction('/orders/' + orderId + '/status', { status });
+  loadOrders();
+  loadNotifications(); // refresh the bell, the number of pending orders may have changed
+}
+
+// A small window with a list of reasons (used for cancelling and for declining a request)
+function openReasonModal(title, intro, reasons, buttonText, onSubmit) {
+  modalTitle.textContent = title;
+  modalForm.innerHTML = `
+    <p style="font-size:13px; color:#666; margin-bottom:6px;">${intro}</p>
+    <label>Reason</label>
+    <select id="f_reason">${reasons.map(r => `<option value="${orderEsc(r)}">${orderEsc(r)}</option>`).join('')}</select>
+    <div class="modal-actions">
+      <button type="button" class="secondary-btn" onclick="closeModal()">Back</button>
+      <button type="submit" class="primary-btn">${buttonText}</button>
+    </div>
+  `;
+  modalForm.onsubmit = async (e) => {
+    e.preventDefault();
+    await onSubmit(document.getElementById('f_reason').value);
+  };
+  modalOverlay.classList.remove('hidden');
+}
+
+function openCancelModal(orderId) {
+  openReasonModal(
+    `Cancel order #${orderId}`,
+    'The customer will see the reason, and the items go back to stock.',
+    ADMIN_CANCEL_REASONS,
+    'Cancel order',
+    async (reason) => {
+      if (await sendOrderAction('/orders/' + orderId + '/cancel', { reason })) {
+        closeModal();
+        loadOrders();
+        loadNotifications();
+      }
+    }
+  );
+}
+
+async function approveCancelRequest(orderId) {
+  if (!confirm('Approve this cancellation? The items will go back to stock.')) return;
+  if (await sendOrderAction('/orders/' + orderId + '/cancel-request', { decision: 'approve' })) {
+    loadOrders();
+    loadNotifications();
+  }
+}
+
+function openDeclineModal(orderId) {
+  openReasonModal(
+    `Decline the cancellation of order #${orderId}`,
+    'The order stays active. The customer will see the reason.',
+    DECLINE_REASONS,
+    'Decline request',
+    async (reason) => {
+      if (await sendOrderAction('/orders/' + orderId + '/cancel-request', { decision: 'reject', reason })) {
+        closeModal();
+        loadOrders();
+        loadNotifications();
+      }
+    }
+  );
 }
 
 // ===========================================================
@@ -1012,7 +1122,8 @@ async function loadNotifications() {
     ]);
 
     const pendingOrders = orders.filter(o => o.status === 'pending');
-    const total = lowStock.length + pendingOrders.length;
+    const cancelRequests = orders.filter(o => o.cancel_request_status === 'requested');
+    const total = lowStock.length + pendingOrders.length + cancelRequests.length;
 
     const badge = document.getElementById('notifBadge');
     badge.textContent = total;
@@ -1021,7 +1132,8 @@ async function loadNotifications() {
     const list = document.getElementById('notifList');
     const items = [
       ...lowStock.map(p => `<li><span>Low stock: ${p.product_name}</span><span>${p.stock} left</span></li>`),
-      ...pendingOrders.map(o => `<li><span>Pending order #${o.order_id}</span><span>${o.customer_name || 'N/A'}</span></li>`),
+      ...cancelRequests.map(o => `<li><span>Cancel request: order #${o.order_id}</span><span>${orderEsc(o.customer_name || 'N/A')}</span></li>`),
+      ...pendingOrders.map(o => `<li><span>Pending order #${o.order_id}</span><span>${orderEsc(o.customer_name || 'N/A')}</span></li>`),
     ];
     list.innerHTML = items.join('') || '<li>No new notifications.</li>';
   } catch (err) {

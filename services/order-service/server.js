@@ -203,6 +203,15 @@ app.put('/api/orders/:id/status', verifyToken, requirePermission('orders'), asyn
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status.' });
     }
+    if (status === 'cancelled') {
+      return res.status(400).json({ error: 'To cancel an order, use the Cancel order button. A reason is required and the stock is returned.' });
+    }
+
+    const [current] = await pool.query('SELECT status FROM orders WHERE order_id = ?', [req.params.id]);
+    if (current.length === 0) return res.status(404).json({ error: 'Order not found.' });
+    if (!(NEXT_STATUSES[current[0].status] || []).includes(status)) {
+      return res.status(400).json({ error: `An order that is "${current[0].status}" cannot be changed to "${status}".` });
+    }
 
     await pool.query('UPDATE orders SET status = ? WHERE order_id = ?', [status, req.params.id]);
     res.json({ message: 'Order status updated.' });
@@ -306,6 +315,164 @@ app.get('/api/orders/reports/by-category', verifyToken, requirePermission('repor
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
+});
+
+// =====================================================
+// ORDER CANCELLATION
+// =====================================================
+const CUSTOMER_CANCEL_REASONS = [
+  'I changed my mind',
+  'I need to change my delivery address',
+  'I ordered the wrong item or quantity',
+  'I found a cheaper price elsewhere',
+  'The payment is too troublesome',
+  'Other',
+];
+const ADMIN_CANCEL_REASONS = [
+  'Out of stock',
+  'Customer asked to cancel',
+  'Customer cannot be reached',
+  'Payment problem',
+  'Address problem',
+  'Other',
+];
+const DECLINE_REASONS = [
+  'The order is already packed',
+  'The order is already with the courier',
+  'Other',
+];
+// Which status changes are allowed (cancelling has its own route)
+const NEXT_STATUSES = {
+  pending: ['processing', 'shipped', 'completed'],
+  processing: ['shipped', 'completed'],
+  shipped: ['completed'],
+  completed: [],
+  cancelled: [],
+};
+
+// Cancels an order inside an open transaction: the stock goes back to the shelf.
+async function cancelOrderInTransaction(conn, order, reason, by, adminId) {
+  const [items] = await conn.query('SELECT product_id, quantity FROM order_items WHERE order_id = ?', [order.order_id]);
+  for (const item of items) {
+    await conn.query('UPDATE products SET stock = stock + ? WHERE product_id = ?', [item.quantity, item.product_id]);
+    try {
+      await conn.query('INSERT INTO stock_logs (product_id, change_amount, reason, admin_id) VALUES (?, ?, ?, ?)', [
+        item.product_id, item.quantity, `Order #${order.order_id} cancelled`, adminId || null,
+      ]);
+    } catch (err) {
+      console.warn('Could not write the stock history:', err.code); // the stock itself is already corrected
+    }
+  }
+  await conn.query(
+    `UPDATE orders SET status = 'cancelled', cancel_reason = ?, cancelled_by = ?, cancelled_at = NOW(), cancel_request_status = NULL
+     WHERE order_id = ?`,
+    [reason, by, order.order_id]
+  );
+}
+
+// Runs a cancellation step inside a transaction. The reply is sent only AFTER the change is saved.
+const fail = (status, error) => ({ ok: false, status, body: { error } });
+const succeed = (body) => ({ ok: true, status: 200, body });
+
+async function inTransaction(res, work) {
+  let conn;
+  let result;
+  try {
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    result = await work(conn);
+    if (result.ok) await conn.commit();
+    else await conn.rollback();
+  } catch (err) {
+    if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
+    console.error(err);
+    return res.status(500).json({ error: 'Something went wrong on the server.' });
+  } finally {
+    if (conn) conn.release();
+  }
+  return res.status(result.status).json(result.body);
+}
+
+// CUSTOMER: pending orders cancel right away; processing orders need the seller's approval
+app.put('/api/orders/my/:id/cancel', verifyCustomerToken, (req, res) => {
+  const id = Number(req.params.id);
+  const reason = String((req.body || {}).reason || '');
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
+  if (!CUSTOMER_CANCEL_REASONS.includes(reason)) return res.status(400).json({ error: 'Please choose a reason for cancelling.' });
+
+  return inTransaction(res, async (conn) => {
+    const [rows] = await conn.query('SELECT * FROM orders WHERE order_id = ? AND user_id = ? FOR UPDATE', [id, req.customer.userId]);
+    if (rows.length === 0) return fail(404, 'Order not found.');
+    const order = rows[0];
+
+    if (order.status === 'pending') {
+      await cancelOrderInTransaction(conn, order, reason, 'customer', null);
+      return succeed({ cancelled: true, message: 'Your order has been cancelled.' });
+    }
+    if (order.status === 'processing') {
+      if (order.cancel_request_status === 'requested') {
+        return fail(400, 'You already asked to cancel this order. Please wait for the seller to reply.');
+      }
+      if (order.cancel_request_status === 'rejected') {
+        return fail(400, 'The seller declined your cancellation request because the order is already being prepared.');
+      }
+      await conn.query(
+        "UPDATE orders SET cancel_request_reason = ?, cancel_request_status = 'requested', cancel_request_at = NOW() WHERE order_id = ?",
+        [reason, id]
+      );
+      return succeed({ cancelled: false, requested: true, message: 'Your cancellation request was sent. The seller will review it.' });
+    }
+
+    const messages = {
+      shipped: 'This order is already on its way and cannot be cancelled. You can refuse the delivery or contact support.',
+      completed: 'This order is already completed.',
+      cancelled: 'This order is already cancelled.',
+    };
+    return fail(400, messages[order.status] || 'This order cannot be cancelled.');
+  });
+});
+
+// ADMIN: cancel an order (for example when an item is out of stock)
+app.put('/api/orders/:id/cancel', verifyToken, requirePermission('orders'), (req, res) => {
+  const id = Number(req.params.id);
+  const reason = String((req.body || {}).reason || '');
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
+  if (!ADMIN_CANCEL_REASONS.includes(reason)) return res.status(400).json({ error: 'Please choose a reason for cancelling.' });
+
+  return inTransaction(res, async (conn) => {
+    const [rows] = await conn.query('SELECT * FROM orders WHERE order_id = ? FOR UPDATE', [id]);
+    if (rows.length === 0) return fail(404, 'Order not found.');
+    if (rows[0].status === 'completed' || rows[0].status === 'cancelled') {
+      return fail(400, `A ${rows[0].status} order cannot be cancelled.`);
+    }
+    await cancelOrderInTransaction(conn, rows[0], reason, 'admin', req.admin.adminId);
+    return succeed({ message: 'The order was cancelled and the stock was returned.' });
+  });
+});
+
+// ADMIN: approve or decline a customer's cancellation request
+app.put('/api/orders/:id/cancel-request', verifyToken, requirePermission('orders'), (req, res) => {
+  const id = Number(req.params.id);
+  const decision = (req.body || {}).decision;
+  const reason = String((req.body || {}).reason || '');
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
+  if (!['approve', 'reject'].includes(decision)) return res.status(400).json({ error: 'Invalid decision.' });
+  if (decision === 'reject' && !DECLINE_REASONS.includes(reason)) return res.status(400).json({ error: 'Please choose a reason for declining.' });
+
+  return inTransaction(res, async (conn) => {
+    const [rows] = await conn.query('SELECT * FROM orders WHERE order_id = ? FOR UPDATE', [id]);
+    if (rows.length === 0) return fail(404, 'Order not found.');
+    const order = rows[0];
+    if (order.cancel_request_status !== 'requested') {
+      return fail(400, 'There is no pending cancellation request for this order.');
+    }
+    if (decision === 'approve') {
+      await cancelOrderInTransaction(conn, order, order.cancel_request_reason || 'Customer asked to cancel', 'customer', req.admin.adminId);
+      return succeed({ message: 'The cancellation was approved and the stock was returned.' });
+    }
+    await conn.query("UPDATE orders SET cancel_request_status = 'rejected', cancel_reject_reason = ? WHERE order_id = ?", [reason, id]);
+    return succeed({ message: 'The cancellation request was declined.' });
+  });
 });
 
 const PORT = process.env.PORT || 4002;
