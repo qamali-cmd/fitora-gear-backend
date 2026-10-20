@@ -146,6 +146,7 @@ app.post('/api/products/:id/stock-adjustment', verifyToken, requirePermission('i
     await conn.commit();
     conn.release();
 
+    await notifyLowStock(productId);
     res.json({ message: 'Stock updated.', newStock });
   } catch (err) {
     await conn.rollback();
@@ -250,6 +251,53 @@ app.delete('/api/products/:id', verifyToken, requirePermission('products'), asyn
 // =====================================================
 // REVIEWS MANAGEMENT (para sa ADMIN panel)
 // =====================================================
+
+// ---------- admin notifications (the bell). The table is shared with the order service. ----------
+const LOW_STOCK_LIMIT = 10; // the same rule as the low stock list
+
+async function addNotification(n) {
+  try {
+    await pool.query(
+      'INSERT INTO admin_notifications (type, title, message, ref_text, product_id) VALUES (?, ?, ?, ?, ?)',
+      [n.type, String(n.title).slice(0, 120), String(n.message).slice(0, 500), n.ref_text ? String(n.ref_text).slice(0, 150) : null, n.product_id || null]
+    );
+  } catch (err) {
+    console.warn('Could not save the notification:', err.message); // never stops the main action
+  }
+}
+
+async function notifyNewReview(productId, userId, stars, comment, mediaCount) {
+  try {
+    const [products] = await pool.query('SELECT product_name FROM products WHERE product_id = ?', [productId]);
+    const [users] = await pool.query('SELECT full_name FROM users WHERE user_id = ?', [userId]);
+    if (products.length === 0) return;
+    const text = comment ? ` "${comment.length > 80 ? comment.slice(0, 77) + '...' : comment}"` : '';
+    const files = mediaCount ? ` · with ${mediaCount} photo${mediaCount === 1 ? '' : 's'}/video` : '';
+    await addNotification({
+      type: 'new_review', title: `New review · ${products[0].product_name}`,
+      message: `${users[0] ? users[0].full_name : 'A customer'} gave ${stars} star${stars === 1 ? '' : 's'}${text}${files}`,
+      ref_text: products[0].product_name, product_id: productId,
+    });
+  } catch (err) {
+    console.warn('Could not prepare the review notification:', err.message);
+  }
+}
+
+async function notifyLowStock(productId) {
+  try {
+    const [rows] = await pool.query('SELECT product_id, product_name, stock FROM products WHERE product_id = ? AND stock < ?', [productId, LOW_STOCK_LIMIT]);
+    if (rows.length === 0) return;
+    const p = rows[0];
+    const message = p.stock === 0 ? `${p.product_name} is out of stock` : `Only ${p.stock} left of ${p.product_name}`;
+    const [recent] = await pool.query(
+      "SELECT notification_id FROM admin_notifications WHERE type = 'low_stock' AND product_id = ? AND message = ? AND created_at > (NOW() - INTERVAL 1 DAY) LIMIT 1",
+      [p.product_id, message]
+    );
+    if (recent.length === 0) await addNotification({ type: 'low_stock', title: `Low stock: ${p.product_name}`, message, ref_text: p.product_name, product_id: p.product_id });
+  } catch (err) {
+    console.warn('Could not check the low stock:', err.message);
+  }
+}
 
 // Adds the photos and the video to each review in the list: review.media = [{ url, type }]
 async function attachMedia(reviews) {
@@ -424,6 +472,7 @@ app.post('/api/products/:id/reviews', verifyCustomerToken, async (req, res) => {
       await conn.query('INSERT INTO review_media (review_id, media_url, media_type) VALUES (?, ?, ?)', [result.insertId, item.url, item.type]);
     }
     await conn.commit();
+    await notifyNewReview(productId, req.customer.userId, stars, comment, media.items.length);
     res.status(201).json({ review_id: result.insertId, message: 'Your review was submitted.' });
   } catch (err) {
     if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }

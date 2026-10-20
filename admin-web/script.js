@@ -293,7 +293,7 @@ async function loadDashboard() {
 
     const recentList = document.getElementById('recentOrdersList');
     recentList.innerHTML = orders.slice(0, 5).map(o =>
-      `<li><span>Order #${o.order_id} - ${o.customer_name || 'N/A'}</span><span>₱${Number(o.total_amount).toLocaleString()}</span></li>`
+      `<li><span><b>${orderEsc(o.order_code || 'Order #' + o.order_id)}</b> · ${orderEsc(o.customer_name || 'N/A')}${o.items_summary ? `<span class="muted-small" style="display:block">${orderEsc(o.items_summary)}</span>` : ''}</span><span>₱${Number(o.total_amount).toLocaleString()}</span></li>`
     ).join('') || '<li>No orders yet.</li>';
 
   } catch (err) {
@@ -1040,7 +1040,7 @@ async function loadOrders() {
 
       return `
       <tr>
-        <td>#${o.order_id}</td>
+        <td><div class="order-code">${orderEsc(o.order_code || '#' + o.order_id)}</div>${o.items_summary ? `<div class="muted-small">${orderEsc(o.items_summary)}</div>` : ''}</td>
         <td>${orderEsc(o.customer_name || 'N/A')}</td>
         <td>₱${Number(o.total_amount).toLocaleString()}</td>
         <td>${statusControl}${paymentLine(o)}${shipNote}${note}${refundButton}${cancelButton}${slipButton}</td>
@@ -1148,7 +1148,7 @@ async function printPackingSlip(orderId) {
         : '<div class="pay">GCash payment not received yet</div>')
     : `<div class="pay cod">CASH ON DELIVERY<br><span>Collect ${money(order.total_amount)} from the customer</span></div>`;
 
-  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Packing slip - Order #${order.order_id}</title>
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Packing slip - Order ${orderEsc(order.order_code || '#' + order.order_id)}</title>
     <style>
       body { font-family: Arial, sans-serif; color: #111; padding: 28px; font-size: 14px; }
       .head { display: flex; align-items: center; gap: 14px; border-bottom: 3px solid #fc408c; padding-bottom: 12px; margin-bottom: 18px; }
@@ -1164,7 +1164,7 @@ async function printPackingSlip(orderId) {
       .foot { margin-top: 28px; color: #666; font-size: 12px; text-align: center; }
     </style></head><body>
       <div class="head"><img src="${logo}" alt=""><div><h1>Fitora Gear</h1><p>Packing slip</p></div></div>
-      <p><b>Order #${order.order_id}</b> &nbsp; ${new Date(order.order_date).toLocaleString()}</p>
+      <p><b>Order ${orderEsc(order.order_code || '#' + order.order_id)}</b> &nbsp; ${new Date(order.order_date).toLocaleString()}</p>
       ${courier}
       ${paymentBox}
       <div class="label">Ship to</div>
@@ -1358,34 +1358,109 @@ async function toggleCustomerStatus(userId, newStatus) {
 // ===========================================================
 // NOTIFICATIONS (bell icon - low stock + pending orders)
 // ===========================================================
+// ===========================================================
+// NOTIFICATIONS (the bell)
+// They are saved on the server and they stay, even after the order was processed.
+// A notification glows until THIS admin opens it. Pressing one goes straight to the order / product.
+// ===========================================================
+let notificationItems = [];
+const NOTIF_PAGES = { new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders', low_stock: 'inventory', new_review: 'reviews' };
+const NOTIF_TABLES = { orders: 'ordersTableBody', inventory: 'inventoryTableBody', reviews: 'reviewsTableBody' };
+
+function timeAgo(value) {
+  const time = new Date(value).getTime();
+  if (Number.isNaN(time)) return '';
+  const minutes = Math.floor(Math.max(0, Date.now() - time) / 60000);
+  if (minutes < 1) return 'Just now';
+  if (minutes < 60) return minutes + ' min ago';
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + (hours === 1 ? ' hour ago' : ' hours ago');
+  const days = Math.floor(hours / 24);
+  if (days < 7) return days + (days === 1 ? ' day ago' : ' days ago');
+  return new Date(value).toLocaleDateString();
+}
+
 async function loadNotifications() {
   try {
-    const [lowStock, orders] = await Promise.all([
-      fetch(API.PRODUCTS + '/products/low-stock').then(r => r.json()),
-      fetch(API.ORDERS + '/orders', { headers: authHeaders() }).then(r => r.json()),
-    ]);
-
-    const pendingOrders = orders.filter(o => o.status === 'pending' && o.payment_status !== 'awaiting_payment');
-    const refundsWaiting = orders.filter(o => o.payment_status === 'refund_pending');
-    const cancelRequests = orders.filter(o => o.cancel_request_status === 'requested');
-    const total = lowStock.length + pendingOrders.length + cancelRequests.length + refundsWaiting.length;
+    const res = await fetch(API.ORDERS + '/notifications', { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not load the notifications.');
+    notificationItems = data.items;
 
     const badge = document.getElementById('notifBadge');
-    badge.textContent = total;
-    badge.classList.toggle('hidden', total === 0);
+    badge.textContent = data.unread > 99 ? '99+' : data.unread;
+    badge.classList.toggle('hidden', data.unread === 0);
+    document.getElementById('notifBtn').classList.toggle('has-unread', data.unread > 0);
+    document.getElementById('notifReadAll').classList.toggle('hidden', data.unread === 0);
 
-    const list = document.getElementById('notifList');
-    const items = [
-      ...lowStock.map(p => `<li><span>Low stock: ${p.product_name}</span><span>${p.stock} left</span></li>`),
-      ...refundsWaiting.map(o => `<li><span>Refund pending: order #${o.order_id}</span><span>${orderEsc(o.customer_name || 'N/A')}</span></li>`),
-      ...cancelRequests.map(o => `<li><span>Cancel request: order #${o.order_id}</span><span>${orderEsc(o.customer_name || 'N/A')}</span></li>`),
-      ...pendingOrders.map(o => `<li><span>Pending order #${o.order_id}</span><span>${orderEsc(o.customer_name || 'N/A')}</span></li>`),
-    ];
-    list.innerHTML = items.join('') || '<li>No new notifications.</li>';
+    document.getElementById('notifList').innerHTML = data.items.map(n => `
+      <li class="notif-item ${n.is_read ? 'read' : 'unread'}" data-id="${n.notification_id}">
+        <span class="notif-icon" data-type="${orderEsc(n.type)}"></span>
+        <span class="notif-body">
+          <span class="notif-title">${orderEsc(n.title)}</span>
+          <span class="notif-text">${orderEsc(n.message)}</span>
+          <span class="notif-time">${orderEsc(timeAgo(n.created_at))}</span>
+        </span>
+        ${n.is_read ? '' : '<span class="notif-dot"></span>'}
+      </li>`).join('') || '<li class="notif-empty">You are all caught up. New orders and updates will appear here.</li>';
   } catch (err) {
     console.error(err);
   }
 }
+
+// Flashes the row of the order / product in the table, once the table has been loaded
+function highlightRow(tbodyId, text) {
+  if (!text) return;
+  const tbody = document.getElementById(tbodyId);
+  let loaded = false;
+  let done = false;
+  const tryOnce = () => {
+    if (done || !loaded) return;
+    const row = Array.from(tbody.querySelectorAll('tr')).find(tr => tr.textContent.includes(text));
+    if (!row) return;
+    done = true;
+    observer.disconnect();
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.classList.remove('row-flash');
+    void row.offsetWidth;
+    row.classList.add('row-flash');
+    setTimeout(() => row.classList.remove('row-flash'), 3400);
+  };
+  // the table is drawn again when its data arrives: flash after that
+  const observer = new MutationObserver(() => { loaded = true; setTimeout(tryOnce, 60); });
+  observer.observe(tbody, { childList: true });
+  setTimeout(() => { loaded = true; tryOnce(); observer.disconnect(); }, 2500); // in case nothing changed
+}
+
+async function openNotification(id) {
+  const item = notificationItems.find(n => n.notification_id === id);
+  if (!item) return;
+  document.getElementById('notifDropdown').classList.add('hidden');
+  if (!item.is_read) {
+    item.is_read = true;
+    fetch(API.ORDERS + '/notifications/' + id + '/read', { method: 'POST', headers: authHeaders() }).then(loadNotifications).catch(() => {});
+  }
+  const page = NOTIF_PAGES[item.type];
+  if (!page) return;
+  history.replaceState(null, '', '#' + page);
+  navigateTo(page);
+  highlightRow(NOTIF_TABLES[page], item.ref_text);
+}
+
+document.getElementById('notifList').addEventListener('click', (e) => {
+  const li = e.target.closest('.notif-item');
+  if (li) openNotification(Number(li.dataset.id));
+});
+
+document.getElementById('notifReadAll').addEventListener('click', async (e) => {
+  e.stopPropagation();
+  try {
+    await fetch(API.ORDERS + '/notifications/read-all', { method: 'POST', headers: authHeaders() });
+  } catch (err) {
+    console.error(err);
+  }
+  loadNotifications();
+});
 
 document.getElementById('notifBtn').addEventListener('click', () => {
   document.getElementById('notifDropdown').classList.toggle('hidden');

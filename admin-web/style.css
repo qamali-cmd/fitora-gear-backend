@@ -363,3 +363,50 @@ tbody tr:last-child td { border-bottom: 0; }
   .filter-bar input, .section-header input[type="text"] { min-width: 0; width: 100%; }
   .notif-dropdown { position: fixed; top: 74px; right: 12px; left: 12px; width: auto; max-width: none; }
 }
+
+/* ---------------------------------------------------------------------
+   NOTIFICATION LIST (saved notifications that glow until they are opened)
+   --------------------------------------------------------------------- */
+.notif-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px 10px; }
+.notif-dropdown .notif-head h4 { padding: 0; }
+.notif-readall { border: 0; background: none; cursor: pointer; color: var(--primary-dark); font-size: 12.5px; font-weight: 600; font-family: inherit; padding: 6px 10px; border-radius: 999px; }
+.notif-readall:hover { background: var(--primary-soft); }
+.notif-dropdown .simple-list li.notif-item {
+  position: relative; display: flex; align-items: flex-start; justify-content: flex-start; gap: 13px; padding: 13px 14px; margin-bottom: 6px;
+  border: 1px solid transparent; border-radius: 16px; cursor: pointer; transition: background 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+.notif-dropdown .simple-list li.notif-item:hover { transform: translateX(2px); background: #fff3f8; }
+.notif-item.unread {
+  background: linear-gradient(90deg, rgba(252, 64, 140, 0.14), rgba(252, 64, 140, 0.04)) !important; border-color: rgba(252, 64, 140, 0.22) !important;
+  box-shadow: inset 3px 0 0 var(--primary), 0 8px 22px rgba(252, 64, 140, 0.16);
+}
+.notif-item.read { opacity: 0.72; }
+.notif-item.read:hover { opacity: 1; }
+.notif-icon { position: relative; width: 42px; height: 42px; border-radius: 14px; flex-shrink: 0; background: var(--tint, #f1edf1); }
+.notif-icon::after {
+  content: ''; position: absolute; inset: 11px; background: var(--tone, #7b7482);
+  -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
+}
+.notif-icon[data-type="new_order"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 7h14l-1 13H6L5 7z'/%3E%3Cpath d='M9 7V6a3 3 0 016 0v1'/%3E%3C/svg%3E"); --tone: #fc408c; --tint: rgba(252,64,140,0.12); }
+.notif-icon[data-type="payment"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h15a1 1 0 011 1v10a1 1 0 01-1 1H5a2 2 0 01-2-2V6a2 2 0 012-2h12'/%3E%3Ccircle cx='16' cy='13' r='1.2'/%3E%3C/svg%3E"); --tone: #1e8e4f; --tint: #e8f8ee; }
+.notif-icon[data-type="cancel_request"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v5l3 2'/%3E%3C/svg%3E"); --tone: #b7791f; --tint: #fff4e0; }
+.notif-icon[data-type="order_cancelled"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E"); --tone: #cf3a2c; --tint: #fdecea; }
+.notif-icon[data-type="refund"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 14L4 9l5-5'/%3E%3Cpath d='M4 9h10a6 6 0 010 12h-3'/%3E%3C/svg%3E"); --tone: #cf3a2c; --tint: #fdecea; }
+.notif-icon[data-type="low_stock"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 8l-9-5-9 5v8l9 5 9-5V8z'/%3E%3Cpath d='M3 8l9 5 9-5M12 13v8'/%3E%3C/svg%3E"); --tone: #c2570c; --tint: #fff0e0; }
+.notif-icon[data-type="new_review"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9L12 3z'/%3E%3C/svg%3E"); --tone: #c99100; --tint: #fff8e0; }
+.simple-list li.notif-item span { text-align: left; }
+.notif-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.notif-title { font-size: 13.5px; font-weight: 700; color: var(--text-dark); line-height: 1.3; }
+.notif-text { font-size: 12.8px; color: #5f5865; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.notif-time { font-size: 11.5px; color: var(--text-muted); }
+.notif-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--primary); flex-shrink: 0; margin-top: 6px; animation: pulse 2s infinite; }
+.notif-dropdown .simple-list li.notif-empty { justify-content: center; padding: 34px 20px; color: var(--text-muted); text-align: center; cursor: default; }
+.notif-btn.has-unread { color: var(--primary); border-color: rgba(252, 64, 140, 0.35); box-shadow: 0 0 0 4px rgba(252, 64, 140, 0.10), var(--shadow-sm); }
+.notif-btn.has-unread svg { animation: bellRing 3.2s ease-in-out infinite; transform-origin: 50% 0; }
+@keyframes bellRing { 0%, 88%, 100% { transform: rotate(0); } 91% { transform: rotate(14deg); } 94% { transform: rotate(-12deg); } 97% { transform: rotate(7deg); } }
+
+/* the row of an order / product that was opened from a notification */
+.row-flash td { animation: rowFlash 3.4s ease both; }
+@keyframes rowFlash { 0%, 55% { background: rgba(252, 64, 140, 0.26); box-shadow: inset 0 0 0 9999px rgba(252, 64, 140, 0.04); } 100% { background: transparent; } }
+.order-code { font-weight: 700; letter-spacing: 0.02em; white-space: nowrap; }
+.muted-small { font-size: 12px; font-weight: 400; color: var(--text-muted); line-height: 1.4; max-width: 300px; margin-top: 2px; letter-spacing: 0; white-space: normal; }

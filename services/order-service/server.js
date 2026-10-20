@@ -242,6 +242,9 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
     );
     const orderId = orderResult.insertId;
 
+    // the order code: FG + the date + the order number, for example FG-261021-0014
+    await conn.query("UPDATE orders SET order_code = CONCAT('FG-', DATE_FORMAT(order_date, '%y%m%d'), '-', LPAD(order_id, 4, '0')) WHERE order_id = ?", [orderId]);
+
     for (const line of cart.lines) {
       await conn.query('INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)', [orderId, line.product_id, line.quantity, line.price]);
       await conn.query('UPDATE products SET stock = stock - ? WHERE product_id = ?', [line.quantity, line.product_id]);
@@ -264,8 +267,14 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
       }
     }
 
+    // tell the admins (best effort: it never stops the order)
+    await notifyOrder(orderId, 'new_order');
+    await checkLowStock(cart.lines.map((line) => line.product_id));
+    const [codeRows] = await pool.query('SELECT order_code FROM orders WHERE order_id = ?', [orderId]);
+
     res.status(201).json({
       order_id: orderId,
+      order_code: codeRows[0] ? codeRows[0].order_code : null,
       status: 'pending',
       subtotal: cart.subtotal,
       shipping_fee: shipping.shipping_fee,
@@ -332,7 +341,9 @@ app.get('/api/orders', verifyToken, async (req, res) => {
   try {
     await maybeExpireUnpaid();
     const [rows] = await pool.query(`
-      SELECT o.*, u.full_name AS customer_name
+      SELECT o.*, u.full_name AS customer_name,
+        (SELECT GROUP_CONCAT(CONCAT(oi.quantity, 'x ', p.product_name) ORDER BY oi.order_item_id SEPARATOR ', ')
+         FROM order_items oi JOIN products p ON p.product_id = oi.product_id WHERE oi.order_id = o.order_id) AS items_summary
       FROM orders o
       LEFT JOIN users u ON o.user_id = u.user_id
       ORDER BY o.order_date DESC
@@ -598,7 +609,7 @@ app.put('/api/orders/my/:id/cancel', verifyCustomerToken, (req, res) => {
 
     if (order.status === 'pending') {
       await cancelOrderInTransaction(conn, order, reason, 'customer', null);
-      return { ...succeed({ cancelled: true, message: 'Your order has been cancelled.' }), after: () => expireCheckout(order.paymongo_session_id) };
+      return { ...succeed({ cancelled: true, message: 'Your order has been cancelled.' }), after: () => Promise.all([expireCheckout(order.paymongo_session_id), afterCancelNotify(id, true, reason)]) };
     }
     if (order.status === 'processing') {
       if (order.cancel_request_status === 'requested') {
@@ -611,7 +622,7 @@ app.put('/api/orders/my/:id/cancel', verifyCustomerToken, (req, res) => {
         "UPDATE orders SET cancel_request_reason = ?, cancel_request_status = 'requested', cancel_request_at = NOW() WHERE order_id = ?",
         [reason, id]
       );
-      return succeed({ cancelled: false, requested: true, message: 'Your cancellation request was sent. The seller will review it.' });
+      return { ...succeed({ cancelled: false, requested: true, message: 'Your cancellation request was sent. The seller will review it.' }), after: () => notifyOrder(id, 'cancel_request', reason) };
     }
 
     const messages = {
@@ -637,7 +648,7 @@ app.put('/api/orders/:id/cancel', verifyToken, requirePermission('orders'), (req
       return fail(400, `A ${rows[0].status} order cannot be cancelled.`);
     }
     await cancelOrderInTransaction(conn, rows[0], reason, 'admin', req.admin.adminId);
-    return { ...succeed({ message: 'The order was cancelled and the stock was returned.' }), after: () => expireCheckout(rows[0].paymongo_session_id) };
+    return { ...succeed({ message: 'The order was cancelled and the stock was returned.' }), after: () => Promise.all([expireCheckout(rows[0].paymongo_session_id), afterCancelNotify(id, false)]) };
   });
 });
 
@@ -659,7 +670,7 @@ app.put('/api/orders/:id/cancel-request', verifyToken, requirePermission('orders
     }
     if (decision === 'approve') {
       await cancelOrderInTransaction(conn, order, order.cancel_request_reason || 'Customer asked to cancel', 'customer', req.admin.adminId);
-      return { ...succeed({ message: 'The cancellation was approved and the stock was returned.' }), after: () => expireCheckout(order.paymongo_session_id) };
+      return { ...succeed({ message: 'The cancellation was approved and the stock was returned.' }), after: () => Promise.all([expireCheckout(order.paymongo_session_id), afterCancelNotify(id, false)]) };
     }
     await conn.query("UPDATE orders SET cancel_request_status = 'rejected', cancel_reject_reason = ? WHERE order_id = ?", [reason, id]);
     return succeed({ message: 'The cancellation request was declined.' });
@@ -883,6 +894,7 @@ async function markPaid(orderId, paymentId) {
     const paymentStatus = order.status === 'cancelled' ? 'refund_pending' : 'paid';
     await conn.query('UPDATE orders SET payment_status = ?, paid_at = NOW(), paymongo_payment_id = ? WHERE order_id = ?', [paymentStatus, paymentId, orderId]);
     await conn.commit();
+    await notifyOrder(orderId, paymentStatus === 'paid' ? 'payment' : 'refund'); // the shop is told, too
     return { payment_status: paymentStatus, status: order.status };
   } catch (err) {
     if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
@@ -1065,6 +1077,153 @@ async function maybeExpireUnpaid() {
 
 const expiryTimer = setInterval(() => { maybeExpireUnpaid(); }, 5 * 60 * 1000);
 if (expiryTimer.unref) expiryTimer.unref();
+
+// =====================================================
+// ADMIN NOTIFICATIONS (the bell in the admin website)
+// They are saved, so they stay even after the order was processed. Each admin has their own
+// "read" marks: a notification glows until THAT admin opens it.
+// =====================================================
+const LOW_STOCK_LIMIT = 10; // the same rule as the low stock list: fewer than 10 left
+const NOTIFICATION_PERMISSIONS = {
+  new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders',
+  low_stock: 'inventory', new_review: 'reviews',
+};
+
+async function addNotification(n) {
+  try {
+    await pool.query(
+      'INSERT INTO admin_notifications (type, title, message, ref_text, order_id, product_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [n.type, String(n.title).slice(0, 120), String(n.message).slice(0, 500), n.ref_text ? String(n.ref_text).slice(0, 150) : null, n.order_id || null, n.product_id || null]
+    );
+  } catch (err) {
+    console.warn('Could not save the notification:', err.message); // a notification problem must never stop an order
+  }
+}
+
+// Who ordered, what, how much, and how they pay
+async function describeOrder(orderId) {
+  const [rows] = await pool.query(
+    `SELECT o.order_id, o.order_code, o.total_amount, o.payment_method, o.payment_status, u.full_name,
+       (SELECT GROUP_CONCAT(CONCAT(oi.quantity, 'x ', p.product_name) ORDER BY oi.order_item_id SEPARATOR ', ')
+        FROM order_items oi JOIN products p ON p.product_id = oi.product_id WHERE oi.order_id = o.order_id) AS items
+     FROM orders o LEFT JOIN users u ON u.user_id = o.user_id WHERE o.order_id = ?`,
+    [orderId]
+  );
+  return rows[0] || null;
+}
+
+async function notifyOrder(orderId, kind, extra) {
+  try {
+    const o = await describeOrder(orderId);
+    if (!o) return;
+    const code = o.order_code || `#${o.order_id}`;
+    const who = o.full_name || 'A customer';
+    const items = o.items || 'items';
+    const total = '₱' + Number(o.total_amount).toLocaleString();
+    const pay = o.payment_method === 'gcash' ? 'GCash' : 'Cash on Delivery';
+    const texts = {
+      new_order: [`New order ${code}`, `${who} ordered ${items} · ${total} · ${pay}${o.payment_status === 'awaiting_payment' ? ' (waiting for payment)' : ''}`],
+      payment: [`Payment received · ${code}`, `${who} paid ${total} through GCash for ${items}`],
+      cancel_request: [`Cancel request · ${code}`, `${who} wants to cancel${extra ? ` (${extra})` : ''}: ${items}`],
+      order_cancelled: [`Order cancelled · ${code}`, `${who} cancelled ${items}${extra ? ` (${extra})` : ''}`],
+      refund: [`Refund needed · ${code}`, `Refund ${total} to ${who} through GCash for the cancelled order: ${items}`],
+    };
+    if (!texts[kind]) return;
+    await addNotification({ type: kind, title: texts[kind][0], message: texts[kind][1], ref_text: code, order_id: o.order_id });
+  } catch (err) {
+    console.warn('Could not prepare the notification:', err.message);
+  }
+}
+
+// After an order was cancelled: tell the shop (if the customer did it) and remind about a refund
+async function afterCancelNotify(orderId, announce, reason) {
+  const o = await describeOrder(orderId);
+  if (!o) return;
+  if (announce) await notifyOrder(orderId, 'order_cancelled', reason);
+  if (o.payment_status === 'refund_pending') await notifyOrder(orderId, 'refund');
+}
+
+// A product that is running low (once for the same message in one day, so the bell is not spammed)
+async function checkLowStock(productIds) {
+  try {
+    if (!productIds.length) return;
+    const [rows] = await pool.query('SELECT product_id, product_name, stock FROM products WHERE product_id IN (?) AND stock < ?', [productIds, LOW_STOCK_LIMIT]);
+    for (const p of rows) {
+      const message = p.stock === 0 ? `${p.product_name} is out of stock` : `Only ${p.stock} left of ${p.product_name}`;
+      const [recent] = await pool.query(
+        "SELECT notification_id FROM admin_notifications WHERE type = 'low_stock' AND product_id = ? AND message = ? AND created_at > (NOW() - INTERVAL 1 DAY) LIMIT 1",
+        [p.product_id, message]
+      );
+      if (recent.length > 0) continue;
+      await addNotification({ type: 'low_stock', title: `Low stock: ${p.product_name}`, message, ref_text: p.product_name, product_id: p.product_id });
+    }
+  } catch (err) {
+    console.warn('Could not check the low stock:', err.message);
+  }
+}
+
+// Staff only see the notifications of the sections they have access to
+function allowedNotificationTypes(admin) {
+  const all = Object.keys(NOTIFICATION_PERMISSIONS);
+  if (admin.role === 'super_admin') return all;
+  const permissions = admin.permissions || [];
+  return all.filter((type) => permissions.includes(NOTIFICATION_PERMISSIONS[type]));
+}
+
+app.get('/api/notifications', verifyToken, async (req, res) => {
+  try {
+    const types = allowedNotificationTypes(req.admin);
+    if (types.length === 0) return res.json({ unread: 0, items: [] });
+    const [items] = await pool.query(
+      `SELECT n.notification_id, n.type, n.title, n.message, n.ref_text, n.order_id, n.product_id, n.created_at,
+              (r.admin_id IS NOT NULL) AS is_read
+       FROM admin_notifications n
+       LEFT JOIN admin_notification_reads r ON r.notification_id = n.notification_id AND r.admin_id = ?
+       WHERE n.type IN (?) ORDER BY n.notification_id DESC LIMIT 40`,
+      [req.admin.adminId, types]
+    );
+    const [counted] = await pool.query(
+      `SELECT COUNT(*) AS unread FROM admin_notifications n
+       LEFT JOIN admin_notification_reads r ON r.notification_id = n.notification_id AND r.admin_id = ?
+       WHERE r.admin_id IS NULL AND n.type IN (?)`,
+      [req.admin.adminId, types]
+    );
+    res.json({ unread: counted[0].unread, items: items.map((item) => ({ ...item, is_read: !!item.is_read })) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+app.post('/api/notifications/read-all', verifyToken, async (req, res) => {
+  try {
+    const types = allowedNotificationTypes(req.admin);
+    if (types.length > 0) {
+      await pool.query(
+        'INSERT IGNORE INTO admin_notification_reads (admin_id, notification_id) SELECT ?, n.notification_id FROM admin_notifications n WHERE n.type IN (?)',
+        [req.admin.adminId, types]
+      );
+    }
+    res.json({ message: 'All notifications were marked as read.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+app.post('/api/notifications/:id/read', verifyToken, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid notification.' });
+    const [found] = await pool.query('SELECT notification_id FROM admin_notifications WHERE notification_id = ?', [id]);
+    if (found.length === 0) return res.status(404).json({ error: 'Notification not found.' });
+    await pool.query('INSERT IGNORE INTO admin_notification_reads (admin_id, notification_id) VALUES (?, ?)', [req.admin.adminId, id]);
+    res.json({ message: 'Marked as read.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
 
 const PORT = process.env.PORT || 4002;
 app.listen(PORT, () => {
