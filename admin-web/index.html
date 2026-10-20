@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Fitora Gear - Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="style.css">
   <link rel="icon" type="image/png" href="logo.png">
 
@@ -68,14 +71,23 @@
       <h1 id="pageTitle">Dashboard</h1>
       <div class="topbar-right">
         <div class="notif-wrap">
-          <button id="notifBtn" class="notif-btn">🔔<span id="notifBadge" class="notif-badge hidden">0</span></button>
+          <button id="notifBtn" class="notif-btn" aria-label="Notifications">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9a6 6 0 0112 0c0 5 2 6.5 2 6.5H4S6 14 6 9z"/><path d="M10 19a2 2 0 004 0"/></svg>
+            <span id="notifBadge" class="notif-badge hidden">0</span>
+          </button>
           <div id="notifDropdown" class="notif-dropdown hidden">
             <h4>Notifications</h4>
             <ul id="notifList" class="simple-list"><li>Loading...</li></ul>
           </div>
         </div>
         <!-- EDIT DITO: papalitan ng totoong pangalan ng admin pagka-login -->
-        <span id="adminName" class="admin-name"></span>
+        <div class="admin-chip">
+          <span id="adminAvatar" class="admin-avatar"></span>
+          <span class="admin-info">
+            <span id="adminName" class="admin-name"></span>
+            <span id="adminRole" class="admin-role"></span>
+          </span>
+        </div>
       </div>
     </div>
 
