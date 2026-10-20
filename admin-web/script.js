@@ -875,6 +875,7 @@ async function loadOrders() {
     const res = await fetch(API.ORDERS + '/orders', { headers: authHeaders() });
     const orders = await res.json();
     if (!res.ok) throw new Error(orders.error || 'Could not load the orders.');
+    ordersCache = Object.fromEntries(orders.map(o => [o.order_id, o]));
 
     tbody.innerHTML = orders.map(o => {
       const next = ORDER_NEXT_STATUS[o.status] || [];
@@ -898,6 +899,14 @@ async function loadOrders() {
         note = `<div style="${NOTE_STYLE}">Cancel request declined: ${orderEsc(o.cancel_reject_reason)}</div>`;
       }
 
+      const shipNote = o.courier
+        ? `<div style="${NOTE_STYLE}">Shipped via <b>${orderEsc(o.courier)}</b>${o.tracking_number ? ' · ' + orderEsc(o.tracking_number) : ''}
+            ${o.status === 'shipped' ? `<button class="icon-btn" onclick="openShipModal(${o.order_id}, true)">Edit tracking</button>` : ''}</div>`
+        : '';
+      const slipButton = o.status !== 'cancelled'
+        ? `<div style="margin-top:4px;"><button class="icon-btn" onclick="printPackingSlip(${o.order_id})">Print slip</button></div>`
+        : '';
+
       const canCancel = ['pending', 'processing', 'shipped'].includes(o.status) && o.cancel_request_status !== 'requested';
       const cancelButton = canCancel
         ? `<div style="margin-top:4px;"><button class="icon-btn danger" onclick="openCancelModal(${o.order_id})">Cancel order</button></div>`
@@ -908,7 +917,7 @@ async function loadOrders() {
         <td>#${o.order_id}</td>
         <td>${orderEsc(o.customer_name || 'N/A')}</td>
         <td>₱${Number(o.total_amount).toLocaleString()}</td>
-        <td>${statusControl}${note}${cancelButton}</td>
+        <td>${statusControl}${shipNote}${note}${cancelButton}${slipButton}</td>
         <td>${new Date(o.order_date).toLocaleDateString()}</td>
       </tr>`;
     }).join('') || '<tr><td colspan="5">No orders yet.</td></tr>';
@@ -934,9 +943,105 @@ async function sendOrderAction(path, body) {
 }
 
 async function updateOrderStatus(orderId, status) {
+  if (status === 'shipped') {
+    loadOrders(); // put the dropdown back to the current status
+    openShipModal(orderId, false); // shipping needs the courier and the tracking number
+    return;
+  }
   await sendOrderAction('/orders/' + orderId + '/status', { status });
   loadOrders();
   loadNotifications(); // refresh the bell, the number of pending orders may have changed
+}
+
+const COURIERS = ['J&T Express', 'LBC Express', 'Flash Express', 'SPX Express', 'Ninja Van', 'Own rider / own delivery', 'Other'];
+let ordersCache = {}; // the orders on screen, so the Edit tracking window can show the saved details
+
+// Window for the courier and the tracking number. This is how an order becomes "shipped".
+function openShipModal(orderId, editing) {
+  const current = ordersCache[orderId] || {};
+  modalTitle.textContent = editing ? `Edit tracking for order #${orderId}` : `Ship order #${orderId}`;
+  modalForm.innerHTML = `
+    <p style="font-size:13px; color:#666; margin-bottom:6px;">The customer will see this in the app and will get an email.</p>
+    <label>Courier</label>
+    <select id="f_courier">${COURIERS.map(c => `<option value="${orderEsc(c)}" ${c === (current.courier || 'J&T Express') ? 'selected' : ''}>${orderEsc(c)}</option>`).join('')}</select>
+    <label>Tracking number</label>
+    <input type="text" id="f_tracking" maxlength="40" placeholder="e.g. 8001234567" value="${orderEsc(current.tracking_number || '')}">
+    <div class="modal-actions">
+      <button type="button" class="secondary-btn" onclick="closeModal()">Back</button>
+      <button type="submit" class="primary-btn">${editing ? 'Save' : 'Mark as shipped'}</button>
+    </div>
+  `;
+  modalForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const body = { courier: document.getElementById('f_courier').value, tracking_number: document.getElementById('f_tracking').value.trim() };
+    const path = editing ? '/orders/' + orderId + '/shipping-info' : '/orders/' + orderId + '/ship';
+    if (await sendOrderAction(path, body)) {
+      closeModal();
+      loadOrders();
+      loadNotifications();
+    }
+  };
+  modalOverlay.classList.remove('hidden');
+}
+
+// Opens a printable packing slip: who to send it to, what is inside, and the shipping details
+async function printPackingSlip(orderId) {
+  let order;
+  try {
+    const res = await fetch(API.ORDERS + '/orders/' + orderId, { headers: authHeaders() });
+    order = await res.json();
+    if (!res.ok) throw new Error(order.error || 'Could not load the order.');
+  } catch (err) {
+    alert(err.message);
+    return;
+  }
+
+  const win = window.open('', '_blank', 'width=720,height=900');
+  if (!win) {
+    alert('Please allow pop-ups for this website to print the packing slip.');
+    return;
+  }
+  const logo = new URL('logo.png', window.location.href).href;
+  const money = (n) => '₱' + Number(n).toLocaleString();
+  const address = order.ship_street
+    ? `<b>${orderEsc(order.ship_name)}</b><br>${orderEsc(order.ship_phone)}<br>${orderEsc(order.ship_street)}<br>Brgy. ${orderEsc(order.ship_barangay)}, ${orderEsc(order.ship_city)}<br>${orderEsc(order.ship_province)}, ${orderEsc(order.ship_region)} ${orderEsc(order.ship_zip)}${order.ship_landmark ? '<br>Landmark: ' + orderEsc(order.ship_landmark) : ''}`
+    : orderEsc(order.shipping_address || 'No address provided.');
+  const items = (order.items || []).map(i => `<tr><td>${i.quantity}</td><td>${orderEsc(i.product_name)}</td><td class="right">${money(i.price * i.quantity)}</td></tr>`).join('');
+  const totals = order.subtotal_amount != null
+    ? `<tr><td colspan="2">Subtotal</td><td class="right">${money(order.subtotal_amount)}</td></tr>
+       <tr><td colspan="2">Shipping fee</td><td class="right">${money(order.shipping_fee)}</td></tr>
+       ${Number(order.shipping_discount) > 0 ? `<tr><td colspan="2">Shipping discount</td><td class="right">-${money(order.shipping_discount)}</td></tr>` : ''}`
+    : '';
+  const courier = order.courier
+    ? `<p><b>Courier:</b> ${orderEsc(order.courier)}${order.tracking_number ? ' &nbsp; <b>Tracking:</b> ' + orderEsc(order.tracking_number) : ''}</p>`
+    : '';
+
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Packing slip - Order #${order.order_id}</title>
+    <style>
+      body { font-family: Arial, sans-serif; color: #111; padding: 28px; font-size: 14px; }
+      .head { display: flex; align-items: center; gap: 14px; border-bottom: 3px solid #fc408c; padding-bottom: 12px; margin-bottom: 18px; }
+      .head img { width: 64px; height: 64px; border-radius: 50%; }
+      .head h1 { margin: 0; font-size: 22px; } .head p { margin: 2px 0 0; color: #666; }
+      .shipto { border: 2px dashed #111; border-radius: 8px; padding: 14px; margin: 14px 0; font-size: 16px; line-height: 1.5; }
+      .label { font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+      table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+      td, th { padding: 8px 6px; border-bottom: 1px solid #ddd; text-align: left; } th { font-size: 12px; text-transform: uppercase; color: #666; }
+      .right { text-align: right; } .total td { font-weight: bold; font-size: 16px; border-top: 2px solid #111; }
+      .foot { margin-top: 28px; color: #666; font-size: 12px; text-align: center; }
+    </style></head><body>
+      <div class="head"><img src="${logo}" alt=""><div><h1>Fitora Gear</h1><p>Packing slip</p></div></div>
+      <p><b>Order #${order.order_id}</b> &nbsp; ${new Date(order.order_date).toLocaleString()}</p>
+      ${courier}
+      <div class="label">Ship to</div>
+      <div class="shipto">${address}</div>
+      <div class="label">Items</div>
+      <table><tr><th>Qty</th><th>Item</th><th class="right">Price</th></tr>${items}${totals}
+        <tr class="total"><td colspan="2">Total</td><td class="right">${money(order.total_amount)}</td></tr></table>
+      <p class="foot">Thank you for shopping with Fitora Gear!</p>
+    </body></html>`);
+  win.document.close();
+  win.focus();
+  setTimeout(() => win.print(), 400);
 }
 
 // A small window with a list of reasons (used for cancelling and for declining a request)

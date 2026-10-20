@@ -344,6 +344,9 @@ app.put('/api/orders/:id/status', verifyToken, requirePermission('orders'), asyn
     if (status === 'cancelled') {
       return res.status(400).json({ error: 'To cancel an order, use the Cancel order button. A reason is required and the stock is returned.' });
     }
+    if (status === 'shipped') {
+      return res.status(400).json({ error: 'To ship an order, use the Ship order button so the courier and tracking number are saved.' });
+    }
 
     const [current] = await pool.query('SELECT status FROM orders WHERE order_id = ?', [req.params.id]);
     if (current.length === 0) return res.status(404).json({ error: 'Order not found.' });
@@ -528,7 +531,11 @@ async function inTransaction(res, work) {
   } finally {
     if (conn) conn.release();
   }
-  return res.status(result.status).json(result.body);
+  res.status(result.status).json(result.body);
+  if (result.ok && typeof result.after === 'function') {
+    result.after().catch((err) => console.warn('Follow-up action failed:', err.message)); // never affects the reply
+  }
+  return undefined;
 }
 
 // CUSTOMER: pending orders cancel right away; processing orders need the seller's approval
@@ -610,6 +617,120 @@ app.put('/api/orders/:id/cancel-request', verifyToken, requirePermission('orders
     }
     await conn.query("UPDATE orders SET cancel_request_status = 'rejected', cancel_reject_reason = ? WHERE order_id = ?", [reason, id]);
     return succeed({ message: 'The cancellation request was declined.' });
+  });
+});
+
+// =====================================================
+// SHIPPING DETAILS (courier + tracking number) AND "ORDER RECEIVED"
+// =====================================================
+const COURIERS = ['J&T Express', 'LBC Express', 'Flash Express', 'SPX Express', 'Ninja Van', 'Own rider / own delivery', 'Other'];
+const OWN_DELIVERY = 'Own rider / own delivery'; // no tracking number needed
+
+function parseShipping(body) {
+  const courier = String(body.courier || '');
+  const tracking = String(body.tracking_number || '').trim();
+  if (!COURIERS.includes(courier)) return { error: 'Please choose the courier.' };
+  if (courier === OWN_DELIVERY) {
+    if (tracking && !/^[A-Za-z0-9 -]{3,40}$/.test(tracking)) return { error: 'The note can only have letters, numbers, spaces, and dashes (3-40 characters).' };
+    return { data: { courier, tracking: tracking || null } };
+  }
+  if (!/^[A-Za-z0-9-]{6,40}$/.test(tracking)) return { error: 'Please enter the tracking number (6-40 letters, numbers, or dashes, no spaces).' };
+  return { data: { courier, tracking } };
+}
+
+function escapeHtml(text) {
+  return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Emails the customer that the order is on its way. This is a bonus: if the email is not set up
+// or fails, the order is still marked as shipped.
+async function sendShippedEmail(userId, orderId, order, shipping) {
+  if (!process.env.BREVO_API_KEY || !process.env.EMAIL_FROM) return;
+  const [rows] = await pool.query('SELECT email, first_name, full_name FROM users WHERE user_id = ?', [userId]);
+  if (rows.length === 0 || !rows[0].email) return;
+
+  const name = rows[0].first_name || rows[0].full_name || 'there';
+  const place = [order.ship_city, order.ship_province].filter(Boolean).join(', ');
+  const trackingLine = shipping.tracking ? `<p>Tracking number: <b style="font-size:18px;letter-spacing:1px">${escapeHtml(shipping.tracking)}</b></p>` : '';
+  const html = `<div style="font-family:Arial,sans-serif;max-width:440px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px">
+    <h2 style="color:#FC408C;margin:0 0 12px">Fitora Gear</h2>
+    <p>Hi ${escapeHtml(name)},</p>
+    <p>Good news! Your order <b>#${orderId}</b> is on its way${place ? ' to ' + escapeHtml(place) : ''}.</p>
+    <p>Courier: <b>${escapeHtml(shipping.courier)}</b></p>
+    ${trackingLine}
+    <p style="color:#666;font-size:13px">You can also see these details in the Fitora Gear app, under Orders. When your parcel arrives, tap "Order Received".</p>
+  </div>`;
+
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { accept: 'application/json', 'content-type': 'application/json', 'api-key': process.env.BREVO_API_KEY },
+    body: JSON.stringify({
+      sender: { name: process.env.EMAIL_FROM_NAME || 'Fitora Gear', email: process.env.EMAIL_FROM },
+      to: [{ email: rows[0].email }],
+      subject: `Your Fitora Gear order #${orderId} is on its way`,
+      htmlContent: html,
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) console.warn('The shipped email was not sent:', response.status);
+}
+
+// ADMIN: mark an order as shipped with its courier and tracking number
+app.put('/api/orders/:id/ship', verifyToken, requirePermission('orders'), (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
+  const parsed = parseShipping(req.body || {});
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+  return inTransaction(res, async (conn) => {
+    const [rows] = await conn.query('SELECT * FROM orders WHERE order_id = ? FOR UPDATE', [id]);
+    if (rows.length === 0) return fail(404, 'Order not found.');
+    const order = rows[0];
+    if (order.status === 'shipped') return fail(400, 'This order is already shipped. Use Edit tracking to change the details.');
+    if (order.status !== 'pending' && order.status !== 'processing') return fail(400, `A ${order.status} order cannot be shipped.`);
+    if (order.cancel_request_status === 'requested') {
+      return fail(400, 'The customer asked to cancel this order. Approve or decline the request first.');
+    }
+    await conn.query(
+      "UPDATE orders SET status = 'shipped', courier = ?, tracking_number = ?, shipped_at = NOW() WHERE order_id = ?",
+      [parsed.data.courier, parsed.data.tracking, id]
+    );
+    return {
+      ...succeed({ message: 'The order was marked as shipped. The customer can now see the courier and tracking number.' }),
+      after: () => sendShippedEmail(order.user_id, id, order, parsed.data),
+    };
+  });
+});
+
+// ADMIN: fix the courier or tracking number of an order that is already shipped
+app.put('/api/orders/:id/shipping-info', verifyToken, requirePermission('orders'), (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
+  const parsed = parseShipping(req.body || {});
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+  return inTransaction(res, async (conn) => {
+    const [rows] = await conn.query('SELECT * FROM orders WHERE order_id = ? FOR UPDATE', [id]);
+    if (rows.length === 0) return fail(404, 'Order not found.');
+    if (rows[0].status !== 'shipped') return fail(400, 'Only a shipped order has tracking details to edit.');
+    await conn.query('UPDATE orders SET courier = ?, tracking_number = ? WHERE order_id = ?', [parsed.data.courier, parsed.data.tracking, id]);
+    return succeed({ message: 'The shipping details were updated.' });
+  });
+});
+
+// CUSTOMER: "Order Received" - the parcel arrived, so the order is completed
+app.put('/api/orders/my/:id/received', verifyCustomerToken, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
+
+  return inTransaction(res, async (conn) => {
+    const [rows] = await conn.query('SELECT * FROM orders WHERE order_id = ? AND user_id = ? FOR UPDATE', [id, req.customer.userId]);
+    if (rows.length === 0) return fail(404, 'Order not found.');
+    if (rows[0].status !== 'shipped') {
+      return fail(400, rows[0].status === 'completed' ? 'You already confirmed that you received this order.' : 'You can confirm the delivery after the order has been shipped.');
+    }
+    await conn.query("UPDATE orders SET status = 'completed', received_at = NOW() WHERE order_id = ?", [id]);
+    return succeed({ message: 'Thank you! Your order is now completed.' });
   });
 });
 
