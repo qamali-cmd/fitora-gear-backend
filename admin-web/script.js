@@ -414,6 +414,7 @@ const modalForm = document.getElementById('modalForm');
 function closeModal() {
   modalOverlay.classList.add('hidden');
   modalForm.innerHTML = '';
+  document.querySelector('#modalOverlay .modal').classList.remove('modal-wide');
 }
 
 async function openProductModal(productId) {
@@ -1040,8 +1041,8 @@ async function loadOrders() {
 
       return `
       <tr>
-        <td><div class="order-code">${orderEsc(o.order_code || '#' + o.order_id)}</div>${o.items_summary ? `<div class="muted-small">${orderEsc(o.items_summary)}</div>` : ''}</td>
-        <td>${orderEsc(o.customer_name || 'N/A')}</td>
+        <td><button type="button" class="link-btn order-code" onclick="openOrderDetails(${o.order_id})">${orderEsc(o.order_code || '#' + o.order_id)}</button>${o.items_summary ? `<div class="muted-small">${orderEsc(o.items_summary)}</div>` : ''}</td>
+        <td>${o.user_id ? `<button type="button" class="link-btn" onclick="openCustomerDetails(${o.user_id})">${orderEsc(o.customer_name || 'N/A')}</button>` : orderEsc(o.customer_name || 'N/A')}</td>
         <td>₱${Number(o.total_amount).toLocaleString()}</td>
         <td>${statusControl}${paymentLine(o)}${shipNote}${note}${refundButton}${cancelButton}${slipButton}</td>
         <td>${new Date(o.order_date).toLocaleDateString()}</td>
@@ -1330,12 +1331,13 @@ function renderCustomersTable() {
 
   tbody.innerHTML = list.map(c => `
     <tr>
-      <td>${c.full_name}</td>
-      <td>${c.email}</td>
+      <td><button type="button" class="link-btn" onclick="openCustomerDetails(${c.user_id})">${orderEsc(c.full_name)}</button></td>
+      <td>${orderEsc(c.email)}</td>
       <td>${c.phone || '-'}</td>
       <td>${c.order_count}</td>
       <td><span class="badge badge-${c.is_active ? 'active' : 'inactive'}">${c.is_active ? 'active' : 'inactive'}</span></td>
       <td>
+        <button class="icon-btn" onclick="openCustomerDetails(${c.user_id})">View</button>
         <button class="icon-btn ${c.is_active ? 'danger' : ''}" onclick="toggleCustomerStatus(${c.user_id}, ${c.is_active ? 0 : 1})">
           ${c.is_active ? 'Deactivate' : 'Activate'}
         </button>
@@ -1471,6 +1473,209 @@ document.addEventListener('click', (e) => {
     document.getElementById('notifDropdown').classList.add('hidden');
   }
 });
+
+// ===========================================================
+// DETAILS WINDOWS: one order, or one customer (with all their orders)
+// The two can open each other, and a Back button returns to the one before.
+// ===========================================================
+const peso = (n) => '₱' + Number(n || 0).toLocaleString();
+
+function productPicture(url, extraClass) {
+  const placeholder = `<div class="thumb-placeholder ${extraClass || ''}">📦</div>`;
+  if (!url) return placeholder;
+  const src = url.includes('/image/upload/') ? url.replace('/image/upload/', '/image/upload/c_fill,w_120,h_120,q_auto/') : url;
+  return `<img src="${orderEsc(src)}" class="thumb ${extraClass || ''}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'), {className:'thumb-placeholder ${extraClass || ''}', textContent:'📦'}))">`;
+}
+
+function avatarPicture(photo, name, big) {
+  const initials = String(name || '?').trim().split(/\s+/).slice(0, 2).map(w => w[0]).join('').toUpperCase();
+  const size = big ? 'avatar-lg' : 'avatar-md';
+  if (photo) {
+    const src = photo.includes('/image/upload/') ? photo.replace('/image/upload/', '/image/upload/c_fill,w_160,h_160,q_auto/') : photo;
+    return `<img src="${orderEsc(src)}" class="avatar ${size}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('span'), {className:'avatar ${size} avatar-initials', textContent:'${orderEsc(initials)}'}))">`;
+  }
+  return `<span class="avatar ${size} avatar-initials">${orderEsc(initials)}</span>`;
+}
+
+function paymentBadge(o) {
+  const method = o.payment_method === 'gcash' ? 'GCash' : 'Cash on Delivery';
+  const labels = { paid: ['Paid', 'paid'], awaiting_payment: ['Awaiting payment', 'pending'], refund_pending: ['Refund pending', 'cancelled'], refunded: ['Refunded', 'hidden'], unpaid: [o.payment_method === 'gcash' ? 'Not paid' : 'To be paid on delivery', ''] };
+  const [text, kind] = labels[o.payment_status] || ['', ''];
+  return `<span class="badge ${kind ? 'badge-' + kind : ''}">${orderEsc(method)} · ${orderEsc(text)}</span>`;
+}
+
+// Shows a wide window with the given content
+function showDetails(title, html) {
+  modalTitle.textContent = title;
+  modalForm.innerHTML = html;
+  modalForm.onsubmit = (e) => e.preventDefault();
+  document.querySelector('#modalOverlay .modal').classList.add('modal-wide');
+  modalOverlay.classList.remove('hidden');
+}
+
+function detailsError(title, message) {
+  showDetails(title, `<p class="detail-error">${orderEsc(message)}</p><div class="modal-actions"><button type="button" class="secondary-btn" onclick="closeModal()">Close</button></div>`);
+}
+
+function backButton(back) {
+  return back ? '<button type="button" class="back-link" id="detailBack">← Back</button>' : '';
+}
+
+async function openOrderDetails(orderId, back) {
+  showDetails('Order details', '<p class="detail-loading">Loading...</p>');
+  try {
+    const res = await fetch(API.ORDERS + '/orders/' + orderId, { headers: authHeaders() });
+    const o = await res.json();
+    if (!res.ok) throw new Error(o.error || 'Could not load the order.');
+
+    const code = o.order_code || '#' + o.order_id;
+    const items = (o.items || []).map(i => `
+      <div class="detail-item">
+        ${productPicture(i.image)}
+        <div class="detail-item-main">
+          <button type="button" class="link-btn" data-product="${orderEsc(i.product_name || '')}">${orderEsc(i.product_name || 'Removed product')}</button>
+          <div class="muted-small">${i.quantity} × ${peso(i.price)}</div>
+        </div>
+        <div class="detail-item-total">${peso(i.price * i.quantity)}</div>
+      </div>`).join('') || '<p class="muted-small">No items.</p>';
+
+    const address = o.ship_street
+      ? `<b>${orderEsc(o.ship_name)}</b> · ${orderEsc(o.ship_phone)}<br>${orderEsc(o.ship_street)}<br>Brgy. ${orderEsc(o.ship_barangay)}, ${orderEsc(o.ship_city)}<br>${orderEsc(o.ship_province)}, ${orderEsc(o.ship_region)} ${orderEsc(o.ship_zip)}${o.ship_landmark ? `<br><span class="muted-small">Landmark: ${orderEsc(o.ship_landmark)}</span>` : ''}`
+      : orderEsc(o.shipping_address || 'No address provided.');
+    const shipping = o.courier
+      ? `<div class="detail-line"><span>Courier</span><b>${orderEsc(o.courier)}${o.tracking_number ? ' · ' + orderEsc(o.tracking_number) : ''}</b></div>`
+      : '';
+    const totals = o.subtotal_amount != null
+      ? `<div class="detail-line"><span>Subtotal</span><b>${peso(o.subtotal_amount)}</b></div>
+         <div class="detail-line"><span>Shipping fee</span><b>${peso(o.shipping_fee)}</b></div>
+         ${Number(o.shipping_discount) > 0 ? `<div class="detail-line"><span>Shipping discount</span><b class="text-success">-${peso(o.shipping_discount)}</b></div>` : ''}`
+      : '';
+    const cancelled = o.status === 'cancelled'
+      ? `<div class="detail-note detail-note-danger">Cancelled by ${o.cancelled_by === 'admin' ? 'the shop' : o.cancelled_by === 'system' ? 'the system' : 'the customer'}: ${orderEsc(o.cancel_reason || 'no reason given')}</div>`
+      : (o.cancel_request_status === 'requested' ? `<div class="detail-note">The customer asked to cancel: ${orderEsc(o.cancel_request_reason || '')}</div>` : '');
+
+    showDetails('Order details', `
+      ${backButton(back)}
+      <div class="detail-top">
+        <div>
+          <div class="detail-code">${orderEsc(code)}</div>
+          <div class="muted-small">${new Date(o.order_date).toLocaleString()}</div>
+        </div>
+        <div class="detail-badges"><span class="badge badge-${orderEsc(o.status)}">${orderEsc(o.status)}</span>${paymentBadge(o)}</div>
+      </div>
+      ${cancelled}
+      <div class="detail-grid">
+        <div class="detail-card">
+          <div class="detail-label">Customer</div>
+          <div class="detail-customer">
+            ${avatarPicture(o.customer_photo, o.customer_name)}
+            <div>
+              ${o.user_id ? `<button type="button" class="link-btn" data-customer="${o.user_id}">${orderEsc(o.customer_name || 'N/A')}</button>` : orderEsc(o.customer_name || 'N/A')}
+              <div class="muted-small">${orderEsc(o.email || '')}${o.customer_phone ? ' · ' + orderEsc(o.customer_phone) : ''}</div>
+            </div>
+          </div>
+        </div>
+        <div class="detail-card">
+          <div class="detail-label">Delivery address</div>
+          <div class="detail-address">${address}</div>
+        </div>
+      </div>
+      <div class="detail-card">
+        <div class="detail-label">Items</div>
+        ${items}
+        <div class="detail-totals">
+          ${totals}
+          ${shipping}
+          <div class="detail-line detail-total"><span>Total</span><b>${peso(o.total_amount)}</b></div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        ${o.status !== 'cancelled' ? `<button type="button" class="secondary-btn" onclick="printPackingSlip(${o.order_id})">Print slip</button>` : ''}
+        <button type="button" class="primary-btn" onclick="closeModal()">Close</button>
+      </div>`);
+
+    if (back) document.getElementById('detailBack').addEventListener('click', back);
+    modalForm.querySelectorAll('[data-product]').forEach(btn => btn.addEventListener('click', () => {
+      closeModal();
+      history.replaceState(null, '', '#products');
+      navigateTo('products');
+      highlightRow('productsTableBody', btn.dataset.product);
+    }));
+    modalForm.querySelectorAll('[data-customer]').forEach(btn => btn.addEventListener('click', () => {
+      openCustomerDetails(Number(btn.dataset.customer), () => openOrderDetails(orderId, back));
+    }));
+  } catch (err) {
+    detailsError('Order details', err.message);
+  }
+}
+
+async function openCustomerDetails(userId, back) {
+  showDetails('Customer details', '<p class="detail-loading">Loading...</p>');
+  try {
+    const [customerRes, ordersRes] = await Promise.all([
+      fetch(API.AUTH + '/customers/' + userId, { headers: authHeaders() }),
+      fetch(API.ORDERS + '/orders/customer/' + userId, { headers: authHeaders() }),
+    ]);
+    const c = await customerRes.json();
+    if (!customerRes.ok) throw new Error(c.error || 'Could not load the customer.');
+    const orders = ordersRes.ok ? await ordersRes.json() : [];
+
+    const birthday = c.birthday ? new Date(c.birthday + 'T00:00:00').toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : '-';
+    const addresses = (c.addresses || []).map(a => `
+      <div class="detail-address-card">
+        <div><span class="badge">${a.label === 'office' ? 'Office' : 'Home'}</span>${a.is_default ? ' <span class="badge badge-active">Default</span>' : ''}</div>
+        <div><b>${orderEsc(a.recipient_name)}</b> · ${orderEsc(a.phone)}</div>
+        <div>${orderEsc(a.street)}, Brgy. ${orderEsc(a.barangay_name)}, ${orderEsc(a.city_name)}, ${orderEsc(a.province_name)}, ${orderEsc(a.region_name)} ${orderEsc(a.zip_code)}</div>
+        ${a.landmark ? `<div class="muted-small">Landmark: ${orderEsc(a.landmark)}</div>` : ''}
+      </div>`).join('') || (c.address ? `<div class="detail-address-card">${orderEsc(c.address)}</div>` : '<p class="muted-small">No saved address.</p>');
+    const orderRows = orders.map(o => `
+      <button type="button" class="detail-order-row" data-order="${o.order_id}">
+        <span class="detail-order-main"><b>${orderEsc(o.order_code || '#' + o.order_id)}</b><span class="muted-small">${orderEsc(o.items_summary || '')}</span></span>
+        <span class="detail-order-side"><span class="badge badge-${orderEsc(o.status)}">${orderEsc(o.status)}</span><b>${peso(o.total_amount)}</b><span class="muted-small">${new Date(o.order_date).toLocaleDateString()}</span></span>
+      </button>`).join('') || '<p class="muted-small">This customer has not ordered yet.</p>';
+
+    showDetails('Customer details', `
+      ${backButton(back)}
+      <div class="detail-person">
+        ${avatarPicture(c.profilePhoto, c.fullName, true)}
+        <div class="detail-person-info">
+          <div class="detail-code">${orderEsc(c.fullName)}</div>
+          <div class="muted-small">@${orderEsc(c.username || '-')} · ${orderEsc(c.email)} ${c.emailVerified ? '<span class="badge badge-active">Email verified</span>' : '<span class="badge badge-pending">Email not verified</span>'}</div>
+          <div style="margin-top:8px;"><span class="badge badge-${c.isActive ? 'active' : 'inactive'}">${c.isActive ? 'active' : 'inactive'}</span></div>
+        </div>
+      </div>
+      <div class="stat-tiles">
+        <div class="stat-tile"><span>Orders</span><b>${c.stats.orders}</b></div>
+        <div class="stat-tile"><span>Completed</span><b>${c.stats.completed}</b></div>
+        <div class="stat-tile"><span>Cancelled</span><b>${c.stats.cancelled}</b></div>
+        <div class="stat-tile"><span>Total spent</span><b>${peso(c.stats.spent)}</b></div>
+      </div>
+      <div class="detail-grid">
+        <div class="detail-card">
+          <div class="detail-label">Personal details</div>
+          <div class="detail-line"><span>Phone</span><b>${orderEsc(c.phone || '-')}</b></div>
+          <div class="detail-line"><span>Birthday</span><b>${orderEsc(birthday)}</b></div>
+          <div class="detail-line"><span>Member since</span><b>${new Date(c.createdAt).toLocaleDateString()}</b></div>
+        </div>
+        <div class="detail-card">
+          <div class="detail-label">Saved addresses</div>
+          ${addresses}
+        </div>
+      </div>
+      <div class="detail-card">
+        <div class="detail-label">Orders</div>
+        ${orderRows}
+      </div>
+      <div class="modal-actions"><button type="button" class="primary-btn" onclick="closeModal()">Close</button></div>`);
+
+    if (back) document.getElementById('detailBack').addEventListener('click', back);
+    modalForm.querySelectorAll('[data-order]').forEach(btn => btn.addEventListener('click', () => {
+      openOrderDetails(Number(btn.dataset.order), () => openCustomerDetails(userId, back));
+    }));
+  } catch (err) {
+    detailsError('Customer details', err.message);
+  }
+}
 
 // ===========================================================
 // REVIEWS MANAGEMENT

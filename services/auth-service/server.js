@@ -617,6 +617,39 @@ app.get('/api/auth/customers', verifyToken, requirePermission('customers'), asyn
 });
 
 // PUT /api/auth/customers/:id/status - i-activate o i-deactivate ang isang customer account
+// ADMIN: everything about ONE customer: the profile, the saved addresses, and numbers about their orders
+app.get('/api/auth/customers/:id', verifyToken, requirePermission('customers'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid customer.' });
+
+    const [rows] = await pool.query(
+      `SELECT u.user_id, u.full_name, u.first_name, u.middle_name, u.last_name, u.username, u.email, u.email_verified, u.phone, u.address,
+              u.profile_photo, u.is_active, u.created_at, DATE_FORMAT(u.birthday, '%Y-%m-%d') AS birthday
+       FROM users u WHERE u.user_id = ?`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Customer not found.' });
+
+    const [addresses] = await pool.query('SELECT * FROM user_addresses WHERE user_id = ? ORDER BY is_default DESC, address_id DESC', [id]);
+    const [stats] = await pool.query(
+      `SELECT COUNT(*) AS orders, COALESCE(SUM(status = 'completed'), 0) AS completed, COALESCE(SUM(status = 'cancelled'), 0) AS cancelled,
+              COALESCE(SUM(CASE WHEN status <> 'cancelled' THEN total_amount END), 0) AS spent
+       FROM orders WHERE user_id = ?`,
+      [id]
+    );
+
+    res.json({
+      ...customerProfile({ ...rows[0], order_count: stats[0].orders }),
+      isActive: !!rows[0].is_active,
+      addresses: addresses.map((a) => ({ ...a, is_default: !!a.is_default })),
+      stats: { orders: Number(stats[0].orders), completed: Number(stats[0].completed), cancelled: Number(stats[0].cancelled), spent: Number(stats[0].spent) },
+    });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
 app.put('/api/auth/customers/:id/status', verifyToken, requirePermission('customers'), async (req, res) => {
   try {
     const { is_active } = req.body;

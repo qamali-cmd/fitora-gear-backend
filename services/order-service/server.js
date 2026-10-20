@@ -356,10 +356,39 @@ app.get('/api/orders', verifyToken, async (req, res) => {
 });
 
 // GET /api/orders/:id - detalye ng isang order kasama ang mga item nito (ADMIN)
+// ADMIN: all the orders of ONE customer (for the customer details window).
+// Allowed for staff who can see customers OR orders.
+function requireAnyPermission(keys) {
+  return (req, res, next) => {
+    if (req.admin.role === 'super_admin') return next();
+    const permissions = req.admin.permissions || [];
+    if (keys.some((key) => permissions.includes(key))) return next();
+    return res.status(403).json({ error: 'You do not have access to this section.' });
+  };
+}
+
+app.get('/api/orders/customer/:userId', verifyToken, requireAnyPermission(['customers', 'orders']), async (req, res) => {
+  try {
+    const id = Number(req.params.userId);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid customer.' });
+    const [rows] = await pool.query(
+      `SELECT o.order_id, o.order_code, o.status, o.total_amount, o.order_date, o.payment_method, o.payment_status,
+        (SELECT GROUP_CONCAT(CONCAT(oi.quantity, 'x ', p.product_name) ORDER BY oi.order_item_id SEPARATOR ', ')
+         FROM order_items oi JOIN products p ON p.product_id = oi.product_id WHERE oi.order_id = o.order_id) AS items_summary
+       FROM orders o WHERE o.user_id = ? ORDER BY o.order_date DESC LIMIT 100`,
+      [id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
 app.get('/api/orders/:id', verifyToken, async (req, res) => {
   try {
     const [orderRows] = await pool.query(
-      `SELECT o.*, u.full_name AS customer_name, u.email
+      `SELECT o.*, u.full_name AS customer_name, u.email, u.phone AS customer_phone, u.profile_photo AS customer_photo
        FROM orders o LEFT JOIN users u ON o.user_id = u.user_id
        WHERE o.order_id = ?`,
       [req.params.id]
@@ -367,7 +396,7 @@ app.get('/api/orders/:id', verifyToken, async (req, res) => {
     if (orderRows.length === 0) return res.status(404).json({ error: 'Order not found.' });
 
     const [itemRows] = await pool.query(
-      `SELECT oi.*, p.product_name
+      `SELECT oi.*, p.product_name, p.image
        FROM order_items oi LEFT JOIN products p ON oi.product_id = p.product_id
        WHERE oi.order_id = ?`,
       [req.params.id]
