@@ -188,16 +188,20 @@ app.get('/api/products/:id', async (req, res) => {
 // POST /api/products - gumawa ng bagong product
 app.post('/api/products', verifyToken, requirePermission('products'), async (req, res) => {
   try {
-    const { category_id, product_name, description, price, stock, image, status } = req.body;
+    const { category_id, product_name, description, price, stock, image, status, weight_grams } = req.body;
 
     if (!product_name || price == null) {
       return res.status(400).json({ error: 'Product name and price are required.' });
     }
+    const weight = weight_grams === undefined || weight_grams === '' || weight_grams === null ? 300 : Number(weight_grams);
+    if (!Number.isInteger(weight) || weight < 1 || weight > 50000) {
+      return res.status(400).json({ error: 'Weight must be a whole number of grams between 1 and 50,000.' });
+    }
 
     const [result] = await pool.query(
-      `INSERT INTO products (category_id, product_name, description, price, stock, image, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [category_id || null, product_name, description || null, price, stock || 0, image || null, status || 'active']
+      `INSERT INTO products (category_id, product_name, description, price, stock, image, status, weight_grams)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [category_id || null, product_name, description || null, price, stock || 0, image || null, status || 'active', weight]
     );
 
     res.status(201).json({ product_id: result.insertId, ...req.body });
@@ -210,13 +214,19 @@ app.post('/api/products', verifyToken, requirePermission('products'), async (req
 // PUT /api/products/:id - i-update ang isang product
 app.put('/api/products/:id', verifyToken, requirePermission('products'), async (req, res) => {
   try {
-    const { category_id, product_name, description, price, stock, image, status } = req.body;
+    const { category_id, product_name, description, price, stock, image, status, weight_grams } = req.body;
+
+    const weight = weight_grams === undefined || weight_grams === '' || weight_grams === null ? null : Number(weight_grams);
+    if (weight !== null && (!Number.isInteger(weight) || weight < 1 || weight > 50000)) {
+      return res.status(400).json({ error: 'Weight must be a whole number of grams between 1 and 50,000.' });
+    }
 
     await pool.query(
       `UPDATE products
-       SET category_id = ?, product_name = ?, description = ?, price = ?, stock = ?, image = ?, status = ?
+       SET category_id = ?, product_name = ?, description = ?, price = ?, stock = ?, image = ?, status = ?,
+           weight_grams = COALESCE(?, weight_grams)
        WHERE product_id = ?`,
-      [category_id || null, product_name, description || null, price, stock, image || null, status, req.params.id]
+      [category_id || null, product_name, description || null, price, stock, image || null, status, weight, req.params.id]
     );
 
     res.json({ message: 'Product updated.' });

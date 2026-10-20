@@ -20,6 +20,162 @@ app.use(express.json());
 // =====================================================
 
 // POST /api/orders/place - gumawa ng bagong order (mula sa cart ng customer)
+// =====================================================
+// SHIPPING FEE (by destination zone and parcel weight)
+// The shop is in Lucena, Quezon. These are demo rates modeled on the zone and weight
+// structure of public courier rates; they are not official courier prices.
+// =====================================================
+const SHIPPING_RATES = {            // [up to 0.5 kg, up to 1 kg, up to 3 kg] in pesos
+  quezon: [65, 110, 140],
+  luzon: [85, 155, 180],
+  metro_manila: [95, 165, 190],
+  visayas: [100, 180, 200],
+  mindanao: [105, 195, 215],
+  island: [115, 205, 230],
+};
+const ZONE_LABELS = {
+  quezon: 'Quezon province', luzon: 'Luzon', metro_manila: 'Metro Manila',
+  visayas: 'Visayas', mindanao: 'Mindanao', island: 'Island province',
+};
+const EXTRA_PER_KG = 35;              // pesos for every extra kilo above 3 kg
+const FREE_SHIPPING_MIN = 1500;       // orders of this amount or more get a shipping discount
+const FREE_SHIPPING_MAX_DISCOUNT = 100;
+
+// Official region codes (PSGC)
+const REGION_ZONES = {
+  '130000000': 'metro_manila',
+  '010000000': 'luzon', '020000000': 'luzon', '030000000': 'luzon', '040000000': 'luzon',
+  '050000000': 'luzon', '140000000': 'luzon', '170000000': 'luzon',
+  '060000000': 'visayas', '070000000': 'visayas', '080000000': 'visayas', '180000000': 'visayas',
+  '090000000': 'mindanao', '100000000': 'mindanao', '110000000': 'mindanao',
+  '120000000': 'mindanao', '150000000': 'mindanao', '160000000': 'mindanao',
+};
+// If the address was typed by hand (no region code), the region name is used instead
+const REGION_NAME_ZONES = [
+  [/ncr|national capital|metro manila/i, 'metro_manila'],
+  [/ilocos|cagayan valley|central luzon|calabarzon|mimaropa|bicol|cordillera|\bcar\b|region\s*(i|ii|iii|iv-?a|iv-?b|v)\b/i, 'luzon'],
+  [/visayas|negros|region\s*(vi|vii|viii)\b/i, 'visayas'],
+  [/zamboanga|northern mindanao|davao|soccsksargen|caraga|barmm|bangsamoro|mindanao|region\s*(ix|x|xi|xii|xiii)\b/i, 'mindanao'],
+];
+const ISLAND_PROVINCES = [
+  'batanes', 'catanduanes', 'marinduque', 'masbate', 'romblon', 'palawan', 'biliran',
+  'siquijor', 'camiguin', 'dinagat islands', 'sulu', 'tawi-tawi', 'basilan',
+];
+
+function round2(value) {
+  return Math.round(value * 100) / 100;
+}
+
+function shippingZone(address) {
+  const province = String(address.province_name || '').trim().toLowerCase();
+  const regionName = String(address.region_name || '');
+  if (ISLAND_PROVINCES.includes(province)) return 'island';
+
+  let zone = REGION_ZONES[String(address.region_code || '')];
+  if (!zone) {
+    for (const [pattern, name] of REGION_NAME_ZONES) {
+      if (pattern.test(regionName)) { zone = name; break; }
+    }
+  }
+  if (!zone) zone = 'luzon'; // places we cannot recognize use the Luzon rate
+  if (zone === 'luzon' && province === 'quezon' && (String(address.region_code) === '040000000' || /calabarzon|region\s*iv-?a\b/i.test(regionName))) {
+    zone = 'quezon';
+  }
+  return zone;
+}
+
+function shippingFeeFor(zone, weightGrams) {
+  const [upToHalfKg, upToOneKg, upToThreeKg] = SHIPPING_RATES[zone];
+  if (weightGrams <= 500) return upToHalfKg;
+  if (weightGrams <= 1000) return upToOneKg;
+  if (weightGrams <= 3000) return upToThreeKg;
+  return upToThreeKg + Math.ceil((weightGrams - 3000) / 1000) * EXTRA_PER_KG;
+}
+
+function priceShipping(address, weightGrams, subtotal) {
+  const zone = shippingZone(address);
+  const fee = shippingFeeFor(zone, weightGrams);
+  const discount = subtotal >= FREE_SHIPPING_MIN ? Math.min(fee, FREE_SHIPPING_MAX_DISCOUNT) : 0;
+  return {
+    zone,
+    zone_label: ZONE_LABELS[zone],
+    weight_grams: weightGrams,
+    shipping_fee: fee,
+    shipping_discount: discount,
+    free_shipping_min: FREE_SHIPPING_MIN,
+    free_shipping_max_discount: FREE_SHIPPING_MAX_DISCOUNT,
+  };
+}
+
+// Checks the cart against the database (prices come from the database, never from the app).
+// Returns { error, status } or { lines, subtotal, weight }.
+async function priceCart(db, rawItems, lockRows) {
+  if (!Array.isArray(rawItems) || rawItems.length === 0 || rawItems.length > 50) {
+    return { error: 'Your cart is empty or invalid.', status: 400 };
+  }
+  const wanted = new Map(); // product_id -> quantity (the same product listed twice is merged)
+  for (const item of rawItems) {
+    const productId = Number(item && item.product_id);
+    const quantity = Number(item && item.quantity);
+    if (!Number.isInteger(productId) || productId <= 0 || !Number.isInteger(quantity) || quantity < 1) {
+      return { error: 'Your cart contains an invalid item.', status: 400 };
+    }
+    const total = (wanted.get(productId) || 0) + quantity;
+    if (total > 99) return { error: 'You can order at most 99 of the same product.', status: 400 };
+    wanted.set(productId, total);
+  }
+
+  const lines = [];
+  let subtotal = 0;
+  let weight = 0;
+  // Fixed order, so two checkouts at the same time cannot block each other
+  for (const productId of [...wanted.keys()].sort((a, b) => a - b)) {
+    const quantity = wanted.get(productId);
+    const [rows] = await db.query(
+      `SELECT product_id, product_name, price, stock, status, weight_grams FROM products WHERE product_id = ?${lockRows ? ' FOR UPDATE' : ''}`,
+      [productId]
+    );
+    const product = rows[0];
+    if (!product || product.status !== 'active') {
+      return { error: 'A product in your cart is no longer available. Please review your cart.', status: 400 };
+    }
+    if (product.stock < quantity) {
+      return { error: `Not enough stock for ${product.product_name}. Only ${product.stock} left.`, status: 400 };
+    }
+    const price = Number(product.price);
+    subtotal += price * quantity;
+    weight += (Number(product.weight_grams) || 300) * quantity;
+    lines.push({ product_id: productId, quantity, price });
+  }
+  return { lines, subtotal: round2(subtotal), weight };
+}
+
+// Shows the customer the shipping fee and total BEFORE they place the order
+app.post('/api/orders/quote', verifyCustomerToken, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const addressId = Number(body.address_id);
+    if (!Number.isInteger(addressId) || addressId <= 0) {
+      return res.status(400).json({ error: 'Please choose a delivery address.' });
+    }
+    const [addressRows] = await pool.query('SELECT * FROM user_addresses WHERE address_id = ? AND user_id = ?', [addressId, req.customer.userId]);
+    if (addressRows.length === 0) return res.status(400).json({ error: 'Please choose a valid delivery address.' });
+
+    const cart = await priceCart(pool, body.items, false);
+    if (cart.error) return res.status(cart.status).json({ error: cart.error });
+
+    const shipping = priceShipping(addressRows[0], cart.weight, cart.subtotal);
+    res.json({
+      subtotal: cart.subtotal,
+      ...shipping,
+      total_amount: round2(cart.subtotal + shipping.shipping_fee - shipping.shipping_discount),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
 app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
   // The customer must have a verified email before placing an order
   try {
@@ -32,83 +188,65 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
     return res.status(500).json({ error: 'Something went wrong on the server.' });
   }
 
-  const conn = await pool.getConnection();
+  const body = req.body || {};
+  const addressId = Number(body.address_id);
+  if (!Number.isInteger(addressId) || addressId <= 0) {
+    return res.status(400).json({ error: 'Please choose a delivery address.' });
+  }
+
+  let conn;
   try {
-    const { items, shipping_address, address_id } = req.body;
+    conn = await pool.getConnection();
 
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      conn.release();
-      return res.status(400).json({ error: 'Your cart is empty.' });
-    }
-
-    // Delivery address: a saved address (address_id) is preferred; a plain text address still works
-    let ship = null;
-    let addressText = shipping_address || null;
-    if (address_id) {
-      const [addressRows] = await conn.query('SELECT * FROM user_addresses WHERE address_id = ? AND user_id = ?', [address_id, req.customer.userId]);
-      if (addressRows.length === 0) {
-        conn.release();
-        return res.status(400).json({ error: 'Please choose a valid delivery address.' });
-      }
-      ship = addressRows[0];
-      addressText = [ship.recipient_name, ship.phone, ship.street, 'Brgy. ' + ship.barangay_name, ship.city_name, ship.province_name, ship.region_name, ship.zip_code]
-        .join(', ').slice(0, 250);
-    }
+    // A complete saved address is required: it also decides the shipping fee
+    const [addressRows] = await conn.query('SELECT * FROM user_addresses WHERE address_id = ? AND user_id = ?', [addressId, req.customer.userId]);
+    if (addressRows.length === 0) return res.status(400).json({ error: 'Please choose a valid delivery address.' });
+    const ship = addressRows[0];
+    const addressText = [ship.recipient_name, ship.phone, ship.street, 'Brgy. ' + ship.barangay_name, ship.city_name, ship.province_name, ship.region_name, ship.zip_code]
+      .join(', ').slice(0, 250);
 
     await conn.beginTransaction();
 
-    let totalAmount = 0;
-    const orderItemsData = [];
-
-    for (const item of items) {
-      const [[product]] = await conn.query(
-        'SELECT product_id, price, stock, product_name FROM products WHERE product_id = ? FOR UPDATE',
-        [item.product_id]
-      );
-
-      if (!product) {
-        await conn.rollback();
-        conn.release();
-        return res.status(404).json({ error: `Product #${item.product_id} was not found.` });
-      }
-      if (product.stock < item.quantity) {
-        await conn.rollback();
-        conn.release();
-        return res.status(400).json({ error: `Not enough stock for ${product.product_name}.` });
-      }
-
-      totalAmount += product.price * item.quantity;
-      orderItemsData.push({ product_id: product.product_id, quantity: item.quantity, price: product.price });
+    const cart = await priceCart(conn, body.items, true);
+    if (cart.error) {
+      await conn.rollback();
+      return res.status(cart.status).json({ error: cart.error });
     }
 
+    const shipping = priceShipping(ship, cart.weight, cart.subtotal);
+    const totalAmount = round2(cart.subtotal + shipping.shipping_fee - shipping.shipping_discount);
+
     const [orderResult] = await conn.query(
-      `INSERT INTO orders (user_id, total_amount, status, shipping_address, ship_name, ship_phone, ship_region, ship_province,
-                           ship_city, ship_barangay, ship_street, ship_zip, ship_landmark, ship_region_code, ship_province_code)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [req.customer.userId, totalAmount, 'pending', addressText,
-        ship ? ship.recipient_name : null, ship ? ship.phone : null, ship ? ship.region_name : null, ship ? ship.province_name : null,
-        ship ? ship.city_name : null, ship ? ship.barangay_name : null, ship ? ship.street : null, ship ? ship.zip_code : null,
-        ship ? ship.landmark : null, ship ? ship.region_code : null, ship ? ship.province_code : null]
+      `INSERT INTO orders (user_id, total_amount, subtotal_amount, shipping_fee, shipping_discount, shipping_zone, total_weight_grams,
+                           status, shipping_address, ship_name, ship_phone, ship_region, ship_province, ship_city, ship_barangay,
+                           ship_street, ship_zip, ship_landmark, ship_region_code, ship_province_code)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [req.customer.userId, totalAmount, cart.subtotal, shipping.shipping_fee, shipping.shipping_discount, shipping.zone, cart.weight,
+        addressText, ship.recipient_name, ship.phone, ship.region_name, ship.province_name, ship.city_name, ship.barangay_name,
+        ship.street, ship.zip_code, ship.landmark, ship.region_code, ship.province_code]
     );
     const orderId = orderResult.insertId;
 
-    for (const item of orderItemsData) {
-      await conn.query(
-        'INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)',
-        [orderId, item.product_id, item.quantity, item.price]
-      );
-      await conn.query('UPDATE products SET stock = stock - ? WHERE product_id = ?', [item.quantity, item.product_id]);
+    for (const line of cart.lines) {
+      await conn.query('INSERT INTO order_items (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)', [orderId, line.product_id, line.quantity, line.price]);
+      await conn.query('UPDATE products SET stock = stock - ? WHERE product_id = ?', [line.quantity, line.product_id]);
     }
 
     await conn.commit();
-    conn.release();
-
-    res.status(201).json({ order_id: orderId, total_amount: totalAmount, status: 'pending' });
+    res.status(201).json({
+      order_id: orderId,
+      status: 'pending',
+      subtotal: cart.subtotal,
+      shipping_fee: shipping.shipping_fee,
+      shipping_discount: shipping.shipping_discount,
+      total_amount: totalAmount,
+    });
   } catch (err) {
-    await conn.rollback();
-    conn.release();
+    if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
@@ -231,7 +369,7 @@ app.get('/api/orders/stats/summary', verifyToken, async (req, res) => {
       "SELECT COUNT(*) AS pendingOrders FROM orders WHERE status = 'pending'"
     );
     const [[{ totalRevenue }]] = await pool.query(
-      "SELECT COALESCE(SUM(total_amount), 0) AS totalRevenue FROM orders WHERE status != 'cancelled'"
+      "SELECT COALESCE(SUM(COALESCE(subtotal_amount, total_amount)), 0) AS totalRevenue FROM orders WHERE status != 'cancelled'"
     );
 
     res.json({ totalOrders, pendingOrders, totalRevenue });
@@ -251,10 +389,10 @@ app.get('/api/orders/reports/summary', verifyToken, requirePermission('reports')
       "SELECT COUNT(*) AS completedOrders FROM orders WHERE status = 'completed'"
     );
     const [[{ totalRevenue }]] = await pool.query(
-      "SELECT COALESCE(SUM(total_amount), 0) AS totalRevenue FROM orders WHERE status != 'cancelled'"
+      "SELECT COALESCE(SUM(COALESCE(subtotal_amount, total_amount)), 0) AS totalRevenue FROM orders WHERE status != 'cancelled'"
     );
     const [[{ avgOrderValue }]] = await pool.query(
-      "SELECT COALESCE(AVG(total_amount), 0) AS avgOrderValue FROM orders WHERE status != 'cancelled'"
+      "SELECT COALESCE(AVG(COALESCE(subtotal_amount, total_amount)), 0) AS avgOrderValue FROM orders WHERE status != 'cancelled'"
     );
 
     res.json({ completedOrders, totalRevenue, avgOrderValue });
@@ -267,7 +405,7 @@ app.get('/api/orders/reports/summary', verifyToken, requirePermission('reports')
 app.get('/api/orders/reports/sales-by-day', verifyToken, requirePermission('reports'), async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT DATE(order_date) AS day, COALESCE(SUM(total_amount), 0) AS revenue
+      SELECT DATE(order_date) AS day, COALESCE(SUM(COALESCE(subtotal_amount, total_amount)), 0) AS revenue
       FROM orders
       WHERE status != 'cancelled' AND order_date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
       GROUP BY DATE(order_date)

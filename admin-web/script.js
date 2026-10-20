@@ -319,7 +319,7 @@ function closeModal() {
 }
 
 async function openProductModal(productId) {
-  let product = { product_name: '', category_id: '', price: '', stock: 0, status: 'active', description: '', image: '' };
+  let product = { product_name: '', category_id: '', price: '', stock: 0, weight_grams: 300, status: 'active', description: '', image: '' };
 
   if (productId) {
     const res = await fetch(API.PRODUCTS + '/products/' + productId);
@@ -366,6 +366,9 @@ async function openProductModal(productId) {
     <label>Stock</label>
     <input type="number" id="f_stock" value="${product.stock || 0}" required>
 
+    <label>Weight (grams, used for the shipping fee)</label>
+    <input type="number" id="f_weight" min="1" max="50000" step="1" value="${product.weight_grams || 300}" required>
+
     <label>Status</label>
     <select id="f_status">
       <option value="active" ${product.status === 'active' ? 'selected' : ''}>Active</option>
@@ -387,6 +390,7 @@ async function openProductModal(productId) {
       image: document.getElementById('f_image').value.trim(),
       price: parseFloat(document.getElementById('f_price').value),
       stock: parseInt(document.getElementById('f_stock').value),
+      weight_grams: parseInt(document.getElementById('f_weight').value),
       status: document.getElementById('f_status').value,
     };
 
