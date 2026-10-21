@@ -18,9 +18,23 @@ app.use(express.json());
 
 // GET /api/categories - kunin lahat ng categories (walang kailangang login,
 // pwede rin itong gamitin ng client/mobile app sa hinaharap)
+// Who a product is for
+const AUDIENCES = ['men', 'women', 'unisex'];
+const AUDIENCE_ERROR = 'Please choose who the product is for: men, women, or unisex.';
+
+// The categories, with how many products each one has and how many are for men, women, or everyone
 app.get('/api/categories', async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM categories ORDER BY category_name');
+    const [rows] = await pool.query(`
+      SELECT c.*, COUNT(p.product_id) AS product_count,
+             COALESCE(SUM(p.audience = 'men'), 0) AS men_count,
+             COALESCE(SUM(p.audience = 'women'), 0) AS women_count,
+             COALESCE(SUM(p.audience = 'unisex'), 0) AS unisex_count
+      FROM categories c
+      LEFT JOIN products p ON p.category_id = c.category_id
+      GROUP BY c.category_id
+      ORDER BY c.category_name
+    `);
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -189,7 +203,7 @@ app.get('/api/products/:id', async (req, res) => {
 // POST /api/products - gumawa ng bagong product
 app.post('/api/products', verifyToken, requirePermission('products'), async (req, res) => {
   try {
-    const { category_id, product_name, description, price, stock, image, status, weight_grams } = req.body;
+    const { category_id, product_name, description, price, stock, image, status, weight_grams, audience } = req.body;
 
     if (!product_name || price == null) {
       return res.status(400).json({ error: 'Product name and price are required.' });
@@ -199,10 +213,13 @@ app.post('/api/products', verifyToken, requirePermission('products'), async (req
       return res.status(400).json({ error: 'Weight must be a whole number of grams between 1 and 50,000.' });
     }
 
+    const who = audience === undefined || audience === null || audience === '' ? 'unisex' : audience;
+    if (!AUDIENCES.includes(who)) return res.status(400).json({ error: AUDIENCE_ERROR });
+
     const [result] = await pool.query(
-      `INSERT INTO products (category_id, product_name, description, price, stock, image, status, weight_grams)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [category_id || null, product_name, description || null, price, stock || 0, image || null, status || 'active', weight]
+      `INSERT INTO products (category_id, product_name, description, price, stock, image, status, weight_grams, audience)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [category_id || null, product_name, description || null, price, stock || 0, image || null, status || 'active', weight, who]
     );
 
     res.status(201).json({ product_id: result.insertId, ...req.body });
@@ -215,19 +232,22 @@ app.post('/api/products', verifyToken, requirePermission('products'), async (req
 // PUT /api/products/:id - i-update ang isang product
 app.put('/api/products/:id', verifyToken, requirePermission('products'), async (req, res) => {
   try {
-    const { category_id, product_name, description, price, stock, image, status, weight_grams } = req.body;
+    const { category_id, product_name, description, price, stock, image, status, weight_grams, audience } = req.body;
 
     const weight = weight_grams === undefined || weight_grams === '' || weight_grams === null ? null : Number(weight_grams);
     if (weight !== null && (!Number.isInteger(weight) || weight < 1 || weight > 50000)) {
       return res.status(400).json({ error: 'Weight must be a whole number of grams between 1 and 50,000.' });
     }
 
+    const who = audience === undefined || audience === null || audience === '' ? null : audience;
+    if (who !== null && !AUDIENCES.includes(who)) return res.status(400).json({ error: AUDIENCE_ERROR });
+
     await pool.query(
       `UPDATE products
        SET category_id = ?, product_name = ?, description = ?, price = ?, stock = ?, image = ?, status = ?,
-           weight_grams = COALESCE(?, weight_grams)
+           weight_grams = COALESCE(?, weight_grams), audience = COALESCE(?, audience)
        WHERE product_id = ?`,
-      [category_id || null, product_name, description || null, price, stock, image || null, status, weight, req.params.id]
+      [category_id || null, product_name, description || null, price, stock, image || null, status, weight, who, req.params.id]
     );
 
     res.json({ message: 'Product updated.' });
@@ -238,6 +258,29 @@ app.put('/api/products/:id', verifyToken, requirePermission('products'), async (
 });
 
 // DELETE /api/products/:id
+// Changes only the status and / or the audience of a product (the dropdowns in the Products table)
+app.put('/api/products/:id/quick', verifyToken, requirePermission('products'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid product.' });
+    const body = req.body || {};
+    const status = body.status === undefined ? null : body.status;
+    const audience = body.audience === undefined ? null : body.audience;
+    if (status === null && audience === null) return res.status(400).json({ error: 'Nothing to change.' });
+    if (status !== null && !['active', 'inactive'].includes(status)) return res.status(400).json({ error: 'The status must be active or inactive.' });
+    if (audience !== null && !AUDIENCES.includes(audience)) return res.status(400).json({ error: AUDIENCE_ERROR });
+
+    const [found] = await pool.query('SELECT product_id FROM products WHERE product_id = ?', [id]);
+    if (found.length === 0) return res.status(404).json({ error: 'Product not found.' });
+
+    await pool.query('UPDATE products SET status = COALESCE(?, status), audience = COALESCE(?, audience) WHERE product_id = ?', [status, audience, id]);
+    res.json({ message: 'Product updated.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
 app.delete('/api/products/:id', verifyToken, requirePermission('products'), async (req, res) => {
   try {
     await pool.query('DELETE FROM products WHERE product_id = ?', [req.params.id]);

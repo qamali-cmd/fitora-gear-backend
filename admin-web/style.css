@@ -470,3 +470,22 @@ tbody tr:last-child td { border-bottom: 0; }
 .secondary-btn.danger-outline { color: #cf3a2c; border-color: rgba(231, 76, 60, 0.35); }
 .secondary-btn.danger-outline:hover { background: #fdecea; border-color: rgba(231, 76, 60, 0.6); }
 .detail-actions { flex-wrap: wrap; }
+
+/* quick choices inside the tables (status, who it is for) */
+select.status-select.tone-active { background-color: #e8f8ee; color: #1e8e4f; border-color: transparent; }
+select.status-select.tone-inactive { background-color: #fdecea; color: #cf3a2c; border-color: transparent; }
+select.status-select.tone-men { background-color: #e8f0ff; color: #2f5fd0; border-color: transparent; }
+select.status-select.tone-women { background-color: #ffe8f1; color: #d6246f; border-color: transparent; }
+select.status-select.tone-unisex { background-color: #efecef; color: #5f5865; border-color: transparent; }
+.count-pill { display: inline-grid; place-items: center; min-width: 32px; height: 28px; padding: 0 10px; border-radius: 999px; background: #efecef; color: #5f5865; font-weight: 700; font-size: 13px; }
+.count-pill.count-men { background: #e8f0ff; color: #2f5fd0; }
+.count-pill.count-women { background: #ffe8f1; color: #d6246f; }
+/* a small message at the bottom of the screen */
+.toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); z-index: 12000; padding: 13px 22px; border-radius: 14px; background: #111; color: #fff; font-size: 13.5px; font-weight: 500; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.3); animation: rise 0.25s ease both; border-left: 4px solid var(--primary); }
+.toast-error { border-left-color: var(--danger); }
+.toast-out { opacity: 0; transition: opacity 0.4s; }
+
+/* who a product is for: a fixed tag in the Products table (it is changed in the Edit form) */
+.badge-men { background: #e8f0ff; color: #2f5fd0; }
+.badge-women { background: #ffe8f1; color: #d6246f; }
+.badge-unisex { background: #efecef; color: #5f5865; }

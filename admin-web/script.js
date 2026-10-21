@@ -315,14 +315,18 @@ async function loadCategories(renderTable) {
       const tbody = document.getElementById('categoriesTableBody');
       tbody.innerHTML = allCategories.map(c => `
         <tr>
-          <td>${c.category_name}</td>
-          <td>${c.description || ''}</td>
+          <td><b>${orderEsc(c.category_name)}</b></td>
+          <td>${orderEsc(c.description || '')}</td>
+          <td><span class="count-pill">${c.product_count || 0}</span></td>
+          <td><span class="count-pill count-men">${c.men_count || 0}</span></td>
+          <td><span class="count-pill count-women">${c.women_count || 0}</span></td>
+          <td><span class="count-pill">${c.unisex_count || 0}</span></td>
           <td>
             <button class="icon-btn" onclick="openCategoryModal(${c.category_id})">Edit</button>
             <button class="icon-btn danger" onclick="deleteCategory(${c.category_id})">Delete</button>
           </td>
         </tr>
-      `).join('') || '<tr><td colspan="3">No categories yet.</td></tr>';
+      `).join('') || '<tr><td colspan="7">No categories yet.</td></tr>';
     }
   } catch (err) {
     console.error(err);
@@ -351,16 +355,30 @@ function populateProductCategoryFilter() {
   select.value = current || 'all';
 }
 
+// A small message at the bottom of the screen ("Saved"), used for quick changes
+function showToast(message, isError) {
+  const toast = document.createElement('div');
+  toast.className = 'toast' + (isError ? ' toast-error' : '');
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.classList.add('toast-out'), 1800);
+  setTimeout(() => toast.remove(), 2300);
+}
+
+const AUDIENCE_LABELS = { men: 'Men', women: 'Women', unisex: 'Unisex' };
+
 function renderProductsTable() {
   const tbody = document.getElementById('productsTableBody');
   const search = document.getElementById('productSearch').value.toLowerCase().trim();
   const categoryFilter = document.getElementById('productCategoryFilter').value;
+  const audienceFilter = document.getElementById('productAudienceFilter').value;
   const sort = document.getElementById('productSort').value;
 
   let list = allProductsList.filter(p => {
     const matchesSearch = !search || p.product_name.toLowerCase().includes(search);
     const matchesCategory = categoryFilter === 'all' || String(p.category_id) === categoryFilter;
-    return matchesSearch && matchesCategory;
+    const matchesAudience = audienceFilter === 'all' || (p.audience || 'unisex') === audienceFilter;
+    return matchesSearch && matchesCategory && matchesAudience;
   });
 
   if (sort === 'price_asc') list = [...list].sort((a, b) => a.price - b.price);
@@ -368,27 +386,52 @@ function renderProductsTable() {
   if (sort === 'stock_asc') list = [...list].sort((a, b) => a.stock - b.stock);
   if (sort === 'stock_desc') list = [...list].sort((a, b) => b.stock - a.stock);
 
-  tbody.innerHTML = list.map(p => `
-    <tr>
+  tbody.innerHTML = list.map(p => {
+    const audience = p.audience || 'unisex';
+    return `
+    <tr data-product-id="${p.product_id}">
       <td>${p.image
-        ? `<img src="${p.image}" class="thumb" alt="${p.product_name}" onerror="this.replaceWith(Object.assign(document.createElement('div'), {className:'thumb-placeholder', textContent:'📦'}))">`
+        ? `<img src="${orderEsc(p.image)}" class="thumb" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'), {className:'thumb-placeholder', textContent:'📦'}))">`
         : `<div class="thumb-placeholder">📦</div>`}</td>
-      <td>${p.product_name}</td>
-      <td>${p.category_name || '-'}</td>
+      <td>${orderEsc(p.product_name)}</td>
+      <td>${orderEsc(p.category_name || '-')}</td>
+      <td><span class="badge badge-${audience}">${AUDIENCE_LABELS[audience]}</span></td>
       <td>₱${Number(p.price).toLocaleString()}</td>
       <td>${p.stock}</td>
-      <td><span class="badge badge-${p.status}">${p.status}</span></td>
+      <td>
+        <select class="status-select tone-${orderEsc(p.status)}" aria-label="Status" onchange="quickUpdateProduct(${p.product_id}, { status: this.value })">
+          <option value="active" ${p.status === 'active' ? 'selected' : ''}>Active</option>
+          <option value="inactive" ${p.status === 'inactive' ? 'selected' : ''}>Inactive</option>
+        </select>
+      </td>
       <td>
         <button class="icon-btn" onclick="openImagesModal(${p.product_id})">Photos</button>
         <button class="icon-btn" onclick="openProductModal(${p.product_id})">Edit</button>
         <button class="icon-btn danger" onclick="deleteProduct(${p.product_id})">Delete</button>
       </td>
-    </tr>
-  `).join('') || '<tr><td colspan="7">No matching products.</td></tr>';
+    </tr>`;
+  }).join('') || '<tr><td colspan="8">No matching products.</td></tr>';
+}
+
+// Changes the status (active / inactive) right from the table. Who the product is for is set in the Edit / Add form only.
+async function quickUpdateProduct(productId, changes) {
+  try {
+    const res = await fetch(API.PRODUCTS + '/products/' + productId + '/quick', { method: 'PUT', headers: authHeaders(), body: JSON.stringify(changes) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not save the change.');
+    const product = allProductsList.find(p => p.product_id === productId);
+    if (product) Object.assign(product, changes);
+    renderProductsTable();
+    showToast(changes.status ? (changes.status === 'active' ? 'Product is now active and visible in the app.' : 'Product is now inactive and hidden from the app.') : 'Saved.');
+  } catch (err) {
+    showToast(err.message, true);
+    renderProductsTable(); // put the dropdown back to what is saved
+  }
 }
 
 document.getElementById('productSearch').addEventListener('input', renderProductsTable);
 document.getElementById('productCategoryFilter').addEventListener('change', renderProductsTable);
+document.getElementById('productAudienceFilter').addEventListener('change', renderProductsTable);
 document.getElementById('productSort').addEventListener('change', renderProductsTable);
 
 async function deleteProduct(id) {
@@ -418,7 +461,7 @@ function closeModal() {
 }
 
 async function openProductModal(productId) {
-  let product = { product_name: '', category_id: '', price: '', stock: 0, weight_grams: 300, status: 'active', description: '', image: '' };
+  let product = { product_name: '', category_id: '', audience: 'unisex', price: '', stock: 0, weight_grams: 300, status: 'active', description: '', image: '' };
 
   if (productId) {
     const res = await fetch(API.PRODUCTS + '/products/' + productId);
@@ -440,6 +483,13 @@ async function openProductModal(productId) {
     <select id="f_category">
       <option value="">-- No category --</option>
       ${categoryOptions}
+    </select>
+
+    <label>For</label>
+    <select id="f_audience">
+      <option value="unisex" ${(product.audience || 'unisex') === 'unisex' ? 'selected' : ''}>Everyone (unisex)</option>
+      <option value="men" ${product.audience === 'men' ? 'selected' : ''}>Men</option>
+      <option value="women" ${product.audience === 'women' ? 'selected' : ''}>Women</option>
     </select>
 
     <label>Description</label>
@@ -485,6 +535,7 @@ async function openProductModal(productId) {
     const payload = {
       product_name: document.getElementById('f_name').value,
       category_id: document.getElementById('f_category').value || null,
+      audience: document.getElementById('f_audience').value,
       description: document.getElementById('f_description').value,
       image: document.getElementById('f_image').value.trim(),
       price: parseFloat(document.getElementById('f_price').value),
