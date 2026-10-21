@@ -1182,6 +1182,7 @@ async function printPackingSlip(orderId) {
 
 // A small window with a list of reasons (used for cancelling and for declining a request)
 function openReasonModal(title, intro, reasons, buttonText, onSubmit) {
+  document.querySelector('#modalOverlay .modal').classList.remove('modal-wide');
   modalTitle.textContent = title;
   modalForm.innerHTML = `
     <p style="font-size:13px; color:#666; margin-bottom:6px;">${intro}</p>
@@ -1329,32 +1330,85 @@ function renderCustomersTable() {
     c.email.toLowerCase().includes(search)
   );
 
-  tbody.innerHTML = list.map(c => `
+  tbody.innerHTML = list.map(c => {
+    const status = c.account_status || (c.is_active ? 'active' : 'suspended');
+    const name = orderEsc(c.full_name);
+    const actions = status === 'active'
+      ? `<button class="icon-btn danger" data-name="${name}" onclick="suspendCustomer(${c.user_id}, this.dataset.name)">Suspend</button>
+         <button class="icon-btn danger" data-name="${name}" onclick="banCustomer(${c.user_id}, this.dataset.name)">Ban</button>`
+      : `<button class="icon-btn" data-name="${name}" onclick="reactivateCustomer(${c.user_id}, this.dataset.name)">Reactivate</button>`;
+    return `
     <tr>
-      <td><button type="button" class="link-btn" onclick="openCustomerDetails(${c.user_id})">${orderEsc(c.full_name)}</button></td>
+      <td><button type="button" class="link-btn" onclick="openCustomerDetails(${c.user_id})">${name}</button></td>
       <td>${orderEsc(c.email)}</td>
-      <td>${c.phone || '-'}</td>
+      <td>${orderEsc(c.phone || '-')}</td>
       <td>${c.order_count}</td>
-      <td><span class="badge badge-${c.is_active ? 'active' : 'inactive'}">${c.is_active ? 'active' : 'inactive'}</span></td>
+      <td><span class="badge badge-${orderEsc(status)}">${orderEsc(status)}</span>${c.status_reason && status !== 'active' ? `<div class="muted-small">${orderEsc(c.status_reason)}</div>` : ''}</td>
       <td>
         <button class="icon-btn" onclick="openCustomerDetails(${c.user_id})">View</button>
-        <button class="icon-btn ${c.is_active ? 'danger' : ''}" onclick="toggleCustomerStatus(${c.user_id}, ${c.is_active ? 0 : 1})">
-          ${c.is_active ? 'Deactivate' : 'Activate'}
-        </button>
+        ${actions}
+        <button class="icon-btn danger" data-name="${name}" onclick="deleteCustomer(${c.user_id}, this.dataset.name)">Delete</button>
       </td>
-    </tr>
-  `).join('') || '<tr><td colspan="6">No registered customers yet.</td></tr>';
+    </tr>`;
+  }).join('') || '<tr><td colspan="6">No registered customers yet.</td></tr>';
 }
 
-document.getElementById('customerSearch').addEventListener('input', renderCustomersTable);
+// ---------- suspend, ban, reactivate, delete ----------
+const CUSTOMER_STATUS_REASONS = ['Suspicious activity', 'Fake orders or non-payment', 'Abusive behavior', 'Violated the shop policy', 'Requested by the customer', 'Other'];
 
-async function toggleCustomerStatus(userId, newStatus) {
-  await fetch(API.AUTH + '/customers/' + userId + '/status', {
-    method: 'PUT',
-    headers: authHeaders(),
-    body: JSON.stringify({ is_active: newStatus }),
-  });
+async function sendCustomerAction(userId, method, path, body) {
+  try {
+    const res = await fetch(API.AUTH + '/customers/' + userId + path, { method, headers: authHeaders(), body: body ? JSON.stringify(body) : undefined });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      openPopup({ type: 'error', title: 'This could not be done', message: data.error || 'Could not complete this action.', buttons: [{ text: 'OK', value: true }] });
+      return null;
+    }
+    return data;
+  } catch (err) {
+    openPopup({ type: 'error', title: 'Something went wrong', message: 'Cannot reach the auth service. Please try again.', buttons: [{ text: 'OK', value: true }] });
+    return null;
+  }
+}
+
+// after a change: refresh the table, and show the customer window again if the change was made from there
+function afterCustomerChange(userId, fromDetails) {
   loadCustomers();
+  if (fromDetails) openCustomerDetails(userId);
+}
+
+function suspendCustomer(userId, name, fromDetails) {
+  openReasonModal(`Suspend ${name}`, 'The customer cannot log in or place orders while suspended, and the reason is shown to them. You can reactivate the account at any time.',
+    CUSTOMER_STATUS_REASONS, 'Suspend', async (reason) => {
+      if (await sendCustomerAction(userId, 'PUT', '/status', { status: 'suspended', reason })) {
+        closeModal();
+        afterCustomerChange(userId, fromDetails);
+      }
+    });
+}
+
+function banCustomer(userId, name, fromDetails) {
+  openReasonModal(`Ban ${name}`, 'A banned customer cannot log in or place orders, and the reason is shown to them. Use this for serious cases. You can still reactivate the account later.',
+    CUSTOMER_STATUS_REASONS, 'Ban', async (reason) => {
+      if (await sendCustomerAction(userId, 'PUT', '/status', { status: 'banned', reason })) {
+        closeModal();
+        afterCustomerChange(userId, fromDetails);
+      }
+    });
+}
+
+async function reactivateCustomer(userId, name, fromDetails) {
+  if (!(await askConfirm(`Reactivate ${name}? They will be able to log in and place orders again.`, 'Reactivate'))) return;
+  if (await sendCustomerAction(userId, 'PUT', '/status', { status: 'active' })) afterCustomerChange(userId, fromDetails);
+}
+
+async function deleteCustomer(userId, name) {
+  if (!(await askConfirm(`Delete ${name}? The account is removed. Their past orders stay in your sales records, but their personal details are erased. This cannot be undone.`))) return;
+  const data = await sendCustomerAction(userId, 'DELETE', '');
+  if (!data) return;
+  closeModal();
+  loadCustomers();
+  openPopup({ type: 'success', title: 'Customer deleted', message: data.message, buttons: [{ text: 'OK', value: true }] });
 }
 
 // ===========================================================
@@ -1619,6 +1673,10 @@ async function openCustomerDetails(userId, back) {
     const c = await customerRes.json();
     if (!customerRes.ok) throw new Error(c.error || 'Could not load the customer.');
     const orders = ordersRes.ok ? await ordersRes.json() : [];
+    const status = c.accountStatus || (c.isActive ? 'active' : 'suspended');
+    const statusNote = status === 'deleted'
+      ? '<div class="detail-note">This account was deleted. All personal details were erased; the past orders are kept for the records.</div>'
+      : (status !== 'active' ? `<div class="detail-note detail-note-danger">This account is ${orderEsc(status)}${c.statusReason ? '. Reason: ' + orderEsc(c.statusReason) : ''}.</div>` : '');
 
     const birthday = c.birthday ? new Date(c.birthday + 'T00:00:00').toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : '-';
     const addresses = (c.addresses || []).map(a => `
@@ -1641,9 +1699,10 @@ async function openCustomerDetails(userId, back) {
         <div class="detail-person-info">
           <div class="detail-code">${orderEsc(c.fullName)}</div>
           <div class="muted-small">@${orderEsc(c.username || '-')} · ${orderEsc(c.email)} ${c.emailVerified ? '<span class="badge badge-active">Email verified</span>' : '<span class="badge badge-pending">Email not verified</span>'}</div>
-          <div style="margin-top:8px;"><span class="badge badge-${c.isActive ? 'active' : 'inactive'}">${c.isActive ? 'active' : 'inactive'}</span></div>
+          <div style="margin-top:8px;"><span class="badge badge-${orderEsc(status)}">${orderEsc(status)}</span></div>
         </div>
       </div>
+      ${statusNote}
       <div class="stat-tiles">
         <div class="stat-tile"><span>Orders</span><b>${c.stats.orders}</b></div>
         <div class="stat-tile"><span>Completed</span><b>${c.stats.completed}</b></div>
@@ -1666,11 +1725,24 @@ async function openCustomerDetails(userId, back) {
         <div class="detail-label">Orders</div>
         ${orderRows}
       </div>
-      <div class="modal-actions"><button type="button" class="primary-btn" onclick="closeModal()">Close</button></div>`);
+      <div class="modal-actions detail-actions">
+        ${status === 'deleted' ? '' : (status === 'active'
+          ? '<button type="button" class="secondary-btn danger-outline" data-action="suspend">Suspend</button><button type="button" class="secondary-btn danger-outline" data-action="ban">Ban</button>'
+          : '<button type="button" class="secondary-btn" data-action="reactivate">Reactivate</button>')}
+        ${status === 'deleted' ? '' : '<button type="button" class="secondary-btn danger-outline" data-action="delete">Delete</button>'}
+        <button type="button" class="primary-btn" onclick="closeModal()">Close</button>
+      </div>`);
 
     if (back) document.getElementById('detailBack').addEventListener('click', back);
     modalForm.querySelectorAll('[data-order]').forEach(btn => btn.addEventListener('click', () => {
       openOrderDetails(Number(btn.dataset.order), () => openCustomerDetails(userId, back));
+    }));
+    modalForm.querySelectorAll('[data-action]').forEach(btn => btn.addEventListener('click', () => {
+      const action = btn.dataset.action;
+      if (action === 'suspend') suspendCustomer(userId, c.fullName, true);
+      if (action === 'ban') banCustomer(userId, c.fullName, true);
+      if (action === 'reactivate') reactivateCustomer(userId, c.fullName, true);
+      if (action === 'delete') deleteCustomer(userId, c.fullName);
     }));
   } catch (err) {
     detailsError('Customer details', err.message);

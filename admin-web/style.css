@@ -463,3 +463,10 @@ tbody tr:last-child td { border-bottom: 0; }
 .detail-order-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .detail-order-side { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; flex-shrink: 0; }
 @media (max-width: 720px) { .detail-grid, .stat-tiles { grid-template-columns: 1fr 1fr; } .detail-grid { grid-template-columns: 1fr; } .detail-person { flex-direction: column; align-items: flex-start; } }
+
+/* account status of customers */
+.badge-banned { background: #fbe3e0; color: #b8352a; }
+.badge-deleted { background: #efecef; color: #6d6573; }
+.secondary-btn.danger-outline { color: #cf3a2c; border-color: rgba(231, 76, 60, 0.35); }
+.secondary-btn.danger-outline:hover { background: #fdecea; border-color: rgba(231, 76, 60, 0.6); }
+.detail-actions { flex-wrap: wrap; }

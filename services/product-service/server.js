@@ -439,6 +439,11 @@ app.post('/api/products/:id/reviews', verifyCustomerToken, async (req, res) => {
 
   let conn;
   try {
+    const [accounts] = await pool.query('SELECT account_status FROM users WHERE user_id = ?', [req.customer.userId]);
+    if (accounts.length > 0 && accounts[0].account_status && accounts[0].account_status !== 'active') {
+      return res.status(403).json({ error: 'Your account cannot post reviews right now. Please contact the shop.', code: 'ACCOUNT_BLOCKED' });
+    }
+
     conn = await pool.getConnection();
     await conn.beginTransaction();
 

@@ -368,7 +368,7 @@ app.post('/api/auth/customers/login', async (req, res) => {
     const column = identifier.includes('@') ? 'email' : 'username';
     const [rows] = await pool.query(
       `SELECT user_id, full_name, first_name, middle_name, last_name, username, email, password, phone, address,
-              profile_photo, is_active, email_verified, DATE_FORMAT(birthday, '%Y-%m-%d') AS birthday
+              profile_photo, is_active, account_status, status_reason, email_verified, DATE_FORMAT(birthday, '%Y-%m-%d') AS birthday
        FROM users WHERE ${column} = ?`,
       [identifier]
     );
@@ -378,8 +378,11 @@ app.post('/api/auth/customers/login', async (req, res) => {
     if (!matches) {
       return res.status(401).json({ error: 'Incorrect email/username or password.' });
     }
-    if (!user.is_active) {
-      return res.status(403).json({ error: 'Your account has been deactivated. Please contact support.' });
+    if (user.account_status === 'deleted') {
+      return res.status(401).json({ error: 'Incorrect email/username or password.' });
+    }
+    if (!user.is_active || (user.account_status && user.account_status !== 'active')) {
+      return res.status(403).json({ error: accountBlockedMessage(user.account_status, user.status_reason), code: 'ACCOUNT_BLOCKED' });
     }
 
     const token = jwt.sign({ userId: user.user_id, email: user.email, type: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
@@ -408,6 +411,21 @@ app.get('/api/auth/customers/username-available', async (req, res) => {
     handleError(res, err);
   }
 });
+// What the customer is told when the shop suspended or banned the account
+const CUSTOMER_STATUS_REASONS = [
+  'Suspicious activity',
+  'Fake orders or non-payment',
+  'Abusive behavior',
+  'Violated the shop policy',
+  'Requested by the customer',
+  'Other',
+];
+function accountBlockedMessage(status, reason) {
+  const why = reason ? ` Reason: ${reason}.` : '';
+  if (status === 'banned') return `Your account has been banned.${why} Please contact the shop if you think this is a mistake.`;
+  return `Your account has been suspended.${why} Please contact the shop to ask when it will be restored.`;
+}
+
 // BAGO: guard para sa customer-only routes (ginagamit lang dito sa auth-service)
 async function verifyCustomerToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -425,11 +443,15 @@ async function verifyCustomerToken(req, res, next) {
   }
   try {
     const [rows] = await pool.query(
-      'SELECT user_id, full_name, email, email_verified, is_active FROM users WHERE user_id = ?',
+      'SELECT user_id, full_name, email, email_verified, is_active, account_status, status_reason FROM users WHERE user_id = ?',
       [decoded.userId]
     );
-    if (rows.length === 0 || !rows[0].is_active) {
+    if (rows.length === 0 || rows[0].account_status === 'deleted') {
       return res.status(401).json({ error: 'This account is no longer available. Please log in again.' });
+    }
+    if (!rows[0].is_active || (rows[0].account_status && rows[0].account_status !== 'active')) {
+      // 401 so the app logs the customer out; the message says why
+      return res.status(401).json({ error: accountBlockedMessage(rows[0].account_status, rows[0].status_reason), code: 'ACCOUNT_BLOCKED' });
     }
     req.customer = {
       userId: rows[0].user_id, fullName: rows[0].full_name, email: rows[0].email,
@@ -602,10 +624,11 @@ app.put('/api/auth/customers/me/password', verifyCustomerToken, async (req, res)
 app.get('/api/auth/customers', verifyToken, requirePermission('customers'), async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT u.user_id, u.full_name, u.username, u.email, u.phone, u.address, u.is_active, u.email_verified, u.created_at,
+      SELECT u.user_id, u.full_name, u.username, u.email, u.phone, u.address, u.is_active, u.account_status, u.status_reason, u.email_verified, u.created_at,
              COUNT(o.order_id) AS order_count
       FROM users u
       LEFT JOIN orders o ON o.user_id = u.user_id
+      WHERE u.deleted_at IS NULL
       GROUP BY u.user_id
       ORDER BY u.created_at DESC
     `);
@@ -625,7 +648,7 @@ app.get('/api/auth/customers/:id', verifyToken, requirePermission('customers'), 
 
     const [rows] = await pool.query(
       `SELECT u.user_id, u.full_name, u.first_name, u.middle_name, u.last_name, u.username, u.email, u.email_verified, u.phone, u.address,
-              u.profile_photo, u.is_active, u.created_at, DATE_FORMAT(u.birthday, '%Y-%m-%d') AS birthday
+              u.profile_photo, u.is_active, u.account_status, u.status_reason, u.status_changed_at, u.deleted_at, u.created_at, DATE_FORMAT(u.birthday, '%Y-%m-%d') AS birthday
        FROM users u WHERE u.user_id = ?`,
       [id]
     );
@@ -642,6 +665,10 @@ app.get('/api/auth/customers/:id', verifyToken, requirePermission('customers'), 
     res.json({
       ...customerProfile({ ...rows[0], order_count: stats[0].orders }),
       isActive: !!rows[0].is_active,
+      accountStatus: rows[0].account_status || (rows[0].is_active ? 'active' : 'suspended'),
+      statusReason: rows[0].status_reason || null,
+      statusChangedAt: rows[0].status_changed_at || null,
+      deletedAt: rows[0].deleted_at || null,
       addresses: addresses.map((a) => ({ ...a, is_default: !!a.is_default })),
       stats: { orders: Number(stats[0].orders), completed: Number(stats[0].completed), cancelled: Number(stats[0].cancelled), spent: Number(stats[0].spent) },
     });
@@ -650,14 +677,95 @@ app.get('/api/auth/customers/:id', verifyToken, requirePermission('customers'), 
   }
 });
 
+// ADMIN: activate, suspend, or ban a customer (suspend and ban need a reason, which the customer is shown)
 app.put('/api/auth/customers/:id/status', verifyToken, requirePermission('customers'), async (req, res) => {
   try {
-    const { is_active } = req.body;
-    await pool.query('UPDATE users SET is_active = ? WHERE user_id = ?', [is_active ? 1 : 0, req.params.id]);
-    res.json({ message: 'Customer status updated.' });
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid customer.' });
+    const body = req.body || {};
+
+    // the old way (is_active true / false) still works
+    let status = body.status;
+    let reason = String(body.reason || '');
+    if (!status && body.is_active !== undefined) {
+      status = body.is_active ? 'active' : 'suspended';
+      reason = reason || 'Other';
+    }
+    if (!['active', 'suspended', 'banned'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
+    if (status !== 'active' && !CUSTOMER_STATUS_REASONS.includes(reason)) {
+      return res.status(400).json({ error: 'Please choose a reason.' });
+    }
+
+    const [rows] = await pool.query('SELECT user_id, deleted_at FROM users WHERE user_id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Customer not found.' });
+    if (rows[0].deleted_at) return res.status(400).json({ error: 'This account was already deleted.' });
+
+    await pool.query(
+      'UPDATE users SET account_status = ?, is_active = ?, status_reason = ?, status_changed_at = NOW() WHERE user_id = ?',
+      [status, status === 'active' ? 1 : 0, status === 'active' ? null : reason, id]
+    );
+    const words = { active: 'reactivated', suspended: 'suspended', banned: 'banned' };
+    res.json({ message: `The customer was ${words[status]}.`, status });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// ADMIN: delete a customer. If they never ordered or reviewed, the account is removed completely.
+// If they did, the order history stays for the sales records but every personal detail is erased.
+app.delete('/api/auth/customers/:id', verifyToken, requirePermission('customers'), async (req, res) => {
+  let conn;
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid customer.' });
+
+    const [rows] = await pool.query('SELECT user_id, deleted_at FROM users WHERE user_id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Customer not found.' });
+    if (rows[0].deleted_at) return res.status(400).json({ error: 'This account was already deleted.' });
+
+    const [busy] = await pool.query("SELECT COUNT(*) AS n FROM orders WHERE user_id = ? AND status IN ('pending', 'processing', 'shipped')", [id]);
+    if (busy[0].n > 0) {
+      return res.status(400).json({ error: `This customer has ${busy[0].n} order${busy[0].n === 1 ? '' : 's'} in progress. Finish or cancel ${busy[0].n === 1 ? 'it' : 'them'} first.` });
+    }
+
+    const [history] = await pool.query(
+      'SELECT (SELECT COUNT(*) FROM orders WHERE user_id = ?) AS orders, (SELECT COUNT(*) FROM reviews WHERE user_id = ?) AS reviews',
+      [id, id]
+    );
+    if (Number(history[0].orders) === 0 && Number(history[0].reviews) === 0) {
+      try {
+        await pool.query('DELETE FROM users WHERE user_id = ?', [id]);
+        return res.json({ message: 'The customer account was deleted.', mode: 'deleted' });
+      } catch (err) {
+        // something still points to this customer: erase the personal details instead (below)
+      }
+    }
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    await conn.query(
+      `UPDATE users SET full_name = 'Deleted customer', first_name = 'Deleted', middle_name = NULL, last_name = 'customer',
+         username = CONCAT('deleted_', user_id), email = CONCAT('deleted-', user_id, '@deleted.invalid'), phone = '', address = '',
+         birthday = NULL, profile_photo = NULL, password = '!', email_verified = 0, is_active = 0, account_status = 'deleted',
+         status_reason = NULL, status_changed_at = NOW(), deleted_at = NOW()
+       WHERE user_id = ?`,
+      [id]
+    );
+    await conn.query('DELETE FROM user_addresses WHERE user_id = ?', [id]);
+    try {
+      await conn.query('DELETE FROM email_verifications WHERE user_id = ?', [id]);
+    } catch (err) {
+      // the table may be arranged differently: it holds no personal details we must keep
+    }
+    await conn.commit();
+    res.json({ message: 'The customer account was deleted. Their past orders stay in your records without any personal details.', mode: 'anonymized' });
+  } catch (err) {
+    if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  } finally {
+    if (conn) conn.release();
   }
 });
 

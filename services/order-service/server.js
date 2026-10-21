@@ -184,7 +184,11 @@ app.post('/api/orders/quote', verifyCustomerToken, async (req, res) => {
 app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
   // The customer must have a verified email before placing an order
   try {
-    const [accounts] = await pool.query('SELECT email_verified FROM users WHERE user_id = ?', [req.customer.userId]);
+    const [accounts] = await pool.query('SELECT email_verified, account_status, status_reason FROM users WHERE user_id = ?', [req.customer.userId]);
+    if (accounts.length > 0 && accounts[0].account_status && accounts[0].account_status !== 'active') {
+      const why = accounts[0].status_reason ? ` Reason: ${accounts[0].status_reason}.` : '';
+      return res.status(403).json({ error: `Your account has been ${accounts[0].account_status === 'banned' ? 'banned' : 'suspended'}.${why} You cannot place orders. Please contact the shop.`, code: 'ACCOUNT_BLOCKED' });
+    }
     if (accounts.length === 0 || !accounts[0].email_verified) {
       return res.status(403).json({ error: 'Please verify your email before placing an order.', code: 'EMAIL_NOT_VERIFIED' });
     }
