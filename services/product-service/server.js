@@ -124,63 +124,103 @@ app.get('/api/products/low-stock', async (req, res) => {
 // =====================================================
 
 // POST /api/products/:id/stock-adjustment
+// Why stock is removed
+const STOCK_REMOVE_REASONS = ['Damaged', 'Lost', 'Other'];
+
+// Changes the stock of a product in one of three ways:
+//   add    = restock: the quantity is ADDED to the stock
+//   remove = damaged / lost: the quantity is TAKEN AWAY from the stock
+//   set    = correction: the stock BECOMES the quantity (it is not added)
 app.post('/api/products/:id/stock-adjustment', verifyToken, requirePermission('inventory'), async (req, res) => {
+  const productId = Number(req.params.id);
+  const body = req.body || {};
+  if (!Number.isInteger(productId) || productId <= 0) return res.status(400).json({ error: 'Invalid product.' });
+
+  let mode = body.mode;
+  let quantity = Number(body.quantity);
+  let reason = String(body.reason || '');
+  let legacy = false;
+  if (!mode && body.change_amount !== undefined) {
+    // the old way still works: one signed amount (+ adds, - removes)
+    const amount = Number(body.change_amount);
+    if (!Number.isInteger(amount) || amount === 0 || !reason) return res.status(400).json({ error: 'change_amount and reason are required.' });
+    mode = amount < 0 ? 'remove' : 'add';
+    quantity = Math.abs(amount);
+    legacy = true;
+  }
+  if (!['add', 'remove', 'set'].includes(mode)) return res.status(400).json({ error: 'Please choose what to do with the stock: restock, remove, or correction.' });
+  if (!Number.isInteger(quantity)) return res.status(400).json({ error: 'Please enter a whole number.' });
+  if (mode === 'set' ? (quantity < 0 || quantity > 1000000) : (quantity < 1 || quantity > 100000)) {
+    return res.status(400).json({ error: mode === 'set' ? 'The stock must be a whole number from 0 to 1,000,000.' : 'The quantity must be a whole number from 1 to 100,000.' });
+  }
+  if (mode === 'remove' && !legacy) {
+    reason = reason || 'Damaged';
+    if (!STOCK_REMOVE_REASONS.includes(reason)) return res.status(400).json({ error: 'Please choose why the stock is removed: damaged, lost, or other.' });
+  }
+  const note = String(body.note || '').trim().slice(0, 200);
+
   const conn = await pool.getConnection();
   try {
-    const { change_amount, reason } = req.body;
-    const productId = req.params.id;
-
-    if (!change_amount || !reason) {
-      conn.release();
-      return res.status(400).json({ error: 'change_amount and reason are required.' });
-    }
-
     await conn.beginTransaction();
 
-    const [[product]] = await conn.query('SELECT stock FROM products WHERE product_id = ? FOR UPDATE', [productId]);
-    if (!product) {
+    const [rows] = await conn.query('SELECT stock FROM products WHERE product_id = ? FOR UPDATE', [productId]);
+    if (rows.length === 0) {
       await conn.rollback();
-      conn.release();
       return res.status(404).json({ error: 'Product not found.' });
     }
+    const before = rows[0].stock;
 
-    const newStock = product.stock + parseInt(change_amount);
-    if (newStock < 0) {
-      await conn.rollback();
-      conn.release();
-      return res.status(400).json({ error: 'Stock cannot go below zero.' });
+    let after;
+    if (mode === 'add') {
+      after = before + quantity;
+    } else if (mode === 'remove') {
+      after = before - quantity;
+      if (after < 0) {
+        await conn.rollback();
+        return res.status(400).json({ error: `There are only ${before} in stock, so you cannot remove ${quantity}.` });
+      }
+    } else {
+      after = quantity; // correction: this IS the new stock
+      if (after === before) {
+        await conn.rollback();
+        return res.status(400).json({ error: `The stock is already ${before}. Nothing to change.` });
+      }
     }
 
-    await conn.query('UPDATE products SET stock = ? WHERE product_id = ?', [newStock, productId]);
+    const logReason = legacy ? reason : mode === 'add' ? 'Restock' : mode === 'set' ? 'Correction' : reason;
+    await conn.query('UPDATE products SET stock = ? WHERE product_id = ?', [after, productId]);
     await conn.query(
-      'INSERT INTO stock_logs (product_id, change_amount, reason, admin_id) VALUES (?, ?, ?, ?)',
-      [productId, change_amount, reason, req.admin.adminId]
+      'INSERT INTO stock_logs (product_id, change_amount, reason, admin_id, stock_before, stock_after, note) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [productId, after - before, logReason, req.admin.adminId, before, after, note || null]
     );
-
     await conn.commit();
-    conn.release();
 
     await notifyLowStock(productId);
-    res.json({ message: 'Stock updated.', newStock });
+    res.json({ message: 'Stock updated.', newStock: after, previousStock: before, change: after - before });
   } catch (err) {
-    await conn.rollback();
-    conn.release();
+    try { await conn.rollback(); } catch (_) { /* ignore */ }
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
+  } finally {
+    conn.release();
   }
 });
 
 // GET /api/products/stock-logs/recent
 app.get('/api/products/stock-logs/recent', verifyToken, requirePermission('inventory'), async (req, res) => {
   try {
+    const productId = req.query.product_id ? Number(req.query.product_id) : null;
+    if (productId !== null && (!Number.isInteger(productId) || productId <= 0)) return res.status(400).json({ error: 'Invalid product.' });
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
     const [rows] = await pool.query(`
       SELECT sl.*, p.product_name, a.full_name AS admin_name
       FROM stock_logs sl
       LEFT JOIN products p ON sl.product_id = p.product_id
       LEFT JOIN admins a ON sl.admin_id = a.admin_id
+      ${productId ? 'WHERE sl.product_id = ?' : ''}
       ORDER BY sl.created_at DESC
-      LIMIT 20
-    `);
+      LIMIT ?
+    `, productId ? [productId, limit] : [limit]);
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -382,8 +422,10 @@ app.put('/api/reviews/:id/status', verifyToken, requirePermission('reviews'), as
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status.' });
     }
+    const [found] = await pool.query('SELECT review_id FROM reviews WHERE review_id = ?', [req.params.id]);
+    if (found.length === 0) return res.status(404).json({ error: 'Review not found.' });
     await pool.query('UPDATE reviews SET status = ? WHERE review_id = ?', [status, req.params.id]);
-    res.json({ message: 'Review updated.' });
+    res.json({ message: status === 'hidden' ? 'The review is now hidden.' : 'The review is now visible.' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });

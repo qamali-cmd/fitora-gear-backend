@@ -431,6 +431,9 @@ async function quickUpdateProduct(productId, changes) {
 
 document.getElementById('productSearch').addEventListener('input', renderProductsTable);
 document.getElementById('productCategoryFilter').addEventListener('change', renderProductsTable);
+document.getElementById('inventorySearch').addEventListener('input', renderInventoryTable);
+document.getElementById('inventoryFilter').addEventListener('change', renderInventoryTable);
+document.getElementById('reviewStatusFilter').addEventListener('change', renderReviews);
 document.getElementById('productAudienceFilter').addEventListener('change', renderProductsTable);
 document.getElementById('productSort').addEventListener('change', renderProductsTable);
 
@@ -910,91 +913,199 @@ async function loadInventory() {
     renderInventoryTable();
     loadStockLogs();
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="4">Cannot reach the product service. Please try again.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5">Cannot reach the product service. Please try again.</td></tr>';
   }
 }
+
+const LOW_STOCK_LIMIT = 10; // EDIT DITO: fewer than this = "low stock" (the same rule as the notifications)
+
+function stockState(stock) {
+  if (stock <= 0) return 'out';
+  return stock < LOW_STOCK_LIMIT ? 'low' : 'ok';
+}
+const STOCK_STATE_LABELS = { out: 'Out of stock', low: 'Low stock', ok: 'In stock' };
+const STOCK_STATE_BADGES = { out: 'badge-cancelled', low: 'badge-pending', ok: 'badge-active' };
 
 function renderInventoryTable() {
   const tbody = document.getElementById('inventoryTableBody');
   const filter = document.getElementById('inventoryFilter').value;
+  const search = document.getElementById('inventorySearch').value.toLowerCase().trim();
 
-  let list = allProductsForInventory;
-  if (filter === 'low') list = list.filter(p => p.stock < 10); // EDIT DITO: low-stock threshold
+  // the numbers on top
+  const counts = { ok: 0, low: 0, out: 0 };
+  let units = 0;
+  allProductsForInventory.forEach(p => { counts[stockState(p.stock)]++; units += Number(p.stock) || 0; });
+  document.getElementById('inventoryStats').innerHTML = `
+    <div class="stat-card"><h3>In stock</h3><div class="value">${counts.ok}</div></div>
+    <div class="stat-card"><h3>Low stock</h3><div class="value">${counts.low}</div></div>
+    <div class="stat-card"><h3>Out of stock</h3><div class="value">${counts.out}</div></div>
+    <div class="stat-card"><h3>Total units</h3><div class="value">${units.toLocaleString()}</div></div>`;
 
-  tbody.innerHTML = list.map(p => `
-    <tr>
-      <td>${p.product_name}</td>
-      <td>${p.category_name || '-'}</td>
-      <td>${p.stock < 10 ? '<span class="badge badge-cancelled">' + p.stock + '</span>' : p.stock}</td>
-      <td><button class="icon-btn" onclick="openStockModal(${p.product_id})">Adjust stock</button></td>
-    </tr>
-  `).join('') || '<tr><td colspan="4">No products yet.</td></tr>';
+  const list = allProductsForInventory.filter(p => {
+    const matchesSearch = !search || p.product_name.toLowerCase().includes(search);
+    const matchesFilter = filter === 'all' || stockState(p.stock) === filter;
+    return matchesSearch && matchesFilter;
+  });
+
+  tbody.innerHTML = list.map(p => {
+    const state = stockState(p.stock);
+    return `
+    <tr data-product-id="${p.product_id}">
+      <td><div class="inv-product">${productPicture(p.image)}<b>${orderEsc(p.product_name)}</b></div></td>
+      <td>${orderEsc(p.category_name || '-')}</td>
+      <td><span class="inv-count">${p.stock}</span></td>
+      <td><span class="badge badge-plain ${STOCK_STATE_BADGES[state]}">${STOCK_STATE_LABELS[state]}</span></td>
+      <td>
+        <button class="icon-btn" onclick="openStockModal(${p.product_id}, 'add')">Restock</button>
+        <button class="icon-btn" onclick="openStockModal(${p.product_id}, 'set')">Correct</button>
+        <button class="icon-btn" onclick="openStockHistory(${p.product_id})">History</button>
+      </td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5">No matching products.</td></tr>';
 }
 
-document.getElementById('inventoryFilter').addEventListener('change', renderInventoryTable);
+// One line of the stock history: what happened and how the stock moved
+function stockMove(log) {
+  const sign = log.change_amount > 0 ? '+' : '';
+  return `<span class="${log.change_amount > 0 ? 'text-success' : 'text-danger'}">${sign}${log.change_amount}</span>`;
+}
 
 async function loadStockLogs() {
   const list = document.getElementById('stockLogsList');
   try {
     const res = await fetch(API.PRODUCTS + '/products/stock-logs/recent', { headers: authHeaders() });
     const logs = await res.json();
+    if (!res.ok) throw new Error(logs.error || 'Could not load the stock history.');
 
-    list.innerHTML = logs.map(l => {
-      const sign = l.change_amount > 0 ? '+' : '';
-      return `<li><span>${l.product_name} - ${l.reason}</span><span>${sign}${l.change_amount}</span></li>`;
-    }).join('') || '<li>No stock changes yet.</li>';
+    list.innerHTML = logs.map(l => `
+      <li>
+        <span><b>${orderEsc(l.product_name || 'Removed product')}</b> · ${orderEsc(l.reason || '')}${l.stock_before != null ? ` <span class="muted-small">(${l.stock_before} → ${l.stock_after})</span>` : ''}
+          <span class="muted-small" style="display:block">${orderEsc(l.admin_name || 'Customer order or system')} · ${orderEsc(timeAgo(l.created_at))}${l.note ? ' · ' + orderEsc(l.note) : ''}</span></span>
+        ${stockMove(l)}
+      </li>`).join('') || '<li>No stock changes yet.</li>';
   } catch (err) {
     list.innerHTML = '<li>Could not load the stock history.</li>';
   }
 }
 
-// ---------------- MODAL: STOCK ADJUSTMENT ----------------
-function openStockModal(productId) {
+// The whole history of ONE product
+async function openStockHistory(productId) {
   const product = allProductsForInventory.find(p => p.product_id === productId);
-  modalTitle.textContent = 'Adjust stock - ' + product.product_name;
+  showDetails('Stock history', '<p class="detail-loading">Loading...</p>');
+  try {
+    const res = await fetch(API.PRODUCTS + '/products/stock-logs/recent?product_id=' + productId + '&limit=50', { headers: authHeaders() });
+    const logs = await res.json();
+    if (!res.ok) throw new Error(logs.error || 'Could not load the stock history.');
+    const rows = logs.map(l => `
+      <tr>
+        <td>${orderEsc(new Date(l.created_at).toLocaleString())}</td>
+        <td><b>${orderEsc(l.reason || '-')}</b>${l.note ? `<div class="muted-small">${orderEsc(l.note)}</div>` : ''}</td>
+        <td>${stockMove(l)}</td>
+        <td>${l.stock_before != null ? `${l.stock_before} → <b>${l.stock_after}</b>` : '-'}</td>
+        <td>${orderEsc(l.admin_name || 'Customer order or system')}</td>
+      </tr>`).join('') || '<tr><td colspan="5">No stock changes for this product yet.</td></tr>';
+    showDetails('Stock history', `
+      <div class="detail-top">
+        <div class="inv-product">${productPicture(product && product.image)}<div><div class="detail-code" style="font-size:18px">${orderEsc(product ? product.product_name : 'Product')}</div><div class="muted-small">Now in stock: <b>${product ? product.stock : '-'}</b></div></div></div>
+      </div>
+      <div class="table-wrap" style="max-height:52vh">
+        <table><thead><tr><th>When</th><th>What happened</th><th>Change</th><th>Stock</th><th>By</th></tr></thead><tbody>${rows}</tbody></table>
+      </div>
+      <div class="modal-actions"><button type="button" class="primary-btn" onclick="closeModal()">Close</button></div>`);
+  } catch (err) {
+    detailsError('Stock history', err.message);
+  }
+}
+
+// The window to change the stock. Three ways:
+//   Restock    = add to the stock            (10 + 5 = 15)
+//   Remove     = take away (damaged / lost)  (10 - 3 = 7)
+//   Correction = set the exact stock         (the stock BECOMES the number you type)
+function openStockModal(productId, startMode) {
+  const product = allProductsForInventory.find(p => p.product_id === productId);
+  const current = Number(product.stock);
+  let mode = startMode || 'add';
+  document.querySelector('#modalOverlay .modal').classList.remove('modal-wide');
+  modalTitle.textContent = 'Stock - ' + product.product_name;
+
+  const MODES = {
+    add: { label: 'How many are you adding?', help: 'Restock: the number you type is ADDED to the current stock.', min: 1, start: 1 },
+    remove: { label: 'How many are you removing?', help: 'Remove: the number you type is TAKEN AWAY from the current stock (damaged or lost items).', min: 1, start: 1 },
+    set: { label: 'What is the correct stock now?', help: 'Correction: the stock BECOMES the number you type. It is not added or subtracted. Use it after counting the shelf.', min: 0, start: current },
+  };
 
   modalForm.innerHTML = `
-    <label>Current stock</label>
-    <input type="text" value="${product.stock}" disabled>
-
-    <label>Reason</label>
-    <select id="f_reason">
-      <option value="Restock">Restock (add)</option>
-      <option value="Damaged">Damaged goods (remove)</option>
-      <option value="Correction">Correction</option>
-    </select>
-
-    <label>Amount</label>
-    <input type="number" id="f_amount" min="1" value="1" required>
-
+    <div class="stock-now"><span>Current stock</span><b>${current}</b></div>
+    <div class="mode-tabs">
+      <button type="button" class="mode-tab" data-mode="add">Restock<small>add more</small></button>
+      <button type="button" class="mode-tab" data-mode="remove">Remove<small>damaged / lost</small></button>
+      <button type="button" class="mode-tab" data-mode="set">Correction<small>set exact stock</small></button>
+    </div>
+    <p id="stockHelp" class="muted-small"></p>
+    <label id="stockQtyLabel"></label>
+    <input type="number" id="f_quantity" step="1" required>
+    <div id="stockReasonBox" class="hidden">
+      <label>Reason</label>
+      <select id="f_stock_reason"><option>Damaged</option><option>Lost</option><option>Other</option></select>
+    </div>
+    <label>Note (optional)</label>
+    <input type="text" id="f_note" maxlength="200" placeholder="For example: new delivery from the supplier">
+    <div id="stockPreview" class="stock-preview"></div>
     <div class="modal-actions">
       <button type="button" class="secondary-btn" onclick="closeModal()">Cancel</button>
-      <button type="submit" class="primary-btn">Save</button>
-    </div>
-  `;
+      <button type="submit" id="stockSave" class="primary-btn">Save</button>
+    </div>`;
+
+  const input = document.getElementById('f_quantity');
+  const preview = document.getElementById('stockPreview');
+  const save = document.getElementById('stockSave');
+
+  function update() {
+    const q = Number(input.value);
+    const valid = input.value !== '' && Number.isInteger(q) && q >= MODES[mode].min;
+    let after = NaN;
+    if (valid) after = mode === 'add' ? current + q : mode === 'remove' ? current - q : q;
+    let message = '';
+    let ok = valid;
+    if (!valid) message = 'Please enter a whole number.';
+    else if (after < 0) { ok = false; message = `There are only ${current} in stock, so you cannot remove ${q}.`; }
+    else if (after === current) { ok = false; message = `The stock is already ${current}. Nothing to change.`; }
+    else message = `The stock will change from <b>${current}</b> to <b>${after}</b> (${after > current ? '+' : ''}${after - current}).`;
+    preview.innerHTML = message;
+    preview.className = 'stock-preview ' + (ok ? 'stock-preview-ok' : 'stock-preview-bad');
+    save.disabled = !ok;
+  }
+
+  function choose(newMode) {
+    mode = newMode;
+    modalForm.querySelectorAll('.mode-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.mode === mode));
+    document.getElementById('stockHelp').textContent = MODES[mode].help;
+    document.getElementById('stockQtyLabel').textContent = MODES[mode].label;
+    input.min = MODES[mode].min;
+    input.value = MODES[mode].start;
+    document.getElementById('stockReasonBox').classList.toggle('hidden', mode !== 'remove');
+    update();
+  }
+
+  modalForm.querySelectorAll('.mode-tab').forEach(tab => tab.addEventListener('click', () => choose(tab.dataset.mode)));
+  input.addEventListener('input', update);
+  choose(mode);
 
   modalForm.onsubmit = async (e) => {
     e.preventDefault();
-    const reason = document.getElementById('f_reason').value;
-    const rawAmount = parseInt(document.getElementById('f_amount').value);
-    // Restock = dagdag (+), Damaged = bawas (-), Correction = direktang ilagay ng admin ang sign
-    const change_amount = reason === 'Damaged' ? -Math.abs(rawAmount) : rawAmount;
-
-    const res = await fetch(API.PRODUCTS + '/products/' + productId + '/stock-adjustment', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ change_amount, reason }),
-    });
-    const data = await res.json();
-
-    if (!res.ok) {
-      alert(data.error || 'Could not adjust the stock.');
-      return;
+    const body = { mode, quantity: Number(input.value), note: document.getElementById('f_note').value.trim() };
+    if (mode === 'remove') body.reason = document.getElementById('f_stock_reason').value;
+    try {
+      const res = await fetch(API.PRODUCTS + '/products/' + productId + '/stock-adjustment', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not change the stock.');
+      closeModal();
+      showToast(`Stock updated: ${data.previousStock} → ${data.newStock}`);
+      loadInventory();
+      loadNotifications(); // the bell may have a new low stock message
+    } catch (err) {
+      openPopup({ type: 'error', title: 'This could not be done', message: err.message, buttons: [{ text: 'OK', value: true }] });
     }
-
-    closeModal();
-    loadInventory();
-    loadNotifications(); // agad i-refresh ang bell, baka nabago ang low-stock list
   };
 
   modalOverlay.classList.remove('hidden');
@@ -1803,59 +1914,90 @@ async function openCustomerDetails(userId, back) {
 // ===========================================================
 // REVIEWS MANAGEMENT
 // ===========================================================
+let allReviews = [];
+
 async function loadReviews() {
   const tbody = document.getElementById('reviewsTableBody');
   try {
     const res = await fetch(API.PRODUCTS + '/reviews', { headers: authHeaders() });
-    const reviews = await res.json();
-
-    tbody.innerHTML = reviews.map(r => {
-      // the photos and the video the customer added (click to view them here, without leaving the page)
-      const media = (r.media || []).map(m => {
-        const isVideo = m.type === 'video';
-        const picture = isVideo
-          ? m.url.replace('/video/upload/', '/video/upload/so_0,c_fill,w_88,h_88,q_auto/').replace(/\.[A-Za-z0-9]+$/, '.jpg')
-          : m.url.replace('/image/upload/', '/image/upload/c_fill,w_88,h_88,q_auto/');
-        return `<a href="${orderEsc(m.url)}" class="review-media" data-url="${orderEsc(m.url)}" data-type="${isVideo ? 'video' : 'image'}" target="_blank" rel="noopener" title="${isVideo ? 'Play video' : 'View photo'}" style="position:relative; display:inline-block; margin:4px 6px 0 0;">
-          <img src="${orderEsc(picture)}" alt="${isVideo ? 'Review video' : 'Review photo'}" style="width:44px; height:44px; object-fit:cover; border-radius:6px; display:block; background:#111;">
-          ${isVideo ? '<span style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-size:16px; text-shadow:0 0 4px #000;">▶</span>' : ''}
-        </a>`;
-      }).join('');
-      return `
-      <tr>
-        <td>${orderEsc(r.product_name)}</td>
-        <td>${orderEsc(r.customer_name)}</td>
-        <td>${'★'.repeat(r.rating)}${'☆'.repeat(5 - r.rating)}</td>
-        <td>${orderEsc(r.comment || '-')}${media ? `<div>${media}</div>` : ''}</td>
-        <td><span class="badge badge-${r.status === 'approved' ? 'active' : r.status === 'hidden' ? 'inactive' : 'pending'}">${r.status}</span></td>
-        <td>
-          ${r.status !== 'approved' ? `<button class="icon-btn" onclick="updateReviewStatus(${r.review_id}, 'approved')">Approve</button>` : ''}
-          ${r.status !== 'hidden' ? `<button class="icon-btn" onclick="updateReviewStatus(${r.review_id}, 'hidden')">Hide</button>` : ''}
-          <button class="icon-btn danger" onclick="deleteReview(${r.review_id})">Delete</button>
-        </td>
-      </tr>`;
-    }).join('') || '<tr><td colspan="6">No reviews yet.</td></tr>';
-
-    // clicking a photo or the video opens the viewer
-    tbody.onclick = (e) => {
-      const link = e.target.closest('.review-media');
-      if (link) {
-        e.preventDefault();
-        openMediaViewer(link.dataset.url, link.dataset.type);
-      }
-    };
+    allReviews = await res.json();
+    if (!res.ok) throw new Error(allReviews.error || 'Could not load the reviews.');
+    renderReviews();
   } catch (err) {
     tbody.innerHTML = '<tr><td colspan="6">Cannot reach the product service. Please try again.</td></tr>';
   }
 }
 
+const REVIEW_LABELS = { pending: 'Pending', approved: 'Visible', hidden: 'Hidden' };
+
+function renderReviews() {
+  const tbody = document.getElementById('reviewsTableBody');
+  const filterBox = document.getElementById('reviewStatusFilter');
+  const filter = filterBox.value;
+
+  // the filter shows how many reviews each choice has
+  const count = (status) => allReviews.filter(r => r.status === status).length;
+  filterBox.options[0].textContent = `All reviews (${allReviews.length})`;
+  filterBox.options[1].textContent = `Waiting for approval (${count('pending')})`;
+  filterBox.options[2].textContent = `Visible (${count('approved')})`;
+  filterBox.options[3].textContent = `Hidden (${count('hidden')})`;
+
+  const list = allReviews.filter(r => filter === 'all' || r.status === filter);
+  tbody.innerHTML = list.map(r => {
+    // the photos and the video the customer added (click to view them here, without leaving the page)
+    const media = (r.media || []).map(m => {
+      const isVideo = m.type === 'video';
+      const picture = isVideo
+        ? m.url.replace('/video/upload/', '/video/upload/so_0,c_fill,w_88,h_88,q_auto/').replace(/\.[A-Za-z0-9]+$/, '.jpg')
+        : m.url.replace('/image/upload/', '/image/upload/c_fill,w_88,h_88,q_auto/');
+      return `<a href="${orderEsc(m.url)}" class="review-media" data-url="${orderEsc(m.url)}" data-type="${isVideo ? 'video' : 'image'}" target="_blank" rel="noopener" title="${isVideo ? 'Play video' : 'View photo'}" style="position:relative; display:inline-block; margin:4px 6px 0 0;">
+        <img src="${orderEsc(picture)}" alt="${isVideo ? 'Review video' : 'Review photo'}" style="width:44px; height:44px; object-fit:cover; border-radius:6px; display:block; background:#111;">
+        ${isVideo ? '<span style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-size:16px; text-shadow:0 0 4px #000;">▶</span>' : ''}
+      </a>`;
+    }).join('');
+    // pending: Approve or Hide.  Visible: Hide.  Hidden: Show.
+    const buttons = r.status === 'approved'
+      ? `<button class="icon-btn" onclick="updateReviewStatus(${r.review_id}, 'hidden')">Hide</button>`
+      : r.status === 'hidden'
+        ? `<button class="icon-btn" onclick="updateReviewStatus(${r.review_id}, 'approved')">Show</button>`
+        : `<button class="icon-btn" onclick="updateReviewStatus(${r.review_id}, 'approved')">Approve</button>
+           <button class="icon-btn" onclick="updateReviewStatus(${r.review_id}, 'hidden')">Hide</button>`;
+    return `
+    <tr data-review-id="${r.review_id}">
+      <td>${orderEsc(r.product_name)}</td>
+      <td>${orderEsc(r.customer_name)}</td>
+      <td>${'★'.repeat(r.rating)}${'☆'.repeat(5 - r.rating)}</td>
+      <td>${orderEsc(r.comment || '-')}${media ? `<div>${media}</div>` : ''}</td>
+      <td><span class="badge badge-${orderEsc(r.status)}">${orderEsc(REVIEW_LABELS[r.status] || r.status)}</span></td>
+      <td>
+        ${buttons}
+        <button class="icon-btn danger" onclick="deleteReview(${r.review_id})">Delete</button>
+      </td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="6">${allReviews.length ? 'No reviews with this status.' : 'No reviews yet.'}</td></tr>`;
+
+  // clicking a photo or the video opens the viewer
+  tbody.onclick = (e) => {
+    const link = e.target.closest('.review-media');
+    if (link) {
+      e.preventDefault();
+      openMediaViewer(link.dataset.url, link.dataset.type);
+    }
+  };
+}
+
 async function updateReviewStatus(reviewId, status) {
-  await fetch(API.PRODUCTS + '/reviews/' + reviewId + '/status', {
-    method: 'PUT',
-    headers: authHeaders(),
-    body: JSON.stringify({ status }),
-  });
-  loadReviews();
+  try {
+    const res = await fetch(API.PRODUCTS + '/reviews/' + reviewId + '/status', { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ status }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not change the review.');
+    const review = allReviews.find(r => r.review_id === reviewId);
+    if (review) review.status = status;
+    renderReviews();
+    showToast(status === 'hidden' ? 'Review hidden. Customers cannot see it.' : 'Review is now visible on the product page.');
+  } catch (err) {
+    showToast(err.message, true);
+  }
 }
 
 async function deleteReview(reviewId) {

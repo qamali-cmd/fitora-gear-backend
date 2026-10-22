@@ -202,9 +202,17 @@
     <section id="page-inventory" class="page">
       <div class="section-header">
         <h2>Inventory</h2>
-        <select id="inventoryFilter" class="status-select">
+      </div>
+
+      <div id="inventoryStats" class="stats-row"></div>
+
+      <div class="filter-bar">
+        <input type="text" id="inventorySearch" placeholder="Search product name...">
+        <select id="inventoryFilter">
           <option value="all">All products</option>
-          <option value="low">Low stock only</option>
+          <option value="low">Low stock (fewer than 10)</option>
+          <option value="out">Out of stock</option>
+          <option value="ok">In stock</option>
         </select>
       </div>
 
@@ -214,12 +222,13 @@
             <tr>
               <th>Product</th>
               <th>Category</th>
-              <th>Current stock</th>
-              <th>Adjust</th>
+              <th>Stock</th>
+              <th>Status</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="inventoryTableBody">
-            <tr><td colspan="4">Loading...</td></tr>
+            <tr><td colspan="5">Loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -316,6 +325,12 @@
     <section id="page-reviews" class="page">
       <div class="section-header">
         <h2>Reviews</h2>
+        <select id="reviewStatusFilter" class="status-select">
+          <option value="all">All reviews</option>
+          <option value="pending">Waiting for approval</option>
+          <option value="approved">Visible</option>
+          <option value="hidden">Hidden</option>
+        </select>
       </div>
       <div class="table-wrap">
         <table>
