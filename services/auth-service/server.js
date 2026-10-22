@@ -139,18 +139,18 @@ async function sendEmail({ to, subject, html }) {
   }
 }
 
-function codeEmailHtml(name, code) {
+function codeEmailHtml(name, code, intro) {
   return `<div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px">
-    <h2 style="color:#6C5CE7;margin:0 0 12px">Fitora Gear</h2>
+    <h2 style="color:#FC408C;margin:0 0 12px">Fitora Gear</h2>
     <p>Hi ${escapeHtml(name)},</p>
-    <p>Use this code to verify your email address:</p>
+    <p>${escapeHtml(intro || 'Use this code to verify your email address:')}</p>
     <p style="font-size:32px;letter-spacing:8px;font-weight:bold;color:#2B2140;margin:16px 0">${code}</p>
     <p style="color:#666;font-size:13px">This code expires in ${CODE_MINUTES} minutes. If you did not request it, you can ignore this email.</p>
   </div>`;
 }
 
 // Creates a 6-digit code (stored hashed) and emails it. Throws if the email cannot be sent.
-async function issueVerificationCode(accountType, accountId, email, name) {
+async function issueVerificationCode(accountType, accountId, email, name, purpose) {
   const [recent] = await pool.query(
     'SELECT TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age FROM email_verifications WHERE account_type = ? AND account_id = ? ORDER BY verification_id DESC LIMIT 1',
     [accountType, accountId]
@@ -172,7 +172,7 @@ async function issueVerificationCode(accountType, accountId, email, name) {
   );
 
   try {
-    await sendEmail({ to: email, subject: 'Your Fitora Gear verification code', html: codeEmailHtml(name, code) });
+    await sendEmail({ to: email, subject: (purpose && purpose.subject) || 'Your Fitora Gear verification code', html: codeEmailHtml(name, code, purpose && purpose.intro) });
   } catch (err) {
     // The email never left, so remove the code and let the user try again right away
     await pool.query('DELETE FROM email_verifications WHERE account_type = ? AND account_id = ?', [accountType, accountId]);
@@ -793,6 +793,14 @@ async function loadAdmin(adminId) {
   return rows[0];
 }
 
+async function loadAdminWithPassword(adminId) {
+  const [rows] = await pool.query(
+    'SELECT admin_id, username, password, full_name, email, email_verified, role FROM admins WHERE admin_id = ?',
+    [adminId]
+  );
+  return rows[0];
+}
+
 app.get('/api/auth/admins/me', verifyToken, async (req, res) => {
   try {
     const admin = await loadAdmin(req.admin.adminId);
@@ -830,6 +838,12 @@ app.put('/api/auth/admins/me', verifyToken, async (req, res) => {
     const currentEmail = current.email ? String(current.email).toLowerCase() : null;
     const emailChanged = (email || null) !== currentEmail;
     const verified = emailChanged ? 0 : (current.email_verified ? 1 : 0);
+
+    // The Super Admin confirms a new name or email with a code sent to the email (the photo needs no code).
+    // A Super Admin who has no email at all yet can add one here: there is nothing to send a code to.
+    if (current.role === 'super_admin' && currentEmail && (emailChanged || fullName !== current.full_name)) {
+      return res.status(403).json({ error: 'To change your name or email, please confirm it with the code that is sent to your email.', code: 'CONFIRM_REQUIRED' });
+    }
 
     await pool.query('UPDATE admins SET full_name = ?, email = ?, profile_photo = ?, email_verified = ? WHERE admin_id = ?', [
       fullName, email || null, photo, verified, req.admin.adminId,
@@ -874,23 +888,140 @@ app.post('/api/auth/admins/me/verify-code', verifyToken, async (req, res) => {
   }
 });
 
+// The password is NOT changed here any more:
+//   staff cannot change a password at all (the Super Admin resets it for them), and
+//   the Super Admin changes it with the code sent to the email (see "changes" routes).
 app.put('/api/auth/admins/me/password', verifyToken, async (req, res) => {
   try {
-    const currentPassword = String((req.body || {}).current_password || '');
-    const newPassword = String((req.body || {}).new_password || '');
-
-    const [rows] = await pool.query('SELECT password, role FROM admins WHERE admin_id = ?', [req.admin.adminId]);
+    const [rows] = await pool.query('SELECT role FROM admins WHERE admin_id = ?', [req.admin.adminId]);
     if (rows.length === 0) return res.status(404).json({ error: 'Admin not found.' });
-    // Staff cannot change their own password: the Super Admin does it for them
     if (rows[0].role !== 'super_admin') {
       return res.status(403).json({ error: 'Only the Super Admin can change a password. Please ask the Super Admin to change it for you.', code: 'SUPER_ADMIN_ONLY' });
     }
-    if (!STRONG_PASSWORD_RE.test(newPassword)) return res.status(400).json({ error: PASSWORD_MESSAGE });
-    if (!(await bcrypt.compare(currentPassword, rows[0].password))) {
-      return res.status(400).json({ error: 'Your current password is incorrect.' });
+    return res.status(403).json({ error: 'To change your password, please confirm it with the code that is sent to your email.', code: 'CONFIRM_REQUIRED' });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// -----------------------------------------------------
+// CHANGES THAT NEED A CODE FROM THE EMAIL (Super Admin: name, username, email, password)
+//   1) /changes/request : the change is checked, a 6-digit code is emailed, and the change waits
+//   2) /changes/confirm : the code is entered, and only then is the change saved
+// The new password is kept hashed while it waits. A waiting change is forgotten after CODE_MINUTES.
+// -----------------------------------------------------
+const pendingChanges = new Map(); // admin id -> { details, passwordHash, expires }
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of pendingChanges) if (entry.expires < now) pendingChanges.delete(key);
+}, 60000).unref();
+
+function maskEmail(email) {
+  const [name, domain] = String(email).split('@');
+  return `${name.slice(0, 1)}${'*'.repeat(Math.max(2, Math.min(name.length - 1, 6)))}@${domain}`;
+}
+
+app.post('/api/auth/admins/me/changes/request', verifyToken, async (req, res) => {
+  try {
+    const admin = await loadAdminWithPassword(req.admin.adminId);
+    if (!admin) return res.status(404).json({ error: 'Admin not found.' });
+    if (admin.role !== 'super_admin') return res.status(403).json({ error: 'Only the Super Admin confirms changes with an email code.', code: 'SUPER_ADMIN_ONLY' });
+    if (!admin.email || !admin.email_verified) {
+      return res.status(400).json({ error: 'Please verify your email first. Your changes are confirmed with a code that is sent to your email.', code: 'EMAIL_NOT_VERIFIED' });
     }
-    await pool.query('UPDATE admins SET password = ? WHERE admin_id = ?', [await bcrypt.hash(newPassword, 10), req.admin.adminId]);
-    res.json({ message: 'Password changed.' });
+
+    const body = req.body || {};
+    const details = {};
+    const input = body.details || {};
+
+    if (input.full_name !== undefined) {
+      const fullName = String(input.full_name).trim();
+      if (fullName.length < 2 || fullName.length > 100) return res.status(400).json({ error: 'Full name must be 2-100 characters.' });
+      if (fullName !== admin.full_name) details.full_name = fullName;
+    }
+    if (input.username !== undefined) {
+      const username = String(input.username).trim();
+      if (!ADMIN_USERNAME_RE.test(username)) return res.status(400).json({ error: 'The username must be 3-30 characters: letters, numbers, dots, dashes, or underscores.' });
+      if (username !== admin.username) {
+        const [taken] = await pool.query('SELECT admin_id FROM admins WHERE username = ? AND admin_id <> ?', [username, admin.admin_id]);
+        if (taken.length > 0) return res.status(400).json({ error: 'This username is already taken.' });
+        details.username = username;
+      }
+    }
+    if (input.email !== undefined) {
+      const email = String(input.email).trim().toLowerCase();
+      if (!EMAIL_RE.test(email) || email.length > 100) return res.status(400).json({ error: 'Please enter a valid email address.' });
+      if (email !== String(admin.email).toLowerCase()) details.email = email;
+    }
+
+    let passwordHash = null;
+    if (body.password) {
+      const currentPassword = String(body.password.current_password || '');
+      const newPassword = String(body.password.new_password || '');
+      if (!(await bcrypt.compare(currentPassword, admin.password))) return res.status(400).json({ error: 'Your current password is incorrect.' });
+      if (!STRONG_PASSWORD_RE.test(newPassword)) return res.status(400).json({ error: PASSWORD_MESSAGE });
+      if (newPassword === currentPassword) return res.status(400).json({ error: 'The new password must be different from the current one.' });
+      passwordHash = await bcrypt.hash(newPassword, 10);
+    }
+
+    if (Object.keys(details).length === 0 && !passwordHash) return res.status(400).json({ error: 'Nothing was changed.' });
+    if (!allow('change|' + admin.admin_id, 8, 3600000)) return res.status(429).json({ error: 'Too many requests. Please try again in an hour.' });
+
+    // the code goes to the email the admin has now (even when the change is a new email)
+    await issueVerificationCode('admin', admin.admin_id, admin.email, admin.full_name, {
+      subject: 'Confirm your changes - Fitora Gear',
+      intro: 'Someone asked to change your admin account details. If it was you, use this code to confirm the change:',
+    });
+    pendingChanges.set(admin.admin_id, { details, passwordHash, expires: Date.now() + CODE_MINUTES * 60000 });
+
+    res.json({
+      message: `We sent a 6-digit code to ${maskEmail(admin.email)}.`,
+      email: maskEmail(admin.email),
+      changes: { ...details, password: !!passwordHash },
+    });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+app.post('/api/auth/admins/me/changes/confirm', verifyToken, async (req, res) => {
+  try {
+    const admin = await loadAdminWithPassword(req.admin.adminId);
+    if (!admin) return res.status(404).json({ error: 'Admin not found.' });
+    if (admin.role !== 'super_admin') return res.status(403).json({ error: 'Only the Super Admin confirms changes with an email code.', code: 'SUPER_ADMIN_ONLY' });
+
+    const code = String((req.body || {}).code || '').trim();
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Please enter the 6-digit code.' });
+
+    const pending = pendingChanges.get(admin.admin_id);
+    if (!pending || pending.expires < Date.now()) {
+      pendingChanges.delete(admin.admin_id);
+      return res.status(400).json({ error: 'There is no change waiting for a code. Please start the change again.' });
+    }
+
+    const result = await checkVerificationCode('admin', admin.admin_id, admin.email, code);
+    if (!result.ok) return res.status(result.status).json({ error: result.message });
+
+    pendingChanges.delete(admin.admin_id); // a code works only once
+    const sets = [];
+    const values = [];
+    const d = pending.details;
+    if (d.full_name !== undefined) { sets.push('full_name = ?'); values.push(d.full_name); }
+    if (d.username !== undefined) { sets.push('username = ?'); values.push(d.username); }
+    if (d.email !== undefined) { sets.push('email = ?', 'email_verified = 0'); values.push(d.email); }
+    if (pending.passwordHash) { sets.push('password = ?'); values.push(pending.passwordHash); }
+    try {
+      await pool.query(`UPDATE admins SET ${sets.join(', ')} WHERE admin_id = ?`, [...values, admin.admin_id]);
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: 'This username was just taken by someone else. Please choose another.' });
+      throw err;
+    }
+    res.json({
+      message: 'Your changes were saved.',
+      emailChanged: d.email !== undefined,
+      passwordChanged: !!pending.passwordHash,
+      admin: adminProfile(await loadAdmin(admin.admin_id)),
+    });
   } catch (err) {
     handleError(res, err);
   }
@@ -962,6 +1093,8 @@ app.put('/api/auth/admins/:id', verifyToken, requireSuperAdmin, async (req, res)
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });
+    // your own details (and their confirmation code) are in My profile
+    if (id === req.admin.adminId) return res.status(400).json({ error: 'Please change your own details in My profile.' });
     const parsed = checkAdminFields(req.body || {});
     if (parsed.error) return res.status(400).json({ error: parsed.error });
     const d = parsed.data;

@@ -546,3 +546,17 @@ a.admin-chip:hover { transform: translateY(-1px); border-color: rgba(252, 64, 14
 
 /* labels stay on one line */
 .badge { white-space: nowrap; }
+
+/* the personal details (shown first, a form only after Edit) and the confirmation window */
+.card-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 4px; }
+.card-head h3 { margin: 0; }
+.info-list { margin-top: 8px; }
+.info-row { display: flex; justify-content: space-between; gap: 18px; padding: 13px 0; border-bottom: 1px dashed var(--line); font-size: 14px; }
+.info-row:last-child { border-bottom: 0; }
+.info-row span { color: var(--text-muted); flex-shrink: 0; }
+.info-row b { text-align: right; word-break: break-word; }
+.change-list { list-style: none; margin: 14px 0 4px; padding: 14px 16px; border-radius: 16px; background: var(--primary-soft); display: flex; flex-direction: column; gap: 8px; }
+.change-list li { display: flex; justify-content: space-between; gap: 16px; font-size: 13.5px; }
+.change-list li span { color: var(--text-muted); }
+.change-list li b { text-align: right; word-break: break-word; }
+.modal input#c_code { letter-spacing: 0.4em; font-size: 20px; text-align: center; font-weight: 700; }

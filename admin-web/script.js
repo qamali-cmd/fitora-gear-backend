@@ -19,6 +19,11 @@ const API = {
 const CLOUDINARY_CLOUD_NAME = 'roit6yup';
 const CLOUDINARY_UPLOAD_PRESET = 'IMAGES';
 
+// The state of the My profile page. These are declared HERE, at the top, because the page can be opened
+// right when the site loads (for example by refreshing while on My profile).
+let profileState = null;
+let profileEditing = false; // the personal details are only shown, until the Edit button is pressed
+
 // ---------------------------------------------------------
 // Helper: kunin ang saved token, gamitin sa lahat ng
 // protektadong request (products add/edit/delete, orders, etc.)
@@ -2115,8 +2120,10 @@ async function loadAdmins() {
         <td>${a.role === 'super_admin' ? '<span class="badge badge-active">Super Admin</span>' : '<span class="badge">Staff</span>'}</td>
         <td>${access}</td>
         <td>
-          <button class="icon-btn" onclick="openEditAdmin(${a.admin_id})">Edit</button>
-          ${isYou ? '' : `<button class="icon-btn" onclick="openResetPassword(${a.admin_id})">Reset password</button>
+          ${isYou
+            ? '<button class="icon-btn" onclick="location.hash = \'profile\'">My profile</button>'
+            : `<button class="icon-btn" onclick="openEditAdmin(${a.admin_id})">Edit</button>
+          <button class="icon-btn" onclick="openResetPassword(${a.admin_id})">Reset password</button>
           <button class="icon-btn danger" onclick="deleteAdmin(${a.admin_id})">Delete</button>`}
         </td>
       </tr>`;
@@ -2335,11 +2342,11 @@ async function deleteAdmin(adminId) {
 // ===========================================================
 // MY PROFILE (the admin who is logged in)
 // ===========================================================
-let profileState = null;
 
 async function loadProfile() {
   const box = document.getElementById('profileContent');
   box.innerHTML = '<p class="detail-loading">Loading...</p>';
+  profileEditing = false;
   try {
     const res = await fetch(API.AUTH + '/admins/me', { headers: authHeaders() });
     const me = await res.json();
@@ -2353,7 +2360,8 @@ async function loadProfile() {
   }
 }
 
-// Saves the name, the email, and / or the photo. Whatever is not sent stays as it is.
+// Saves the name, the email, and / or the photo directly. Whatever is not sent stays as it is.
+// (A Super Admin who has an email confirms a new name or email with a code instead: see requestChange.)
 async function saveProfile(me, changes) {
   const body = { full_name: me.fullName, email: me.email || '', ...changes };
   const res = await fetch(API.AUTH + '/admins/me', { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
@@ -2366,9 +2374,70 @@ async function saveProfile(me, changes) {
   return data;
 }
 
+// Step 1 of a change that needs the email code: the server checks it and emails a 6-digit code
+async function requestChange(payload) {
+  const res = await fetch(API.AUTH + '/admins/me/changes/request', { method: 'POST', headers: authHeaders(), body: JSON.stringify(payload) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Could not start the change.');
+  return data;
+}
+
+// Step 2: the window where the code is typed. Only then are the changes saved.
+function openConfirmWindow(payload, info) {
+  document.querySelector('#modalOverlay .modal').classList.remove('modal-wide');
+  modalTitle.textContent = 'Confirm your changes';
+  const lines = [];
+  if (info.changes.full_name) lines.push(['Name', info.changes.full_name]);
+  if (info.changes.username) lines.push(['Username', '@' + info.changes.username]);
+  if (info.changes.email) lines.push(['Email', info.changes.email]);
+  if (info.changes.password) lines.push(['Password', 'will be changed']);
+
+  modalForm.innerHTML = `
+    <p class="muted-small">For your security, we sent a 6-digit code to <b>${orderEsc(info.email)}</b>. Type it here to save these changes:</p>
+    <ul class="change-list">${lines.map(([label, value]) => `<li><span>${orderEsc(label)}</span><b>${orderEsc(value)}</b></li>`).join('')}</ul>
+    <label>6-digit code</label>
+    <input type="text" id="c_code" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code" required>
+    <small class="muted-small">The code works for 10 minutes. Nothing is saved until you confirm. <button type="button" class="link-btn" id="c_resend">Send a new code</button></small>
+    <div class="modal-actions">
+      <button type="button" class="secondary-btn" onclick="closeModal()">Cancel</button>
+      <button type="submit" class="primary-btn">Confirm and save</button>
+    </div>`;
+
+  document.getElementById('c_resend').addEventListener('click', async () => {
+    try {
+      await requestChange(payload);
+      showToast('A new code was sent to your email.');
+    } catch (err) {
+      showApiError(err.message);
+    }
+  });
+
+  modalForm.onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await fetch(API.AUTH + '/admins/me/changes/confirm', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ code: document.getElementById('c_code').value.trim() }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not confirm the changes.');
+      closeModal();
+      profileEditing = false;
+      profileState = data.admin;
+      saveAdminSession(data.admin);
+      renderAdminChip();
+      renderProfile(data.admin);
+      showToast(data.emailChanged ? 'Your changes were saved. Please verify your new email.' : 'Your changes were saved.');
+    } catch (err) {
+      showApiError(err.message); // the window stays open so the code can be typed again
+    }
+  };
+  modalOverlay.classList.remove('hidden');
+}
+
 function renderProfile(me) {
   const box = document.getElementById('profileContent');
   const isSuper = me.role === 'super_admin';
+  // A Super Admin who has an email confirms changes with a code sent to it
+  const needsCode = isSuper && !!me.email;
+  const blocked = needsCode && !me.emailVerified; // the code cannot be sent to an email that is not verified yet
   const photo = me.profilePhoto
     ? `<img class="profile-photo" alt="" src="${orderEsc(me.profilePhoto.includes('/image/upload/') ? me.profilePhoto.replace('/image/upload/', '/image/upload/c_fill,w_240,h_240,q_auto/') : me.profilePhoto)}">`
     : `<span class="profile-photo profile-initials">${orderEsc(initialsOf(me.fullName))}</span>`;
@@ -2376,8 +2445,33 @@ function renderProfile(me) {
     ? (me.emailVerified ? '<span class="badge badge-plain badge-active">Email verified</span>' : '<span class="badge badge-plain badge-pending">Email not verified</span>')
     : '<span class="badge badge-plain">No email yet</span>';
 
+  const verifyFirst = '<div class="lock-note" style="margin-top:14px;"><span class="lock-icon">🔒</span><div><b>Verify your email first.</b><div class="muted-small" style="color:inherit; opacity:0.85;">Changes to your details and password are confirmed with a code sent to your email. Use "Email verification" on this page.</div></div></div>';
+
+  // ----- the personal details: shown, or (after Edit) a form -----
+  const detailsCard = profileEditing
+    ? `<form id="profileForm">
+         <label>Full name</label>
+         <input type="text" id="p_name" value="${orderEsc(me.fullName)}" maxlength="100" required>
+         <label>Email</label>
+         <input type="email" id="p_email" value="${orderEsc(me.email || '')}">
+         <small class="muted-small">${needsCode ? 'Your changes are confirmed with a code sent to your current email.' : 'If you change your email, it has to be verified again.'}</small>
+         <label>Username</label>
+         <input type="text" id="p_username" value="${orderEsc(me.username)}" maxlength="30" ${needsCode ? '' : 'disabled'}>
+         <small class="muted-small">${needsCode ? 'Letters, numbers, dots, dashes, or underscores (3-30).' : isSuper ? 'Add and verify your email first, then you can change your username.' : 'Only the Super Admin can change a username.'}</small>
+         <div class="profile-actions">
+           <button type="submit" class="primary-btn">Save changes</button>
+           <button type="button" class="secondary-btn" id="cancelEditBtn">Cancel</button>
+         </div>
+       </form>`
+    : `<div class="info-list">
+         <div class="info-row"><span>Full name</span><b>${orderEsc(me.fullName)}</b></div>
+         <div class="info-row"><span>Email</span><b>${orderEsc(me.email || 'Not set')}</b></div>
+         <div class="info-row"><span>Username</span><b>@${orderEsc(me.username)}</b></div>
+       </div>
+       ${blocked ? verifyFirst : needsCode ? '<p class="muted-small" style="margin-top:12px;">For your security, changes to your name, username, or email are confirmed with a code sent to your email.</p>' : ''}`;
+
   const emailCard = !me.email
-    ? '<p class="muted-small">Add your email in "Personal details" and save it. Then you can verify it here.</p>'
+    ? '<p class="muted-small">Add your email in "Personal details" (press Edit) and save it. Then you can verify it here.</p>'
     : me.emailVerified
       ? `<div class="detail-note detail-note-ok">Your email <b>${orderEsc(me.email)}</b> is verified.</div>`
       : `<p class="muted-small">We will send a 6-digit code to <b>${orderEsc(me.email)}</b>.</p>
@@ -2388,16 +2482,18 @@ function renderProfile(me) {
            <div class="profile-actions"><button type="button" class="primary-btn" id="verifyCodeBtn">Verify email</button></div>
          </div>`;
 
+  const passwordDisabled = !needsCode || blocked ? 'disabled' : '';
   const passwordCard = isSuper
     ? `<form id="passwordForm">
          <label>Current password</label>
-         <input type="password" id="p_current" autocomplete="current-password" required>
+         <input type="password" id="p_current" autocomplete="current-password" ${passwordDisabled} required>
          <label>New password</label>
-         <input type="password" id="p_new" autocomplete="new-password" required>
+         <input type="password" id="p_new" autocomplete="new-password" ${passwordDisabled} required>
          <label>Type the new password again</label>
-         <input type="password" id="p_new2" autocomplete="new-password" required>
-         <small class="muted-small">At least 8 characters, with uppercase and lowercase letters, a number, and a special character (for example !@#$%).</small>
-         <div class="profile-actions"><button type="submit" class="primary-btn">Change password</button></div>
+         <input type="password" id="p_new2" autocomplete="new-password" ${passwordDisabled} required>
+         <small class="muted-small">At least 8 characters, with uppercase and lowercase letters, a number, and a special character (for example !@#$%). The change is confirmed with a code sent to your email.</small>
+         ${!me.email ? '<p class="muted-small" style="margin-top:10px;">Add your email and verify it first. The password change is confirmed with a code sent to it.</p>' : blocked ? verifyFirst : ''}
+         <div class="profile-actions"><button type="submit" class="primary-btn" ${passwordDisabled}>Change password</button></div>
        </form>`
     : `<div class="lock-note"><span class="lock-icon">🔒</span><div><b>Only the Super Admin can change passwords.</b><div class="muted-small" style="color:inherit; opacity:0.85;">If you forgot your password or want a new one, please ask the Super Admin to reset it for you.</div></div></div>`;
 
@@ -2424,18 +2520,11 @@ function renderProfile(me) {
       </div>
 
       <div class="card">
-        <h3>Personal details</h3>
-        <form id="profileForm">
-          <label>Full name</label>
-          <input type="text" id="p_name" value="${orderEsc(me.fullName)}" maxlength="100" required>
-          <label>Email</label>
-          <input type="email" id="p_email" value="${orderEsc(me.email || '')}">
-          <small class="muted-small">If you change your email, it has to be verified again.</small>
-          <label>Username</label>
-          <input type="text" value="${orderEsc(me.username)}" disabled>
-          <small class="muted-small">Only the Super Admin can change a username.</small>
-          <div class="profile-actions"><button type="submit" class="primary-btn">Save changes</button></div>
-        </form>
+        <div class="card-head">
+          <h3>Personal details</h3>
+          ${profileEditing ? '' : `<button type="button" class="secondary-btn" id="editDetailsBtn" ${blocked ? 'disabled' : ''}>Edit</button>`}
+        </div>
+        ${detailsCard}
       </div>
 
       <div class="card"><h3>Email verification</h3>${emailCard}</div>
@@ -2443,7 +2532,7 @@ function renderProfile(me) {
       <div class="card"><h3>What I can open</h3>${accessCard}</div>
     </div>`;
 
-  // ----- the photo -----
+  // ----- the photo (no code needed) -----
   const input = document.getElementById('profilePhotoInput');
   const status = document.getElementById('profilePhotoStatus');
   document.getElementById('profilePhotoBtn').addEventListener('click', () => input.click());
@@ -2460,6 +2549,7 @@ function renderProfile(me) {
       const upload = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, { method: 'POST', body: formData });
       const uploaded = await upload.json();
       if (!uploaded.secure_url) throw new Error((uploaded.error && uploaded.error.message) || 'The picture could not be uploaded.');
+      profileEditing = false;
       await saveProfile(me, { profile_photo: uploaded.secure_url });
       showToast('Your photo was saved.');
     } catch (err) {
@@ -2468,21 +2558,41 @@ function renderProfile(me) {
   });
   const remove = document.getElementById('profilePhotoRemove');
   if (remove) remove.addEventListener('click', async () => {
-    try { await saveProfile(me, { profile_photo: '' }); showToast('Your photo was removed.'); } catch (err) { showApiError(err.message); }
+    try { profileEditing = false; await saveProfile(me, { profile_photo: '' }); showToast('Your photo was removed.'); } catch (err) { showApiError(err.message); }
   });
 
-  // ----- the details -----
-  document.getElementById('profileForm').addEventListener('submit', async (e) => {
+  // ----- the details: Edit, Cancel, Save -----
+  const editBtn = document.getElementById('editDetailsBtn');
+  if (editBtn) editBtn.addEventListener('click', () => { profileEditing = true; renderProfile(me); });
+  const cancelBtn = document.getElementById('cancelEditBtn');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => { profileEditing = false; renderProfile(me); });
+  const profileForm = document.getElementById('profileForm');
+  if (profileForm) profileForm.addEventListener('submit', async (e) => {
     e.preventDefault();
+    const name = document.getElementById('p_name').value.trim();
+    const email = document.getElementById('p_email').value.trim();
     try {
-      const data = await saveProfile(me, { full_name: document.getElementById('p_name').value.trim(), email: document.getElementById('p_email').value.trim() });
-      showToast(data.emailChanged ? 'Saved. Please verify your new email.' : 'Your profile was saved.');
+      if (needsCode) {
+        // only what really changed is sent, and a code from the email is needed to save it
+        const details = {};
+        if (name !== me.fullName) details.full_name = name;
+        if (email.toLowerCase() !== (me.email || '').toLowerCase()) details.email = email;
+        const username = document.getElementById('p_username').value.trim();
+        if (username !== me.username) details.username = username;
+        if (Object.keys(details).length === 0) { showToast('Nothing was changed.'); profileEditing = false; renderProfile(me); return; }
+        const payload = { details };
+        openConfirmWindow(payload, await requestChange(payload));
+      } else {
+        profileEditing = false;
+        const data = await saveProfile(me, { full_name: name, email });
+        showToast(data.emailChanged ? 'Saved. Please verify your new email.' : 'Your profile was saved.');
+      }
     } catch (err) {
       showApiError(err.message);
     }
   });
 
-  // ----- the email code -----
+  // ----- the email code (to verify the email) -----
   const sendBtn = document.getElementById('sendCodeBtn');
   if (sendBtn) {
     sendBtn.addEventListener('click', async () => {
@@ -2511,7 +2621,7 @@ function renderProfile(me) {
     });
   }
 
-  // ----- the password (Super Admin only) -----
+  // ----- the password (Super Admin only, confirmed with a code from the email) -----
   const passwordForm = document.getElementById('passwordForm');
   if (passwordForm) {
     passwordForm.addEventListener('submit', async (e) => {
@@ -2519,11 +2629,8 @@ function renderProfile(me) {
       const next = document.getElementById('p_new').value;
       if (next !== document.getElementById('p_new2').value) { showApiError('The two new passwords are not the same.', 'Check the password'); return; }
       try {
-        const res = await fetch(API.AUTH + '/admins/me/password', { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ current_password: document.getElementById('p_current').value, new_password: next }) });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || 'Could not change the password.');
-        passwordForm.reset();
-        showToast('Your password was changed.');
+        const payload = { password: { current_password: document.getElementById('p_current').value, new_password: next } };
+        openConfirmWindow(payload, await requestChange(payload));
       } catch (err) {
         showApiError(err.message);
       }
