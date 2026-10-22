@@ -274,6 +274,7 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
     // tell the admins (best effort: it never stops the order)
     await notifyOrder(orderId, 'new_order');
     await checkLowStock(cart.lines.map((line) => line.product_id));
+    sendOrderEmail(orderId, 'placed'); // not waited for: the customer does not have to wait for the email
     const [codeRows] = await pool.query('SELECT order_code FROM orders WHERE order_id = ?', [orderId]);
 
     res.status(201).json({
@@ -440,6 +441,7 @@ app.put('/api/orders/:id/status', verifyToken, requirePermission('orders'), asyn
 
     await pool.query('UPDATE orders SET status = ? WHERE order_id = ?', [status, req.params.id]);
     if (status === 'completed') await markCashPaid(pool, req.params.id); // the courier collected the cash
+    if (status === 'processing') sendOrderEmail(Number(req.params.id), 'processing');
     res.json({ message: 'Order status updated.' });
   } catch (err) {
     console.error(err);
@@ -732,37 +734,128 @@ function escapeHtml(text) {
   return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// Emails the customer that the order is on its way. This is a bonus: if the email is not set up
-// or fails, the order is still marked as shipped.
-async function sendShippedEmail(userId, orderId, order, shipping) {
-  if (!process.env.BREVO_API_KEY || !process.env.EMAIL_FROM) return;
-  const [rows] = await pool.query('SELECT email, first_name, full_name FROM users WHERE user_id = ?', [userId]);
-  if (rows.length === 0 || !rows[0].email) return;
+// =====================================================
+// EMAILS TO THE CUSTOMER: order received, being prepared, on its way, cancelled
+// They are a bonus: if emailing is not set up, or the email fails, the order is NOT affected.
+// =====================================================
+const peso = (n) => '₱' + Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 2 });
 
-  const name = rows[0].first_name || rows[0].full_name || 'there';
+async function loadOrderForEmail(orderId) {
+  const [rows] = await pool.query(
+    `SELECT o.order_id, o.order_code, o.status, o.total_amount, o.subtotal_amount, o.shipping_fee, o.shipping_discount,
+            o.payment_method, o.payment_status, o.ship_name, o.ship_phone, o.ship_street, o.ship_barangay, o.ship_city,
+            o.ship_province, o.ship_zip, o.courier, o.tracking_number, o.cancel_reason, o.cancelled_by,
+            u.email, u.first_name, u.full_name
+     FROM orders o JOIN users u ON u.user_id = o.user_id WHERE o.order_id = ?`,
+    [orderId]
+  );
+  if (rows.length === 0 || !rows[0].email) return null;
+  const [items] = await pool.query(
+    `SELECT oi.quantity, oi.price, p.product_name
+     FROM order_items oi LEFT JOIN products p ON p.product_id = oi.product_id
+     WHERE oi.order_id = ? ORDER BY oi.order_item_id`,
+    [orderId]
+  );
+  return { order: rows[0], items };
+}
+
+function emailItemsTable(items, order, withTotals) {
+  const rows = items.map((i) => `<tr>
+      <td style="padding:6px 0">${escapeHtml(i.product_name || 'Product')} <span style="color:#888">x ${Number(i.quantity)}</span></td>
+      <td style="padding:6px 0;text-align:right;white-space:nowrap">${peso(Number(i.price) * Number(i.quantity))}</td></tr>`).join('');
+  const totals = withTotals ? `
+    <tr><td colspan="2" style="border-top:1px solid #eee;padding-top:8px"></td></tr>
+    ${order.subtotal_amount != null ? `<tr><td style="color:#666;padding:2px 0">Subtotal</td><td style="text-align:right">${peso(order.subtotal_amount)}</td></tr>
+    <tr><td style="color:#666;padding:2px 0">Shipping fee</td><td style="text-align:right">${peso(order.shipping_fee)}</td></tr>
+    ${Number(order.shipping_discount) > 0 ? `<tr><td style="color:#666;padding:2px 0">Shipping discount</td><td style="text-align:right;color:#1e8e4f">-${peso(order.shipping_discount)}</td></tr>` : ''}` : ''}
+    <tr><td style="padding:6px 0;font-weight:bold">Total</td><td style="text-align:right;font-weight:bold;font-size:17px;color:#FC408C">${peso(order.total_amount)}</td></tr>` : '';
+  return `<table style="width:100%;border-collapse:collapse;font-size:14px;margin:12px 0">${rows}${totals}</table>`;
+}
+
+function emailAddress(order) {
+  const lines = [order.ship_name, order.ship_street, order.ship_barangay ? 'Brgy. ' + order.ship_barangay : '',
+    [order.ship_city, order.ship_province, order.ship_zip].filter(Boolean).join(', ')].filter(Boolean);
+  return lines.map(escapeHtml).join('<br>');
+}
+
+// Writes the subject and the message for each kind of email
+function buildOrderEmail(kind, order, items) {
+  const code = order.order_code || '#' + order.order_id;
+  const name = escapeHtml(order.first_name || order.full_name || 'there');
   const place = [order.ship_city, order.ship_province].filter(Boolean).join(', ');
-  const trackingLine = shipping.tracking ? `<p>Tracking number: <b style="font-size:18px;letter-spacing:1px">${escapeHtml(shipping.tracking)}</b></p>` : '';
-  const html = `<div style="font-family:Arial,sans-serif;max-width:440px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px">
-    <h2 style="color:#FC408C;margin:0 0 12px">Fitora Gear</h2>
-    <p>Hi ${escapeHtml(name)},</p>
-    <p>Good news! Your order <b>#${orderId}</b> is on its way${place ? ' to ' + escapeHtml(place) : ''}.</p>
-    <p>Courier: <b>${escapeHtml(shipping.courier)}</b></p>
-    ${trackingLine}
-    <p style="color:#666;font-size:13px">You can also see these details in the Fitora Gear app, under Orders. When your parcel arrives, tap "Order Received".</p>
-  </div>`;
+  let subject;
+  let heading;
+  let body;
 
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: { accept: 'application/json', 'content-type': 'application/json', 'api-key': process.env.BREVO_API_KEY },
-    body: JSON.stringify({
-      sender: { name: process.env.EMAIL_FROM_NAME || 'Fitora Gear', email: process.env.EMAIL_FROM },
-      to: [{ email: rows[0].email }],
-      subject: `Your Fitora Gear order #${orderId} is on its way`,
-      htmlContent: html,
-    }),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) console.warn('The shipped email was not sent:', response.status);
+  if (kind === 'placed') {
+    subject = `We received your order ${code}`;
+    heading = 'Thank you for your order!';
+    const payment = order.payment_method === 'gcash'
+      ? (order.payment_status === 'paid'
+        ? '<p>Payment: <b>GCash</b> (paid).</p>'
+        : `<p style="background:#fff4e0;color:#7a4d0b;padding:12px 14px;border-radius:10px">Payment: <b>GCash</b>. Your order is <b>waiting for your payment</b>. Open the Fitora Gear app, go to <b>Orders</b>, choose this order, and tap <b>Pay with GCash</b> within ${PAYMENT_WINDOW_MINUTES} minutes. Unpaid orders are cancelled automatically.</p>`)
+      : `<p>Payment: <b>Cash on Delivery</b>. Please prepare <b>${peso(order.total_amount)}</b> for the courier.</p>`;
+    body = `<p>We received your order <b>${escapeHtml(code)}</b>.</p>${payment}${emailItemsTable(items, order, true)}
+      <p style="margin:14px 0 4px"><b>Delivery address</b></p><p style="margin:0;color:#444;line-height:1.5">${emailAddress(order)}</p>
+      <p style="color:#666;font-size:13px;margin-top:16px">We will email you again when your order is being prepared and when it is on its way.</p>`;
+  } else if (kind === 'processing') {
+    subject = `Your order ${code} is being prepared`;
+    heading = 'We are preparing your order';
+    body = `<p>Good news! The shop is now preparing your order <b>${escapeHtml(code)}</b>.</p>${emailItemsTable(items, order, false)}
+      <p style="color:#666;font-size:13px">We will email you the courier and the tracking number as soon as it is on its way.</p>`;
+  } else if (kind === 'shipped') {
+    subject = `Your order ${code} is on its way`;
+    heading = 'Your order is on its way!';
+    const tracking = order.tracking_number
+      ? `<p>Tracking number: <b style="font-size:18px;letter-spacing:1px">${escapeHtml(order.tracking_number)}</b></p>` : '';
+    body = `<p>Good news! Your order <b>${escapeHtml(code)}</b> is on its way${place ? ' to ' + escapeHtml(place) : ''}.</p>
+      <p>Courier: <b>${escapeHtml(order.courier || '-')}</b></p>${tracking}
+      <p style="color:#666;font-size:13px">You can also see these details in the Fitora Gear app, under Orders. When your parcel arrives, tap "Order Received".</p>`;
+  } else {
+    subject = `Your order ${code} was cancelled`;
+    heading = 'Your order was cancelled';
+    const who = order.cancelled_by === 'system'
+      ? `This order was cancelled automatically because the GCash payment was not completed in ${PAYMENT_WINDOW_MINUTES} minutes.`
+      : order.cancelled_by === 'admin' ? 'The shop cancelled this order.' : 'You cancelled this order.';
+    const reason = order.cancelled_by !== 'system' && order.cancel_reason ? `<p>Reason: <b>${escapeHtml(order.cancel_reason)}</b></p>` : '';
+    const money = order.payment_status === 'refund_pending'
+      ? `<p style="background:#fff4e0;color:#7a4d0b;padding:12px 14px;border-radius:10px">You already paid <b>${peso(order.total_amount)}</b> with GCash. The shop will refund it to you. Please wait for the shop to process your refund.</p>`
+      : order.payment_status === 'refunded' ? '<p>Your payment was refunded.</p>'
+        : '<p>No payment was taken for this order.</p>';
+    body = `<p>${escapeHtml(who)}</p>${reason}${money}${emailItemsTable(items, order, false)}
+      <p style="color:#666;font-size:13px">You can order again anytime in the Fitora Gear app.</p>`;
+  }
+
+  const html = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px;color:#222">
+    <h2 style="color:#FC408C;margin:0 0 4px">Fitora Gear</h2>
+    <h3 style="margin:0 0 14px">${escapeHtml(heading)}</h3>
+    <p>Hi ${name},</p>${body}
+  </div>`;
+  return { subject, html };
+}
+
+// Sends one email about an order. It never throws, and it never stops what the shop is doing.
+async function sendOrderEmail(orderId, kind) {
+  try {
+    if (!process.env.BREVO_API_KEY || !process.env.EMAIL_FROM) return;
+    const loaded = await loadOrderForEmail(orderId);
+    if (!loaded) return;
+    const { subject, html } = buildOrderEmail(kind, loaded.order, loaded.items);
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json', 'api-key': process.env.BREVO_API_KEY },
+      body: JSON.stringify({
+        sender: { name: process.env.EMAIL_FROM_NAME || 'Fitora Gear', email: process.env.EMAIL_FROM },
+        to: [{ email: loaded.order.email }],
+        subject,
+        htmlContent: html,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) console.warn(`The "${kind}" email of order #${orderId} was not sent:`, response.status);
+  } catch (err) {
+    console.warn(`The "${kind}" email of order #${orderId} was not sent:`, err.message);
+  }
 }
 
 // ADMIN: mark an order as shipped with its courier and tracking number
@@ -790,7 +883,7 @@ app.put('/api/orders/:id/ship', verifyToken, requirePermission('orders'), (req, 
     );
     return {
       ...succeed({ message: 'The order was marked as shipped. The customer can now see the courier and tracking number.' }),
-      after: () => sendShippedEmail(order.user_id, id, order, parsed.data),
+      after: () => sendOrderEmail(id, 'shipped'),
     };
   });
 });
@@ -1078,6 +1171,7 @@ async function cancelUnpaidOrder(orderId) {
     if (conn) conn.release();
   }
   await expireCheckout(order && order.paymongo_session_id);
+  sendOrderEmail(orderId, 'cancelled'); // the customer is told it was cancelled automatically
 }
 
 async function expireUnpaidOrders() {
@@ -1170,6 +1264,7 @@ async function notifyOrder(orderId, kind, extra) {
 
 // After an order was cancelled: tell the shop (if the customer did it) and remind about a refund
 async function afterCancelNotify(orderId, announce, reason) {
+  sendOrderEmail(orderId, 'cancelled'); // every way of cancelling an order (customer, shop, approved request) comes here
   const o = await describeOrder(orderId);
   if (!o) return;
   if (announce) await notifyOrder(orderId, 'order_cancelled', reason);
