@@ -442,6 +442,7 @@ app.put('/api/orders/:id/status', verifyToken, requirePermission('orders'), asyn
     await pool.query('UPDATE orders SET status = ? WHERE order_id = ?', [status, req.params.id]);
     if (status === 'completed') await markCashPaid(pool, req.params.id); // the courier collected the cash
     if (status === 'processing') sendOrderEmail(Number(req.params.id), 'processing');
+    if (status === 'completed') sendOrderEmail(Number(req.params.id), 'completed');
     res.json({ message: 'Order status updated.' });
   } catch (err) {
     console.error(err);
@@ -708,7 +709,7 @@ app.put('/api/orders/:id/cancel-request', verifyToken, requirePermission('orders
       return { ...succeed({ message: 'The cancellation was approved and the stock was returned.' }), after: () => Promise.all([expireCheckout(order.paymongo_session_id), afterCancelNotify(id, false)]) };
     }
     await conn.query("UPDATE orders SET cancel_request_status = 'rejected', cancel_reject_reason = ? WHERE order_id = ?", [reason, id]);
-    return succeed({ message: 'The cancellation request was declined.' });
+    return { ...succeed({ message: 'The cancellation request was declined.' }), after: () => sendOrderEmail(id, 'declined') };
   });
 });
 
@@ -744,7 +745,7 @@ async function loadOrderForEmail(orderId) {
   const [rows] = await pool.query(
     `SELECT o.order_id, o.order_code, o.status, o.total_amount, o.subtotal_amount, o.shipping_fee, o.shipping_discount,
             o.payment_method, o.payment_status, o.ship_name, o.ship_phone, o.ship_street, o.ship_barangay, o.ship_city,
-            o.ship_province, o.ship_zip, o.courier, o.tracking_number, o.cancel_reason, o.cancelled_by,
+            o.ship_province, o.ship_zip, o.courier, o.tracking_number, o.cancel_reason, o.cancelled_by, o.cancel_reject_reason,
             u.email, u.first_name, u.full_name
      FROM orders o JOIN users u ON u.user_id = o.user_id WHERE o.order_id = ?`,
     [orderId]
@@ -811,6 +812,32 @@ function buildOrderEmail(kind, order, items) {
     body = `<p>Good news! Your order <b>${escapeHtml(code)}</b> is on its way${place ? ' to ' + escapeHtml(place) : ''}.</p>
       <p>Courier: <b>${escapeHtml(order.courier || '-')}</b></p>${tracking}
       <p style="color:#666;font-size:13px">You can also see these details in the Fitora Gear app, under Orders. When your parcel arrives, tap "Order Received".</p>`;
+  } else if (kind === 'declined') {
+    subject = `Your cancellation request for ${code} was declined`;
+    heading = 'We could not cancel your order';
+    const why = order.cancel_reject_reason ? `<p>Reason: <b>${escapeHtml(order.cancel_reject_reason)}</b></p>` : '';
+    body = `<p>The shop could not cancel your order <b>${escapeHtml(code)}</b>.</p>${why}
+      <p>Your order will go on and will be delivered to you.</p>${emailItemsTable(items, order, false)}
+      <p style="color:#666;font-size:13px">If you have questions, please contact the shop.</p>`;
+  } else if (kind === 'completed') {
+    subject = `Your order ${code} is complete`;
+    heading = 'Thank you for shopping with us!';
+    const paid = order.payment_method === 'gcash' ? 'Payment: paid with <b>GCash</b>.' : `Payment: <b>${peso(order.total_amount)}</b> paid in cash on delivery.`;
+    body = `<p>Your order <b>${escapeHtml(code)}</b> is now complete. We hope you enjoy your items!</p><p>${paid}</p>${emailItemsTable(items, order, true)}
+      <p style="background:#f7f3f7;padding:12px 14px;border-radius:10px;font-size:13.5px">Tell other shoppers what you think: open the Fitora Gear app, go to <b>Orders</b>, and tap <b>Rate this product</b> on this order. You can add photos and a video.</p>`;
+  } else if (kind === 'payment') {
+    subject = `We received your GCash payment for ${code}`;
+    heading = 'Payment received';
+    body = order.status === 'cancelled'
+      ? `<p>We received your GCash payment of <b>${peso(order.total_amount)}</b>, but the order <b>${escapeHtml(code)}</b> was already cancelled.</p>
+         <p style="background:#fff4e0;color:#7a4d0b;padding:12px 14px;border-radius:10px">The shop will refund your money. Please wait for the shop to process your refund.</p>${emailItemsTable(items, order, false)}`
+      : `<p>We received your GCash payment of <b>${peso(order.total_amount)}</b> for order <b>${escapeHtml(code)}</b>. Thank you!</p>${emailItemsTable(items, order, false)}
+         <p style="color:#666;font-size:13px">The shop will prepare your order soon. We will email you again when it is on its way.</p>`;
+  } else if (kind === 'refunded') {
+    subject = `Your refund for order ${code} was sent`;
+    heading = 'Your refund was sent';
+    body = `<p>The shop has refunded <b>${peso(order.total_amount)}</b> to your GCash account for the cancelled order <b>${escapeHtml(code)}</b>.</p>
+      <p style="color:#666;font-size:13px">It may take some time to show up in your GCash. If you do not see it after a few days, please contact the shop.</p>`;
   } else {
     subject = `Your order ${code} was cancelled`;
     heading = 'Your order was cancelled';
@@ -917,7 +944,7 @@ app.put('/api/orders/my/:id/received', verifyCustomerToken, (req, res) => {
     }
     await conn.query("UPDATE orders SET status = 'completed', received_at = NOW() WHERE order_id = ?", [id]);
     await markCashPaid(conn, id); // the courier collected the cash
-    return succeed({ message: 'Thank you! Your order is now completed.' });
+    return { ...succeed({ message: 'Thank you! Your order is now completed.' }), after: () => sendOrderEmail(id, 'completed') };
   });
 });
 
@@ -1021,6 +1048,7 @@ async function markPaid(orderId, paymentId) {
     await conn.query('UPDATE orders SET payment_status = ?, paid_at = NOW(), paymongo_payment_id = ? WHERE order_id = ?', [paymentStatus, paymentId, orderId]);
     await conn.commit();
     await notifyOrder(orderId, paymentStatus === 'paid' ? 'payment' : 'refund'); // the shop is told, too
+    sendOrderEmail(orderId, 'payment'); // and the customer (this runs only once: a payment already saved returns above)
     return { payment_status: paymentStatus, status: order.status };
   } catch (err) {
     if (conn) { try { await conn.rollback(); } catch (_) { /* ignore */ } }
@@ -1145,7 +1173,7 @@ app.put('/api/orders/:id/refunded', verifyToken, requirePermission('orders'), (r
     if (rows.length === 0) return fail(404, 'Order not found.');
     if (rows[0].payment_status !== 'refund_pending') return fail(400, 'This order has no refund waiting.');
     await conn.query("UPDATE orders SET payment_status = 'refunded', refunded_at = NOW() WHERE order_id = ?", [id]);
-    return succeed({ message: 'The refund was marked as done.' });
+    return { ...succeed({ message: 'The refund was marked as done.' }), after: () => sendOrderEmail(id, 'refunded') };
   });
 });
 
