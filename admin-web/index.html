@@ -60,6 +60,7 @@
       <a href="#reports" data-page="reports" class="nav-link">Sales Reports</a>
       <a href="#reviews" data-page="reviews" class="nav-link">Reviews</a>
       <a href="#admins" data-page="admins" class="nav-link">Admins</a>
+      <a href="#profile" data-page="profile" class="nav-link">My profile</a>
     </nav>
     <button id="logoutBtn" class="logout-btn">Log out</button>
   </aside>
@@ -81,13 +82,13 @@
           </div>
         </div>
         <!-- EDIT DITO: papalitan ng totoong pangalan ng admin pagka-login -->
-        <div class="admin-chip">
+        <a href="#profile" class="admin-chip" title="My profile">
           <span id="adminAvatar" class="admin-avatar"></span>
           <span class="admin-info">
             <span id="adminName" class="admin-name"></span>
             <span id="adminRole" class="admin-role"></span>
           </span>
-        </div>
+        </a>
       </div>
     </div>
 
@@ -361,19 +362,23 @@
         <table>
           <thead>
             <tr>
-              <th>Full name</th>
+              <th>Admin</th>
               <th>Username</th>
-              <th>Email</th>
               <th>Role</th>
-              <th>Permissions</th>
+              <th>Access</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody id="adminsTableBody">
-            <tr><td colspan="6">Loading...</td></tr>
+            <tr><td colspan="5">Loading...</td></tr>
           </tbody>
         </table>
       </div>
+    </section>
+
+    <!-- ---------------- MY PROFILE PAGE (the admin who is logged in) ---------------- -->
+    <section id="page-profile" class="page">
+      <div id="profileContent"><p class="detail-loading">Loading...</p></div>
     </section>
 
   </main>

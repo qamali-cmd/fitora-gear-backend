@@ -125,6 +125,21 @@ function openMediaViewer(url, type) {
   document.body.appendChild(overlay);
 }
 
+// If the server says the session ended (for example the admin account was deleted or the login expired),
+// the admin is told and sent back to the login page
+let sessionEndedShown = false;
+const nativeFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const response = await nativeFetch(...args);
+  const url = typeof args[0] === 'string' ? args[0] : '';
+  if (response.status === 401 && /onrender\.com/.test(url) && getToken() && !sessionEndedShown) {
+    sessionEndedShown = true;
+    openPopup({ type: 'warning', title: 'Logged out', message: 'Your session has ended, or this account is no longer available. Please log in again.', buttons: [{ text: 'OK', value: true }] })
+      .then(() => { sessionStorage.clear(); location.reload(); });
+  }
+  return response;
+};
+
 function authHeaders() {
   return {
     'Content-Type': 'application/json',
@@ -180,16 +195,65 @@ function showApp() {
   adminApp.classList.remove('hidden');
 
   const admin = JSON.parse(sessionStorage.getItem('fitora_admin') || '{}');
-  document.getElementById('adminName').textContent = admin.fullName ? 'Hi, ' + admin.fullName : '';
+  renderAdminChip();
 
   applyAccessControl(admin);
   navigateTo(location.hash.replace('#', '') || 'dashboard');
   loadCategories(); // kailangan agad ito para sa product form dropdown
   loadNotifications();
+  refreshAdminSession(); // the photo, the role, and the access are read again from the server
 
   // Auto-refresh ng notifications kada 15 segundo, para hindi na kailangang
   // i-refresh ang buong page para makita ang bagong low stock/pending order
   setInterval(loadNotifications, 15000);
+}
+
+// ===========================================================
+// THE ADMIN WHO IS LOGGED IN (the chip at the top right)
+// ===========================================================
+function saveAdminSession(partial) {
+  const merged = { ...JSON.parse(sessionStorage.getItem('fitora_admin') || '{}'), ...partial };
+  sessionStorage.setItem('fitora_admin', JSON.stringify(merged));
+  return merged;
+}
+
+function initialsOf(name) {
+  return String(name || '?').trim().split(/\s+/).slice(0, 2).map(w => w[0]).join('').toUpperCase();
+}
+
+function renderAdminChip() {
+  const admin = JSON.parse(sessionStorage.getItem('fitora_admin') || '{}');
+  document.getElementById('adminName').textContent = admin.fullName || '';
+  document.getElementById('adminRole').textContent = admin.role === 'super_admin' ? 'Super Admin' : (admin.role ? 'Staff' : '');
+  const avatar = document.getElementById('adminAvatar');
+  avatar.className = 'admin-avatar';
+  avatar.textContent = '';
+  if (admin.profilePhoto) {
+    const src = admin.profilePhoto.includes('/image/upload/') ? admin.profilePhoto.replace('/image/upload/', '/image/upload/c_fill,w_96,h_96,q_auto/') : admin.profilePhoto;
+    const img = document.createElement('img');
+    img.alt = '';
+    img.src = src;
+    img.onerror = () => { avatar.textContent = initialsOf(admin.fullName); avatar.classList.add('has-initials'); };
+    avatar.appendChild(img);
+  } else if (admin.fullName) {
+    avatar.textContent = initialsOf(admin.fullName);
+    avatar.classList.add('has-initials');
+  }
+}
+
+// Reads the admin's profile again from the server (photo, role, access can have changed)
+async function refreshAdminSession() {
+  try {
+    const res = await fetch(API.AUTH + '/admins/me', { headers: authHeaders() });
+    if (!res.ok) return;
+    const me = await res.json();
+    const admin = saveAdminSession(me);
+    renderAdminChip();
+    applyAccessControl(admin);
+    if (!hasAccess(location.hash.replace('#', '') || 'dashboard')) navigateTo('dashboard');
+  } catch (err) {
+    // not important: the saved profile is used
+  }
 }
 
 // EDIT DITO: ito ang listahan ng mga "gated" na tabs (hindi kasama ang dashboard,
@@ -200,7 +264,7 @@ const GATED_PAGES = ['products', 'categories', 'inventory', 'customers', 'orders
 // (super_admin = laging oo; staff = tinitignan sa permissions niya)
 function hasAccess(page) {
   const admin = JSON.parse(sessionStorage.getItem('fitora_admin') || '{}');
-  if (page === 'dashboard') return true;
+  if (page === 'dashboard' || page === 'profile') return true; // everyone can open their own profile
   if (page === 'admins') return admin.role === 'super_admin';
   if (admin.role === 'super_admin') return true;
   return (admin.permissions || []).includes(page);
@@ -267,6 +331,7 @@ function navigateTo(page) {
   if (page === 'reports') loadReports();
   if (page === 'reviews') loadReviews();
   if (page === 'admins') loadAdmins();
+  if (page === 'profile') loadProfile();
 }
 
 // ===========================================================
@@ -1569,7 +1634,7 @@ async function deleteCustomer(userId, name) {
   const data = await sendCustomerAction(userId, 'DELETE', '');
   if (!data) return;
   closeModal();
-  loadCustomers();
+  await loadCustomers(); // the table is updated first, then the message
   openPopup({ type: 'success', title: 'Customer deleted', message: data.message, buttons: [{ text: 'OK', value: true }] });
 }
 
@@ -2009,34 +2074,163 @@ async function deleteReview(reviewId) {
 // ===========================================================
 // ADMIN MANAGEMENT
 // ===========================================================
+let allAdmins = [];
+// EDIT DITO: ito ang listahan ng mga pages na pwedeng bigyan ng access ang isang staff
+const ADMIN_PERMISSION_OPTIONS = [
+  ['products', 'Products'], ['categories', 'Categories'], ['inventory', 'Inventory'],
+  ['customers', 'Customers'], ['orders', 'Orders'], ['reports', 'Sales Reports'], ['reviews', 'Reviews'],
+];
+const PERMISSION_LABELS = Object.fromEntries(ADMIN_PERMISSION_OPTIONS);
+
+function showApiError(message, title) {
+  openPopup({ type: 'error', title: title || 'This could not be done', message, buttons: [{ text: 'OK', value: true }] });
+}
+
 async function loadAdmins() {
   const tbody = document.getElementById('adminsTableBody');
   try {
     const res = await fetch(API.AUTH + '/admins', { headers: authHeaders() });
-    const admins = await res.json();
+    allAdmins = await res.json();
+    if (!res.ok) throw new Error(allAdmins.error || 'Could not load the admins.');
     const currentAdmin = getCurrentAdmin();
 
-    tbody.innerHTML = admins.map(a => `
-      <tr>
-        <td>${a.full_name}</td>
-        <td>${a.username}</td>
-        <td>${a.email || '-'}</td>
-        <td>${a.role === 'super_admin' ? '<span class="badge badge-active">Super Admin</span>' : 'Staff'}</td>
-        <td>${a.role === 'super_admin' ? 'Lahat' : (a.permissions || '').split(',').filter(Boolean).join(', ') || '-'}</td>
+    tbody.innerHTML = allAdmins.map(a => {
+      const isYou = currentAdmin && currentAdmin.id === a.admin_id;
+      const permissions = (a.permissions || '').split(',').filter(Boolean);
+      const access = a.role === 'super_admin'
+        ? '<span class="badge badge-plain badge-active">Full access</span>'
+        : (permissions.map(p => `<span class="pill">${orderEsc(PERMISSION_LABELS[p] || p)}</span>`).join('') || '<span class="muted-small">No sections yet</span>');
+      return `
+      <tr data-admin-id="${a.admin_id}">
         <td>
-          ${currentAdmin && currentAdmin.id === a.admin_id
-            ? '<span style="color:var(--text-muted); font-size:13px;">You</span>'
-            : `<button class="icon-btn danger" onclick="deleteAdmin(${a.admin_id})">Delete</button>`}
+          <div class="inv-product">
+            ${avatarPicture(a.profile_photo, a.full_name)}
+            <div>
+              <b>${orderEsc(a.full_name)}</b>${isYou ? ' <span class="badge badge-active">You</span>' : ''}
+              <div class="muted-small">${orderEsc(a.email || 'No email')}${a.email ? (a.email_verified ? ' · verified' : ' · not verified') : ''}</div>
+            </div>
+          </div>
         </td>
-      </tr>
-    `).join('') || '<tr><td colspan="6">No admins yet.</td></tr>';
+        <td>@${orderEsc(a.username)}</td>
+        <td>${a.role === 'super_admin' ? '<span class="badge badge-active">Super Admin</span>' : '<span class="badge">Staff</span>'}</td>
+        <td>${access}</td>
+        <td>
+          <button class="icon-btn" onclick="openEditAdmin(${a.admin_id})">Edit</button>
+          ${isYou ? '' : `<button class="icon-btn" onclick="openResetPassword(${a.admin_id})">Reset password</button>
+          <button class="icon-btn danger" onclick="deleteAdmin(${a.admin_id})">Delete</button>`}
+        </td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="5">No admins yet.</td></tr>';
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="4">Cannot reach the auth service. Please try again.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5">Cannot reach the auth service. Please try again.</td></tr>';
   }
 }
 
 function getCurrentAdmin() {
   return JSON.parse(sessionStorage.getItem('fitora_admin') || 'null');
+}
+
+// The Super Admin changes the details of an admin (name, username, email, role, and what they can open)
+function openEditAdmin(adminId) {
+  const a = allAdmins.find(x => x.admin_id === adminId);
+  if (!a) return;
+  const me = getCurrentAdmin();
+  const isSelf = !!me && me.id === adminId;
+  const current = (a.permissions || '').split(',').filter(Boolean);
+  document.querySelector('#modalOverlay .modal').classList.remove('modal-wide');
+  modalTitle.textContent = 'Edit admin';
+  modalForm.innerHTML = `
+    <label>Full name</label>
+    <input type="text" id="f_admin_name" value="${orderEsc(a.full_name)}" maxlength="100" required>
+
+    <label>Username</label>
+    <input type="text" id="f_admin_username" value="${orderEsc(a.username)}" maxlength="30" required>
+
+    <label>Email</label>
+    <input type="email" id="f_admin_email" value="${orderEsc(a.email || '')}">
+    <small class="muted-small">If the email is changed, it has to be verified again.</small>
+
+    <label>Role</label>
+    <select id="f_admin_role" ${isSelf ? 'disabled' : ''}>
+      <option value="staff" ${a.role === 'staff' ? 'selected' : ''}>Staff (limited access)</option>
+      <option value="super_admin" ${a.role === 'super_admin' ? 'selected' : ''}>Super Admin (full access)</option>
+    </select>
+    ${isSelf ? '<small class="muted-small">You cannot change your own role.</small>' : ''}
+
+    <div id="permissionsGroup" class="${a.role === 'super_admin' ? 'hidden' : ''}">
+      <label>Sections this staff member can open</label>
+      ${ADMIN_PERMISSION_OPTIONS.map(([key, label]) => `
+        <label style="display:flex; align-items:center; gap:8px; font-weight:normal; margin-top:6px;">
+          <input type="checkbox" class="perm-checkbox" value="${key}" ${current.includes(key) ? 'checked' : ''}> ${label}
+        </label>`).join('')}
+    </div>
+    <p class="muted-small" style="margin-top:12px;">The changes work right away.</p>
+
+    <div class="modal-actions">
+      <button type="button" class="secondary-btn" onclick="closeModal()">Cancel</button>
+      <button type="submit" class="primary-btn">Save changes</button>
+    </div>`;
+
+  const roleSelect = document.getElementById('f_admin_role');
+  roleSelect.addEventListener('change', () => document.getElementById('permissionsGroup').classList.toggle('hidden', roleSelect.value === 'super_admin'));
+
+  modalForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const role = isSelf ? a.role : roleSelect.value;
+    const payload = {
+      full_name: document.getElementById('f_admin_name').value.trim(),
+      username: document.getElementById('f_admin_username').value.trim(),
+      email: document.getElementById('f_admin_email').value.trim(),
+      role,
+      permissions: role === 'staff' ? Array.from(document.querySelectorAll('.perm-checkbox:checked')).map(cb => cb.value) : [],
+    };
+    try {
+      const res = await fetch(API.AUTH + '/admins/' + adminId, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(payload) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not save the changes.');
+      closeModal();
+      await loadAdmins(); // the table is updated first, then the message
+      showToast('Admin account updated.');
+      if (isSelf) refreshAdminSession();
+    } catch (err) {
+      showApiError(err.message);
+    }
+  };
+  modalOverlay.classList.remove('hidden');
+}
+
+// The Super Admin sets a new password for another admin (staff cannot change their own)
+function openResetPassword(adminId) {
+  const a = allAdmins.find(x => x.admin_id === adminId);
+  if (!a) return;
+  document.querySelector('#modalOverlay .modal').classList.remove('modal-wide');
+  modalTitle.textContent = 'Reset password - ' + a.full_name;
+  modalForm.innerHTML = `
+    <p class="muted-small">Choose a new password for <b>${orderEsc(a.full_name)}</b> (@${orderEsc(a.username)}). Then tell them the new password.</p>
+    <label>New password</label>
+    <input type="password" id="f_new_password" autocomplete="new-password" required>
+    <label>Type it again</label>
+    <input type="password" id="f_new_password2" autocomplete="new-password" required>
+    <small class="muted-small">At least 8 characters, with uppercase and lowercase letters, a number, and a special character (for example !@#$%).</small>
+    <div class="modal-actions">
+      <button type="button" class="secondary-btn" onclick="closeModal()">Cancel</button>
+      <button type="submit" class="primary-btn">Save new password</button>
+    </div>`;
+  modalForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const password = document.getElementById('f_new_password').value;
+    if (password !== document.getElementById('f_new_password2').value) { showApiError('The two passwords are not the same.', 'Check the password'); return; }
+    try {
+      const res = await fetch(API.AUTH + '/admins/' + adminId + '/password', { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ new_password: password }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not save the password.');
+      closeModal();
+      openPopup({ type: 'success', title: 'Password changed', message: data.message, buttons: [{ text: 'OK', value: true }] });
+    } catch (err) {
+      showApiError(err.message);
+    }
+  };
+  modalOverlay.classList.remove('hidden');
 }
 
 document.getElementById('addAdminBtn').addEventListener('click', () => {
@@ -2060,6 +2254,7 @@ document.getElementById('addAdminBtn').addEventListener('click', () => {
 
     <label>Password</label>
     <input type="password" id="f_admin_password" required>
+    <small class="muted-small">At least 8 characters, with uppercase and lowercase letters, a number, and a special character (for example !@#$%).</small>
 
     <label>Role</label>
     <select id="f_admin_role">
@@ -2115,19 +2310,223 @@ document.getElementById('addAdminBtn').addEventListener('click', () => {
     }
 
     closeModal();
-    loadAdmins();
+    await loadAdmins();
+    showToast('Admin account added.');
   };
 
   modalOverlay.classList.remove('hidden');
 });
 
 async function deleteAdmin(adminId) {
-  if (!(await askConfirm('Are you sure you want to delete this admin account?'))) return;
-  const res = await fetch(API.AUTH + '/admins/' + adminId, { method: 'DELETE', headers: authHeaders() });
-  const data = await res.json();
-  if (!res.ok) {
-    alert(data.error || 'Could not delete.');
-    return;
+  const a = allAdmins.find(x => x.admin_id === adminId);
+  const name = a ? a.full_name : 'this admin';
+  if (!(await askConfirm(`Delete the admin account of ${name}? They will be logged out right away and can no longer log in. This cannot be undone.`))) return;
+  try {
+    const res = await fetch(API.AUTH + '/admins/' + adminId, { method: 'DELETE', headers: authHeaders() });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not delete the account.');
+    await loadAdmins();
+    showToast('Admin account deleted.');
+  } catch (err) {
+    showApiError(err.message);
   }
-  loadAdmins();
+}
+
+// ===========================================================
+// MY PROFILE (the admin who is logged in)
+// ===========================================================
+let profileState = null;
+
+async function loadProfile() {
+  const box = document.getElementById('profileContent');
+  box.innerHTML = '<p class="detail-loading">Loading...</p>';
+  try {
+    const res = await fetch(API.AUTH + '/admins/me', { headers: authHeaders() });
+    const me = await res.json();
+    if (!res.ok) throw new Error(me.error || 'Could not load your profile.');
+    profileState = me;
+    saveAdminSession(me);
+    renderAdminChip();
+    renderProfile(me);
+  } catch (err) {
+    box.innerHTML = `<div class="detail-error">${orderEsc(err.message)}</div>`;
+  }
+}
+
+// Saves the name, the email, and / or the photo. Whatever is not sent stays as it is.
+async function saveProfile(me, changes) {
+  const body = { full_name: me.fullName, email: me.email || '', ...changes };
+  const res = await fetch(API.AUTH + '/admins/me', { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Could not save your profile.');
+  profileState = data.admin;
+  saveAdminSession(data.admin);
+  renderAdminChip();
+  renderProfile(data.admin);
+  return data;
+}
+
+function renderProfile(me) {
+  const box = document.getElementById('profileContent');
+  const isSuper = me.role === 'super_admin';
+  const photo = me.profilePhoto
+    ? `<img class="profile-photo" alt="" src="${orderEsc(me.profilePhoto.includes('/image/upload/') ? me.profilePhoto.replace('/image/upload/', '/image/upload/c_fill,w_240,h_240,q_auto/') : me.profilePhoto)}">`
+    : `<span class="profile-photo profile-initials">${orderEsc(initialsOf(me.fullName))}</span>`;
+  const emailBadge = me.email
+    ? (me.emailVerified ? '<span class="badge badge-plain badge-active">Email verified</span>' : '<span class="badge badge-plain badge-pending">Email not verified</span>')
+    : '<span class="badge badge-plain">No email yet</span>';
+
+  const emailCard = !me.email
+    ? '<p class="muted-small">Add your email in "Personal details" and save it. Then you can verify it here.</p>'
+    : me.emailVerified
+      ? `<div class="detail-note detail-note-ok">Your email <b>${orderEsc(me.email)}</b> is verified.</div>`
+      : `<p class="muted-small">We will send a 6-digit code to <b>${orderEsc(me.email)}</b>.</p>
+         <div class="profile-actions"><button type="button" class="secondary-btn" id="sendCodeBtn">Send verification code</button></div>
+         <div id="codeBox" class="hidden">
+           <label>6-digit code</label>
+           <input type="text" id="p_code" inputmode="numeric" maxlength="6" placeholder="123456">
+           <div class="profile-actions"><button type="button" class="primary-btn" id="verifyCodeBtn">Verify email</button></div>
+         </div>`;
+
+  const passwordCard = isSuper
+    ? `<form id="passwordForm">
+         <label>Current password</label>
+         <input type="password" id="p_current" autocomplete="current-password" required>
+         <label>New password</label>
+         <input type="password" id="p_new" autocomplete="new-password" required>
+         <label>Type the new password again</label>
+         <input type="password" id="p_new2" autocomplete="new-password" required>
+         <small class="muted-small">At least 8 characters, with uppercase and lowercase letters, a number, and a special character (for example !@#$%).</small>
+         <div class="profile-actions"><button type="submit" class="primary-btn">Change password</button></div>
+       </form>`
+    : `<div class="lock-note"><span class="lock-icon">🔒</span><div><b>Only the Super Admin can change passwords.</b><div class="muted-small" style="color:inherit; opacity:0.85;">If you forgot your password or want a new one, please ask the Super Admin to reset it for you.</div></div></div>`;
+
+  const permissions = (me.permissions || []);
+  const accessCard = isSuper
+    ? '<div class="detail-note detail-note-ok">You have full access to every section.</div>'
+    : `<p class="muted-small" style="margin-bottom:10px;">The Dashboard and My profile are always open to you.</p>${permissions.map(p => `<span class="pill">${orderEsc(PERMISSION_LABELS[p] || p)}</span>`).join('') || '<span class="muted-small">No other sections yet. Ask the Super Admin.</span>'}`;
+
+  box.innerHTML = `
+    <div class="profile-grid">
+      <div class="card profile-hero">
+        <div class="profile-photo-wrap">${photo}</div>
+        <div class="profile-hero-info">
+          <div class="detail-code">${orderEsc(me.fullName)}</div>
+          <div class="muted-small">@${orderEsc(me.username)} · Member since ${orderEsc(new Date(me.createdAt).toLocaleDateString())}</div>
+          <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;"><span class="badge ${isSuper ? 'badge-active' : ''}">${isSuper ? 'Super Admin' : 'Staff'}</span>${emailBadge}</div>
+          <div class="profile-actions">
+            <button type="button" class="primary-btn" id="profilePhotoBtn">${me.profilePhoto ? 'Change photo' : 'Add photo'}</button>
+            ${me.profilePhoto ? '<button type="button" class="secondary-btn" id="profilePhotoRemove">Remove photo</button>' : ''}
+            <input type="file" id="profilePhotoInput" accept="image/*" class="hidden">
+          </div>
+          <p class="muted-small" id="profilePhotoStatus"></p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Personal details</h3>
+        <form id="profileForm">
+          <label>Full name</label>
+          <input type="text" id="p_name" value="${orderEsc(me.fullName)}" maxlength="100" required>
+          <label>Email</label>
+          <input type="email" id="p_email" value="${orderEsc(me.email || '')}">
+          <small class="muted-small">If you change your email, it has to be verified again.</small>
+          <label>Username</label>
+          <input type="text" value="${orderEsc(me.username)}" disabled>
+          <small class="muted-small">Only the Super Admin can change a username.</small>
+          <div class="profile-actions"><button type="submit" class="primary-btn">Save changes</button></div>
+        </form>
+      </div>
+
+      <div class="card"><h3>Email verification</h3>${emailCard}</div>
+      <div class="card"><h3>Password</h3>${passwordCard}</div>
+      <div class="card"><h3>What I can open</h3>${accessCard}</div>
+    </div>`;
+
+  // ----- the photo -----
+  const input = document.getElementById('profilePhotoInput');
+  const status = document.getElementById('profilePhotoStatus');
+  document.getElementById('profilePhotoBtn').addEventListener('click', () => input.click());
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { status.textContent = 'Please choose a picture (an image file).'; return; }
+    if (file.size > 5 * 1024 * 1024) { status.textContent = 'The picture is too big. Please choose one under 5 MB.'; return; }
+    status.textContent = 'Uploading...';
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+      const upload = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, { method: 'POST', body: formData });
+      const uploaded = await upload.json();
+      if (!uploaded.secure_url) throw new Error((uploaded.error && uploaded.error.message) || 'The picture could not be uploaded.');
+      await saveProfile(me, { profile_photo: uploaded.secure_url });
+      showToast('Your photo was saved.');
+    } catch (err) {
+      status.textContent = err.message;
+    }
+  });
+  const remove = document.getElementById('profilePhotoRemove');
+  if (remove) remove.addEventListener('click', async () => {
+    try { await saveProfile(me, { profile_photo: '' }); showToast('Your photo was removed.'); } catch (err) { showApiError(err.message); }
+  });
+
+  // ----- the details -----
+  document.getElementById('profileForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const data = await saveProfile(me, { full_name: document.getElementById('p_name').value.trim(), email: document.getElementById('p_email').value.trim() });
+      showToast(data.emailChanged ? 'Saved. Please verify your new email.' : 'Your profile was saved.');
+    } catch (err) {
+      showApiError(err.message);
+    }
+  });
+
+  // ----- the email code -----
+  const sendBtn = document.getElementById('sendCodeBtn');
+  if (sendBtn) {
+    sendBtn.addEventListener('click', async () => {
+      sendBtn.disabled = true;
+      try {
+        const res = await fetch(API.AUTH + '/admins/me/send-code', { method: 'POST', headers: authHeaders() });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Could not send the code.');
+        document.getElementById('codeBox').classList.remove('hidden');
+        showToast(data.message || 'We sent you a code.');
+      } catch (err) {
+        showApiError(err.message);
+      }
+      sendBtn.disabled = false;
+    });
+    document.getElementById('verifyCodeBtn').addEventListener('click', async () => {
+      try {
+        const res = await fetch(API.AUTH + '/admins/me/verify-code', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ code: document.getElementById('p_code').value.trim() }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Could not verify the code.');
+        showToast('Your email is verified.');
+        loadProfile();
+      } catch (err) {
+        showApiError(err.message);
+      }
+    });
+  }
+
+  // ----- the password (Super Admin only) -----
+  const passwordForm = document.getElementById('passwordForm');
+  if (passwordForm) {
+    passwordForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const next = document.getElementById('p_new').value;
+      if (next !== document.getElementById('p_new2').value) { showApiError('The two new passwords are not the same.', 'Check the password'); return; }
+      try {
+        const res = await fetch(API.AUTH + '/admins/me/password', { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ current_password: document.getElementById('p_current').value, new_password: next }) });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Could not change the password.');
+        passwordForm.reset();
+        showToast('Your password was changed.');
+      } catch (err) {
+        showApiError(err.message);
+      }
+    });
+  }
 }

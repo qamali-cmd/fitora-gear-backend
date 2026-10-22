@@ -878,10 +878,14 @@ app.put('/api/auth/admins/me/password', verifyToken, async (req, res) => {
   try {
     const currentPassword = String((req.body || {}).current_password || '');
     const newPassword = String((req.body || {}).new_password || '');
-    if (!STRONG_PASSWORD_RE.test(newPassword)) return res.status(400).json({ error: PASSWORD_MESSAGE });
 
-    const [rows] = await pool.query('SELECT password FROM admins WHERE admin_id = ?', [req.admin.adminId]);
+    const [rows] = await pool.query('SELECT password, role FROM admins WHERE admin_id = ?', [req.admin.adminId]);
     if (rows.length === 0) return res.status(404).json({ error: 'Admin not found.' });
+    // Staff cannot change their own password: the Super Admin does it for them
+    if (rows[0].role !== 'super_admin') {
+      return res.status(403).json({ error: 'Only the Super Admin can change a password. Please ask the Super Admin to change it for you.', code: 'SUPER_ADMIN_ONLY' });
+    }
+    if (!STRONG_PASSWORD_RE.test(newPassword)) return res.status(400).json({ error: PASSWORD_MESSAGE });
     if (!(await bcrypt.compare(currentPassword, rows[0].password))) {
       return res.status(400).json({ error: 'Your current password is incorrect.' });
     }
@@ -906,29 +910,101 @@ app.get('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) => 
   }
 });
 
+// The modules a staff member can be given access to
+const ADMIN_PERMISSION_KEYS = ['products', 'categories', 'inventory', 'customers', 'orders', 'reports', 'reviews'];
+const ADMIN_USERNAME_RE = /^[A-Za-z0-9_.-]{3,30}$/;
+
+// Checks the fields of an admin account (used when adding and when editing)
+function checkAdminFields(body) {
+  const fullName = String(body.full_name || '').trim();
+  const username = String(body.username || '').trim();
+  const email = String(body.email || '').trim().toLowerCase();
+  const role = body.role === 'super_admin' ? 'super_admin' : 'staff';
+  const permissions = Array.isArray(body.permissions) ? body.permissions : [];
+
+  if (fullName.length < 2 || fullName.length > 100) return { error: 'Full name must be 2-100 characters.' };
+  if (!ADMIN_USERNAME_RE.test(username)) return { error: 'The username must be 3-30 characters: letters, numbers, dots, dashes, or underscores.' };
+  if (email && (!EMAIL_RE.test(email) || email.length > 100)) return { error: 'Please enter a valid email address.' };
+  if (permissions.some((p) => !ADMIN_PERMISSION_KEYS.includes(p))) return { error: 'One of the modules is not valid.' };
+
+  return { data: { fullName, username, email: email || null, role, permissions: role === 'staff' ? [...new Set(permissions)].join(',') || null : null } };
+}
+
+async function countSuperAdmins() {
+  const [rows] = await pool.query("SELECT COUNT(*) AS n FROM admins WHERE role = 'super_admin'");
+  return Number(rows[0].n);
+}
+
 // POST /api/auth/admins - gumawa ng bagong admin account
 app.post('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) => {
   try {
-    const { username, password, full_name, email, role, permissions } = req.body;
+    const body = req.body || {};
+    const parsed = checkAdminFields(body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const password = String(body.password || '');
+    if (!STRONG_PASSWORD_RE.test(password)) return res.status(400).json({ error: PASSWORD_MESSAGE });
 
-    if (!username || !password || !full_name) {
-      return res.status(400).json({ error: 'Username, password, and full name are required.' });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const finalRole = role === 'super_admin' ? 'super_admin' : 'staff';
-    const permissionsStr = Array.isArray(permissions) ? permissions.join(',') : null;
-
+    const d = parsed.data;
     const [result] = await pool.query(
       'INSERT INTO admins (username, password, full_name, email, role, permissions) VALUES (?, ?, ?, ?, ?, ?)',
-      [username, hashedPassword, full_name, email || null, finalRole, permissionsStr]
+      [d.username, await bcrypt.hash(password, 10), d.fullName, d.email, d.role, d.permissions]
     );
-
-    res.status(201).json({ admin_id: result.insertId, username, full_name, email, role: finalRole, permissions });
+    res.status(201).json({ admin_id: result.insertId, username: d.username, full_name: d.fullName, email: d.email, role: d.role, permissions: parsePermissions(d.permissions) });
   } catch (err) {
-    if (err.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ error: 'This username is already taken.' });
+    if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: 'This username is already taken.' });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// PUT /api/auth/admins/:id - the Super Admin edits the details of another admin
+app.put('/api/auth/admins/:id', verifyToken, requireSuperAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });
+    const parsed = checkAdminFields(req.body || {});
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const d = parsed.data;
+
+    const [rows] = await pool.query('SELECT admin_id, role, email FROM admins WHERE admin_id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Admin not found.' });
+    const target = rows[0];
+
+    if (id === req.admin.adminId && d.role !== 'super_admin') {
+      return res.status(400).json({ error: 'You cannot remove your own Super Admin role.' });
     }
+    if (target.role === 'super_admin' && d.role !== 'super_admin' && (await countSuperAdmins()) <= 1) {
+      return res.status(400).json({ error: 'There must always be at least one Super Admin.' });
+    }
+
+    const currentEmail = target.email ? String(target.email).toLowerCase() : null;
+    const emailChanged = d.email !== currentEmail;
+    await pool.query(
+      'UPDATE admins SET full_name = ?, username = ?, email = ?, role = ?, permissions = ?, email_verified = IF(?, 0, email_verified) WHERE admin_id = ?',
+      [d.fullName, d.username, d.email, d.role, d.permissions, emailChanged ? 1 : 0, id]
+    );
+    res.json({ message: 'The admin account was updated.', admin: adminProfile(await loadAdmin(id)) });
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: 'This username is already taken.' });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// PUT /api/auth/admins/:id/password - the Super Admin sets a new password for another admin
+app.put('/api/auth/admins/:id/password', verifyToken, requireSuperAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });
+    if (id === req.admin.adminId) return res.status(400).json({ error: 'Use "Change password" in your profile to change your own password.' });
+    const newPassword = String((req.body || {}).new_password || '');
+    if (!STRONG_PASSWORD_RE.test(newPassword)) return res.status(400).json({ error: PASSWORD_MESSAGE });
+
+    const [rows] = await pool.query('SELECT admin_id FROM admins WHERE admin_id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Admin not found.' });
+    await pool.query('UPDATE admins SET password = ? WHERE admin_id = ?', [await bcrypt.hash(newPassword, 10), id]);
+    res.json({ message: 'The new password was saved. Tell the admin the new password.' });
+  } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
@@ -937,11 +1013,22 @@ app.post('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) =>
 // DELETE /api/auth/admins/:id - tanggalin ang isang admin account
 app.delete('/api/auth/admins/:id', verifyToken, requireSuperAdmin, async (req, res) => {
   try {
-    if (parseInt(req.params.id) === req.admin.adminId) {
-      return res.status(400).json({ error: 'You cannot delete your own account.' });
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });
+    if (id === req.admin.adminId) return res.status(400).json({ error: 'You cannot delete your own account.' });
+
+    const [rows] = await pool.query('SELECT admin_id, role FROM admins WHERE admin_id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Admin not found.' });
+    if (rows[0].role === 'super_admin' && (await countSuperAdmins()) <= 1) {
+      return res.status(400).json({ error: 'There must always be at least one Super Admin.' });
     }
-    await pool.query('DELETE FROM admins WHERE admin_id = ?', [req.params.id]);
-    res.json({ message: 'Admin account deleted.' });
+
+    // the records the admin made stay, but they no longer point to the deleted account
+    for (const sql of ['UPDATE stock_logs SET admin_id = NULL WHERE admin_id = ?', 'DELETE FROM admin_notification_reads WHERE admin_id = ?', 'DELETE FROM email_verifications WHERE admin_id = ?']) {
+      try { await pool.query(sql, [id]); } catch (err) { /* that table may be arranged differently: not important */ }
+    }
+    await pool.query('DELETE FROM admins WHERE admin_id = ?', [id]);
+    res.json({ message: 'Admin account deleted. They are logged out right away.' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
