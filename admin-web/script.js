@@ -2435,29 +2435,48 @@ function openConfirmWindow(payload, info) {
 function renderProfile(me) {
   const box = document.getElementById('profileContent');
   const isSuper = me.role === 'super_admin';
-  // A Super Admin who has an email confirms changes with a code sent to it
-  const needsCode = isSuper && !!me.email;
-  const blocked = needsCode && !me.emailVerified; // the code cannot be sent to an email that is not verified yet
+  const hasEmail = !!me.email;
+  const verified = hasEmail && !!me.emailVerified;
+  // A Super Admin with a VERIFIED email confirms changes with a code sent to it.
+  // If the email is not verified (or missing, or a wrong address), no code could arrive, so the name and the
+  // email can be fixed directly here; the new email is then verified, and after that the codes protect the account.
+  const needsCode = isSuper && verified;
+  const fixing = isSuper && !verified;
+
   const photo = me.profilePhoto
     ? `<img class="profile-photo" alt="" src="${orderEsc(me.profilePhoto.includes('/image/upload/') ? me.profilePhoto.replace('/image/upload/', '/image/upload/c_fill,w_240,h_240,q_auto/') : me.profilePhoto)}">`
     : `<span class="profile-photo profile-initials">${orderEsc(initialsOf(me.fullName))}</span>`;
-  const emailBadge = me.email
-    ? (me.emailVerified ? '<span class="badge badge-plain badge-active">Email verified</span>' : '<span class="badge badge-plain badge-pending">Email not verified</span>')
+  const emailBadge = hasEmail
+    ? (verified ? '<span class="badge badge-plain badge-active">Email verified</span>' : '<span class="badge badge-plain badge-pending">Email not verified</span>')
     : '<span class="badge badge-plain">No email yet</span>';
 
-  const verifyFirst = '<div class="lock-note" style="margin-top:14px;"><span class="lock-icon">🔒</span><div><b>Verify your email first.</b><div class="muted-small" style="color:inherit; opacity:0.85;">Changes to your details and password are confirmed with a code sent to your email. Use "Email verification" on this page.</div></div></div>';
+  // ----- a message on top when the Super Admin's email is not verified yet -----
+  const alertBox = !fixing ? '' : `
+    <div class="profile-alert">
+      <span class="profile-alert-icon">!</span>
+      <div class="profile-alert-text">
+        <b>${hasEmail ? 'Verify your email to secure your account' : 'Add your email to secure your account'}</b>
+        <p>${hasEmail
+          ? `We cannot send you confirmation codes until <b>${orderEsc(me.email)}</b> is verified. If this address is not real or not yours, press <b>Change email</b> first.`
+          : 'Press Add email, type your real email address, and save it. Then verify it with the code we send you.'}</p>
+      </div>
+      <div class="profile-alert-actions">
+        ${hasEmail ? '<button type="button" class="primary-btn" id="alertVerifyBtn">Send verification code</button>' : ''}
+        <button type="button" class="secondary-btn" id="alertEditBtn">${hasEmail ? 'Change email' : 'Add email'}</button>
+      </div>
+    </div>`;
 
   // ----- the personal details: shown, or (after Edit) a form -----
-  const detailsCard = profileEditing
+  const detailsBody = profileEditing
     ? `<form id="profileForm">
          <label>Full name</label>
          <input type="text" id="p_name" value="${orderEsc(me.fullName)}" maxlength="100" required>
          <label>Email</label>
          <input type="email" id="p_email" value="${orderEsc(me.email || '')}">
-         <small class="muted-small">${needsCode ? 'Your changes are confirmed with a code sent to your current email.' : 'If you change your email, it has to be verified again.'}</small>
+         <small class="muted-small">${needsCode ? 'Your changes are confirmed with a code sent to your current email.' : fixing ? 'Type your real email address. You will verify it next, with a code we send to it.' : 'If you change your email, you will have to verify it again.'}</small>
          <label>Username</label>
          <input type="text" id="p_username" value="${orderEsc(me.username)}" maxlength="30" ${needsCode ? '' : 'disabled'}>
-         <small class="muted-small">${needsCode ? 'Letters, numbers, dots, dashes, or underscores (3-30).' : isSuper ? 'Add and verify your email first, then you can change your username.' : 'Only the Super Admin can change a username.'}</small>
+         <small class="muted-small">${needsCode ? 'Letters, numbers, dots, dashes, or underscores (3-30).' : isSuper ? 'You can change your username after your email is verified.' : 'Only the Super Admin can change a username.'}</small>
          <div class="profile-actions">
            <button type="submit" class="primary-btn">Save changes</button>
            <button type="button" class="secondary-btn" id="cancelEditBtn">Cancel</button>
@@ -2468,22 +2487,28 @@ function renderProfile(me) {
          <div class="info-row"><span>Email</span><b>${orderEsc(me.email || 'Not set')}</b></div>
          <div class="info-row"><span>Username</span><b>@${orderEsc(me.username)}</b></div>
        </div>
-       ${blocked ? verifyFirst : needsCode ? '<p class="muted-small" style="margin-top:12px;">For your security, changes to your name, username, or email are confirmed with a code sent to your email.</p>' : ''}`;
+       ${needsCode ? '<p class="card-note">For your security, changes to your name, username, or email are confirmed with a code sent to your email.</p>' : ''}`;
 
-  const emailCard = !me.email
-    ? '<p class="muted-small">Add your email in "Personal details" (press Edit) and save it. Then you can verify it here.</p>'
-    : me.emailVerified
+  // ----- email verification -----
+  const emailBody = !hasEmail
+    ? `<p class="muted-small">You have no email yet. Add one so you can confirm changes and keep your account safe.</p>
+       <div class="profile-actions"><button type="button" class="secondary-btn" id="addEmailBtn">Add email</button></div>`
+    : verified
       ? `<div class="detail-note detail-note-ok">Your email <b>${orderEsc(me.email)}</b> is verified.</div>`
-      : `<p class="muted-small">We will send a 6-digit code to <b>${orderEsc(me.email)}</b>.</p>
-         <div class="profile-actions"><button type="button" class="secondary-btn" id="sendCodeBtn">Send verification code</button></div>
+      : `<p class="muted-small">We will send a 6-digit code to <b>${orderEsc(me.email)}</b>. Is it the wrong address? Press Change email.</p>
+         <div class="profile-actions">
+           <button type="button" class="primary-btn" id="sendCodeBtn">Send verification code</button>
+           <button type="button" class="secondary-btn" id="changeEmailBtn">Change email</button>
+         </div>
          <div id="codeBox" class="hidden">
            <label>6-digit code</label>
-           <input type="text" id="p_code" inputmode="numeric" maxlength="6" placeholder="123456">
+           <input type="text" id="p_code" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code">
            <div class="profile-actions"><button type="button" class="primary-btn" id="verifyCodeBtn">Verify email</button></div>
          </div>`;
 
-  const passwordDisabled = !needsCode || blocked ? 'disabled' : '';
-  const passwordCard = isSuper
+  // ----- password -----
+  const passwordDisabled = needsCode ? '' : 'disabled';
+  const passwordBody = isSuper
     ? `<form id="passwordForm">
          <label>Current password</label>
          <input type="password" id="p_current" autocomplete="current-password" ${passwordDisabled} required>
@@ -2491,45 +2516,51 @@ function renderProfile(me) {
          <input type="password" id="p_new" autocomplete="new-password" ${passwordDisabled} required>
          <label>Type the new password again</label>
          <input type="password" id="p_new2" autocomplete="new-password" ${passwordDisabled} required>
-         <small class="muted-small">At least 8 characters, with uppercase and lowercase letters, a number, and a special character (for example !@#$%). The change is confirmed with a code sent to your email.</small>
-         ${!me.email ? '<p class="muted-small" style="margin-top:10px;">Add your email and verify it first. The password change is confirmed with a code sent to it.</p>' : blocked ? verifyFirst : ''}
+         <small class="muted-small">At least 8 characters, with uppercase and lowercase letters, a number, and a special character (for example !@#$%).</small>
+         <p class="card-note">${needsCode ? 'The change is confirmed with a code sent to your email.' : 'Verify your email first. Password changes are confirmed with a code sent to it.'}</p>
          <div class="profile-actions"><button type="submit" class="primary-btn" ${passwordDisabled}>Change password</button></div>
        </form>`
     : `<div class="lock-note"><span class="lock-icon">🔒</span><div><b>Only the Super Admin can change passwords.</b><div class="muted-small" style="color:inherit; opacity:0.85;">If you forgot your password or want a new one, please ask the Super Admin to reset it for you.</div></div></div>`;
 
   const permissions = (me.permissions || []);
-  const accessCard = isSuper
+  const accessBody = isSuper
     ? '<div class="detail-note detail-note-ok">You have full access to every section.</div>'
     : `<p class="muted-small" style="margin-bottom:10px;">The Dashboard and My profile are always open to you.</p>${permissions.map(p => `<span class="pill">${orderEsc(PERMISSION_LABELS[p] || p)}</span>`).join('') || '<span class="muted-small">No other sections yet. Ask the Super Admin.</span>'}`;
 
   box.innerHTML = `
     <div class="profile-grid">
-      <div class="card profile-hero">
+      <div class="profile-banner">
         <div class="profile-photo-wrap">${photo}</div>
-        <div class="profile-hero-info">
-          <div class="detail-code">${orderEsc(me.fullName)}</div>
-          <div class="muted-small">@${orderEsc(me.username)} · Member since ${orderEsc(new Date(me.createdAt).toLocaleDateString())}</div>
-          <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;"><span class="badge ${isSuper ? 'badge-active' : ''}">${isSuper ? 'Super Admin' : 'Staff'}</span>${emailBadge}</div>
-          <div class="profile-actions">
-            <button type="button" class="primary-btn" id="profilePhotoBtn">${me.profilePhoto ? 'Change photo' : 'Add photo'}</button>
-            ${me.profilePhoto ? '<button type="button" class="secondary-btn" id="profilePhotoRemove">Remove photo</button>' : ''}
-            <input type="file" id="profilePhotoInput" accept="image/*" class="hidden">
+        <div class="profile-banner-info">
+          <div class="profile-name">${orderEsc(me.fullName)}</div>
+          <div class="profile-sub">@${orderEsc(me.username)} · Member since ${orderEsc(new Date(me.createdAt).toLocaleDateString())}</div>
+          <div class="profile-badges"><span class="badge ${isSuper ? 'badge-active' : ''}">${isSuper ? 'Super Admin' : 'Staff'}</span>${emailBadge}</div>
+        </div>
+        <div class="profile-banner-actions">
+          <button type="button" class="primary-btn" id="profilePhotoBtn">${me.profilePhoto ? 'Change photo' : 'Add photo'}</button>
+          ${me.profilePhoto ? '<button type="button" class="secondary-btn" id="profilePhotoRemove">Remove photo</button>' : ''}
+          <input type="file" id="profilePhotoInput" accept="image/*" class="hidden">
+          <p class="profile-photo-status" id="profilePhotoStatus"></p>
+        </div>
+      </div>
+
+      ${alertBox}
+
+      <div class="profile-main">
+        <div class="card">
+          <div class="card-head">
+            <h3>Personal details</h3>
+            ${profileEditing ? '' : '<button type="button" class="secondary-btn" id="editDetailsBtn">Edit</button>'}
           </div>
-          <p class="muted-small" id="profilePhotoStatus"></p>
+          ${detailsBody}
         </div>
+        <div class="card"><div class="card-head"><h3>Password</h3></div>${passwordBody}</div>
       </div>
 
-      <div class="card">
-        <div class="card-head">
-          <h3>Personal details</h3>
-          ${profileEditing ? '' : `<button type="button" class="secondary-btn" id="editDetailsBtn" ${blocked ? 'disabled' : ''}>Edit</button>`}
-        </div>
-        ${detailsCard}
+      <div class="profile-side">
+        <div class="card" id="emailCard"><div class="card-head"><h3>Email verification</h3></div>${emailBody}</div>
+        <div class="card"><div class="card-head"><h3>What I can open</h3></div>${accessBody}</div>
       </div>
-
-      <div class="card"><h3>Email verification</h3>${emailCard}</div>
-      <div class="card"><h3>Password</h3>${passwordCard}</div>
-      <div class="card"><h3>What I can open</h3>${accessCard}</div>
     </div>`;
 
   // ----- the photo (no code needed) -----
@@ -2562,8 +2593,11 @@ function renderProfile(me) {
   });
 
   // ----- the details: Edit, Cancel, Save -----
-  const editBtn = document.getElementById('editDetailsBtn');
-  if (editBtn) editBtn.addEventListener('click', () => { profileEditing = true; renderProfile(me); });
+  const startEdit = () => { profileEditing = true; renderProfile(me); };
+  ['editDetailsBtn', 'alertEditBtn', 'changeEmailBtn', 'addEmailBtn'].forEach(id => {
+    const button = document.getElementById(id);
+    if (button) button.addEventListener('click', startEdit);
+  });
   const cancelBtn = document.getElementById('cancelEditBtn');
   if (cancelBtn) cancelBtn.addEventListener('click', () => { profileEditing = false; renderProfile(me); });
   const profileForm = document.getElementById('profileForm');
@@ -2585,7 +2619,7 @@ function renderProfile(me) {
       } else {
         profileEditing = false;
         const data = await saveProfile(me, { full_name: name, email });
-        showToast(data.emailChanged ? 'Saved. Please verify your new email.' : 'Your profile was saved.');
+        showToast(data.emailChanged ? 'Saved. Now verify your new email.' : 'Your profile was saved.');
       }
     } catch (err) {
       showApiError(err.message);
@@ -2595,19 +2629,23 @@ function renderProfile(me) {
   // ----- the email code (to verify the email) -----
   const sendBtn = document.getElementById('sendCodeBtn');
   if (sendBtn) {
-    sendBtn.addEventListener('click', async () => {
+    const sendCode = async () => {
       sendBtn.disabled = true;
       try {
         const res = await fetch(API.AUTH + '/admins/me/send-code', { method: 'POST', headers: authHeaders() });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || 'Could not send the code.');
         document.getElementById('codeBox').classList.remove('hidden');
-        showToast(data.message || 'We sent you a code.');
+        document.getElementById('p_code').focus();
+        showToast(data.message || 'We sent you a code. Check your inbox (and the spam folder).');
       } catch (err) {
         showApiError(err.message);
       }
       sendBtn.disabled = false;
-    });
+    };
+    sendBtn.addEventListener('click', sendCode);
+    const alertVerify = document.getElementById('alertVerifyBtn');
+    if (alertVerify) alertVerify.addEventListener('click', () => { document.getElementById('emailCard').scrollIntoView({ behavior: 'smooth', block: 'center' }); sendCode(); });
     document.getElementById('verifyCodeBtn').addEventListener('click', async () => {
       try {
         const res = await fetch(API.AUTH + '/admins/me/verify-code', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ code: document.getElementById('p_code').value.trim() }) });

@@ -840,8 +840,10 @@ app.put('/api/auth/admins/me', verifyToken, async (req, res) => {
     const verified = emailChanged ? 0 : (current.email_verified ? 1 : 0);
 
     // The Super Admin confirms a new name or email with a code sent to the email (the photo needs no code).
-    // A Super Admin who has no email at all yet can add one here: there is nothing to send a code to.
-    if (current.role === 'super_admin' && currentEmail && (emailChanged || fullName !== current.full_name)) {
+    // That only works when the email is VERIFIED. If it is not verified (or there is no email yet, or it is a
+    // wrong / non-existing address), a code could never arrive, so the name and the email can be fixed here directly.
+    // The new email must then be verified with a code sent to it, and only after that do the codes protect the account.
+    if (current.role === 'super_admin' && currentEmail && current.email_verified && (emailChanged || fullName !== current.full_name)) {
       return res.status(403).json({ error: 'To change your name or email, please confirm it with the code that is sent to your email.', code: 'CONFIRM_REQUIRED' });
     }
 
