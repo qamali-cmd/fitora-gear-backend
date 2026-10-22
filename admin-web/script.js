@@ -21,6 +21,9 @@ const CLOUDINARY_UPLOAD_PRESET = 'IMAGES';
 
 // The state of the My profile page. These are declared HERE, at the top, because the page can be opened
 // right when the site loads (for example by refreshing while on My profile).
+let allOrders = []; // the orders of the Orders page
+const reportState = { preset: '7', from: '', to: '' }; // the period of the Sales Reports page
+let reportRequest = 0;
 let profileState = null;
 let profileEditing = false; // the personal details are only shown, until the Edit button is pressed
 
@@ -332,7 +335,7 @@ function navigateTo(page) {
   if (page === 'categories') loadCategories(true);
   if (page === 'inventory') loadInventory();
   if (page === 'customers') loadCustomers();
-  if (page === 'orders') loadOrders();
+  if (page === 'orders') loadOrders(true);
   if (page === 'reports') loadReports();
   if (page === 'reviews') loadReviews();
   if (page === 'admins') loadAdmins();
@@ -505,6 +508,17 @@ document.getElementById('inventorySearch').addEventListener('input', renderInven
 document.getElementById('inventoryFilter').addEventListener('change', renderInventoryTable);
 document.getElementById('reviewStatusFilter').addEventListener('change', renderReviews);
 document.getElementById('productAudienceFilter').addEventListener('change', renderProductsTable);
+
+// the Orders page
+['orderSearch'].forEach(id => document.getElementById(id).addEventListener('input', () => renderOrders()));
+['orderStatusFilter', 'orderPaymentFilter', 'orderFrom', 'orderTo'].forEach(id => document.getElementById(id).addEventListener('change', () => renderOrders()));
+document.getElementById('orderClear').addEventListener('click', () => { resetOrderFilterInputs(); renderOrders(); });
+document.getElementById('orderExport').addEventListener('click', exportOrdersCsv);
+
+// the Reports page
+document.querySelectorAll('#reportRanges .chip').forEach(chip => chip.addEventListener('click', () => choosePreset(chip.dataset.range)));
+document.getElementById('reportApply').addEventListener('click', applyCustomRange);
+document.getElementById('reportExport').addEventListener('click', exportReportCsv);
 document.getElementById('productSort').addEventListener('change', renderProductsTable);
 
 async function deleteProduct(id) {
@@ -1223,15 +1237,86 @@ async function markRefunded(orderId) {
   }
 }
 
-async function loadOrders() {
+// Loads the orders. When the Orders page is opened (resetFilters), the filters start empty again;
+// after an action (ship, cancel...) the list is refreshed with the same filters.
+async function loadOrders(resetFilters) {
   const tbody = document.getElementById('ordersTableBody');
   try {
     const res = await fetch(API.ORDERS + '/orders', { headers: authHeaders() });
     const orders = await res.json();
     if (!res.ok) throw new Error(orders.error || 'Could not load the orders.');
     ordersCache = Object.fromEntries(orders.map(o => [o.order_id, o]));
+    allOrders = orders;
+    if (resetFilters) resetOrderFilterInputs();
+    renderOrders();
+  } catch (err) {
+    tbody.innerHTML = '<tr><td colspan="5">Cannot reach the order service. Please try again.</td></tr>';
+  }
+}
 
-    tbody.innerHTML = orders.map(o => {
+// ----- the filters of the Orders page -----
+function pad2(n) { return String(n).padStart(2, '0'); }
+function localDateKey(value) { const d = new Date(value); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+
+function currentOrderFilters() {
+  return {
+    q: document.getElementById('orderSearch').value.toLowerCase().trim(),
+    status: document.getElementById('orderStatusFilter').value,
+    payment: document.getElementById('orderPaymentFilter').value,
+    from: document.getElementById('orderFrom').value,
+    to: document.getElementById('orderTo').value,
+  };
+}
+
+function orderMatches(o, f) {
+  if (f.status === 'cancel_requests') { if (o.cancel_request_status !== 'requested') return false; }
+  else if (f.status !== 'all' && o.status !== f.status) return false;
+  if (f.payment === 'cod' && o.payment_method !== 'cod') return false;
+  if (f.payment === 'gcash' && o.payment_method !== 'gcash') return false;
+  if (f.payment === 'awaiting' && !(o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment')) return false;
+  if (f.payment === 'refund_pending' && o.payment_status !== 'refund_pending') return false;
+  if (f.payment === 'refunded' && o.payment_status !== 'refunded') return false;
+  const day = localDateKey(o.order_date);
+  if (f.from && day < f.from) return false;
+  if (f.to && day > f.to) return false;
+  if (f.q) {
+    const text = [o.order_code, '#' + o.order_id, o.customer_name, o.items_summary, o.courier, o.tracking_number].join(' ').toLowerCase();
+    if (!text.includes(f.q)) return false;
+  }
+  return true;
+}
+
+function resetOrderFilterInputs() {
+  document.getElementById('orderSearch').value = '';
+  document.getElementById('orderStatusFilter').value = 'all';
+  document.getElementById('orderPaymentFilter').value = 'all';
+  document.getElementById('orderFrom').value = '';
+  document.getElementById('orderTo').value = '';
+}
+
+// the status choices show how many orders each one has
+function updateOrderStatusCounts() {
+  const box = document.getElementById('orderStatusFilter');
+  const count = (test) => allOrders.filter(test).length;
+  const labels = {
+    all: `All statuses (${allOrders.length})`,
+    pending: `Pending (${count(o => o.status === 'pending')})`,
+    processing: `Processing (${count(o => o.status === 'processing')})`,
+    shipped: `Shipped (${count(o => o.status === 'shipped')})`,
+    completed: `Completed (${count(o => o.status === 'completed')})`,
+    cancelled: `Cancelled (${count(o => o.status === 'cancelled')})`,
+    cancel_requests: `Cancel requests (${count(o => o.cancel_request_status === 'requested')})`,
+  };
+  Array.from(box.options).forEach(option => { option.textContent = labels[option.value]; });
+}
+
+function renderOrders() {
+  const tbody = document.getElementById('ordersTableBody');
+  const filters = currentOrderFilters();
+  updateOrderStatusCounts();
+  const list = allOrders.filter(o => orderMatches(o, filters));
+
+    tbody.innerHTML = list.map(o => {
       const next = ORDER_NEXT_STATUS[o.status] || [];
       // a GCash order cannot move forward until the payment is received
       const awaitingPayment = o.status === 'pending' && o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment';
@@ -1279,10 +1364,62 @@ async function loadOrders() {
         <td>${statusControl}${paymentLine(o)}${shipNote}${note}${refundButton}${cancelButton}${slipButton}</td>
         <td>${new Date(o.order_date).toLocaleDateString()}</td>
       </tr>`;
-    }).join('') || '<tr><td colspan="5">No orders yet.</td></tr>';
-  } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="5">Cannot reach the order service. Please try again.</td></tr>';
+    }).join('') || `<tr><td colspan="5">${allOrders.length ? 'No orders match these filters.' : 'No orders yet.'}</td></tr>`;
+
+  const filtered = list.length !== allOrders.length;
+  document.getElementById('orderCount').textContent = allOrders.length
+    ? `Showing ${list.length} of ${allOrders.length} order${allOrders.length === 1 ? '' : 's'}${filtered ? ' (filtered)' : ''}`
+    : '';
+}
+
+// ----- CSV files (Excel can open them) -----
+// A cell of a CSV file. Text that Excel could read as a formula (it starts with = + - @) is made safe.
+function csvText(value) {
+  let text = String(value == null ? '' : value);
+  if (/^[=+\-@\t\r]/.test(text)) text = "'" + text;
+  return /[",\r\n]/.test(text) || /^\s|\s$/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+const csvNumber = (value) => (value == null || value === '' || Number.isNaN(Number(value)) ? '' : String(Math.round(Number(value) * 100) / 100));
+
+function downloadFile(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+const PAYMENT_WORDS = { cod: 'Cash on Delivery', gcash: 'GCash' };
+const PAYMENT_STATUS_WORDS = { unpaid: 'Unpaid', awaiting_payment: 'Awaiting payment', paid: 'Paid', refund_pending: 'Refund pending', refunded: 'Refunded' };
+
+// Saves the orders that are shown now (with the filters) as a CSV file
+function exportOrdersCsv() {
+  const list = allOrders.filter(o => orderMatches(o, currentOrderFilters()));
+  if (list.length === 0) { showToast('There are no orders to export.', true); return; }
+  const lines = [['Order code', 'Date', 'Customer', 'Items', 'Subtotal', 'Shipping fee', 'Shipping discount', 'Total', 'Payment method', 'Payment status', 'Order status', 'Courier', 'Tracking number'].join(',')];
+  for (const o of list) {
+    const d = new Date(o.order_date);
+    lines.push([
+      csvText(o.order_code || '#' + o.order_id),
+      csvText(`${localDateKey(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`),
+      csvText(o.customer_name || ''),
+      csvText(o.items_summary || ''),
+      csvNumber(o.subtotal_amount != null ? o.subtotal_amount : o.total_amount),
+      csvNumber(o.shipping_fee),
+      csvNumber(o.shipping_discount),
+      csvNumber(o.total_amount),
+      csvText(PAYMENT_WORDS[o.payment_method] || o.payment_method || ''),
+      csvText(PAYMENT_STATUS_WORDS[o.payment_status] || o.payment_status || ''),
+      csvText(o.status ? o.status.charAt(0).toUpperCase() + o.status.slice(1) : ''),
+      csvText(o.courier || ''),
+      csvText(o.tracking_number || ''),
+    ].join(','));
   }
+  downloadFile(`fitora-orders_${localDateKey(new Date())}.csv`, new Blob(['\uFEFF' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' }));
+  showToast(`${list.length} order${list.length === 1 ? '' : 's'} saved to a CSV file.`);
 }
 
 // Sends one of the order actions and shows the server's message if it is refused
@@ -1475,65 +1612,155 @@ function openDeclineModal(orderId) {
 // ===========================================================
 // SALES REPORTS
 // ===========================================================
+function niceDay(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// The first and last day of a ready-made period (the days of this computer, which is Philippine time)
+function presetRange(preset) {
+  const today = new Date();
+  const back = (n) => { const d = new Date(today); d.setDate(d.getDate() - n); return localDateKey(d); };
+  if (preset === 'today') return { from: localDateKey(today), to: localDateKey(today) };
+  if (preset === '7') return { from: back(6), to: localDateKey(today) };
+  if (preset === '30') return { from: back(29), to: localDateKey(today) };
+  if (preset === 'month') return { from: localDateKey(new Date(today.getFullYear(), today.getMonth(), 1)), to: localDateKey(today) };
+  if (preset === 'lastmonth') return { from: localDateKey(new Date(today.getFullYear(), today.getMonth() - 1, 1)), to: localDateKey(new Date(today.getFullYear(), today.getMonth(), 0)) };
+  return null;
+}
+
+function syncReportToolbar() {
+  document.querySelectorAll('#reportRanges .chip').forEach(chip => chip.classList.toggle('active', chip.dataset.range === reportState.preset));
+  document.getElementById('reportCustom').classList.toggle('hidden', reportState.preset !== 'custom');
+  document.getElementById('reportFrom').value = reportState.from;
+  document.getElementById('reportTo').value = reportState.to;
+  document.getElementById('reportRangeLabel').textContent = reportState.from === reportState.to
+    ? niceDay(reportState.from)
+    : `${niceDay(reportState.from)} - ${niceDay(reportState.to)}`;
+}
+
+function choosePreset(preset) {
+  if (preset === 'custom') {
+    reportState.preset = 'custom';
+    syncReportToolbar();
+    return;
+  }
+  const range = presetRange(preset);
+  Object.assign(reportState, { preset, from: range.from, to: range.to });
+  syncReportToolbar();
+  fetchReport();
+}
+
+function applyCustomRange() {
+  const from = document.getElementById('reportFrom').value;
+  const to = document.getElementById('reportTo').value;
+  if (!from || !to) { showToast('Please choose the start date and the end date.', true); return; }
+  if (from > to) { showToast('The start date must not be after the end date.', true); return; }
+  const days = Math.round((new Date(to) - new Date(from)) / 86400000) + 1;
+  if (days > 366) { showToast('Please choose a period of at most 1 year.', true); return; }
+  Object.assign(reportState, { preset: 'custom', from, to });
+  syncReportToolbar();
+  fetchReport();
+}
+
 async function loadReports() {
+  if (!reportState.from) Object.assign(reportState, { preset: '7' }, presetRange('7'));
+  syncReportToolbar();
+  await fetchReport();
+}
+
+async function fetchReport() {
+  const mine = ++reportRequest; // if the answer of an older choice arrives late, it is ignored
   try {
-    const [summary, salesByDay, bestSellers, byCategory] = await Promise.all([
-      fetch(API.ORDERS + '/orders/reports/summary', { headers: authHeaders() }).then(r => r.json()),
-      fetch(API.ORDERS + '/orders/reports/sales-by-day', { headers: authHeaders() }).then(r => r.json()),
-      fetch(API.ORDERS + '/orders/reports/best-sellers', { headers: authHeaders() }).then(r => r.json()),
-      fetch(API.ORDERS + '/orders/reports/by-category', { headers: authHeaders() }).then(r => r.json()),
-    ]);
-
-    document.getElementById('reportCompletedOrders').textContent = summary.completedOrders;
-    document.getElementById('reportTotalRevenue').textContent = '₱' + Number(summary.totalRevenue).toLocaleString();
-    document.getElementById('reportAvgOrder').textContent = '₱' + Number(summary.avgOrderValue).toFixed(2);
-
-    renderSalesChart(salesByDay);
-
-    const bestList = document.getElementById('bestSellersList');
-    bestList.innerHTML = bestSellers.map(p =>
-      `<li><span>${p.product_name}</span><span>${p.totalSold} sold - ₱${Number(p.totalRevenue).toLocaleString()}</span></li>`
-    ).join('') || '<li>No sales data yet.</li>';
-
-    const catList = document.getElementById('categoryRevenueList');
-    catList.innerHTML = byCategory.map(c =>
-      `<li><span>${c.category_name}</span><span>₱${Number(c.revenue).toLocaleString()}</span></li>`
-    ).join('') || '<li>No categories yet.</li>';
-
+    const res = await fetch(`${API.ORDERS}/orders/reports/overview?from=${reportState.from}&to=${reportState.to}`, { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not load the report.');
+    if (mine !== reportRequest) return;
+    renderReport(data);
   } catch (err) {
-    console.error(err);
+    if (mine === reportRequest) showToast(err.message, true);
   }
 }
 
-// Gumagawa ng simpleng bar chart gamit ang div height - walang chart library
-function renderSalesChart(salesByDay) {
+function peso0(n) { const v = Number(n || 0); return '₱' + v.toLocaleString('en-US', { minimumFractionDigits: Number.isInteger(v) ? 0 : 2, maximumFractionDigits: 2 }); } // whole pesos without decimals, money with cents always with 2
+
+// a list where every line has a bar showing its share
+function meterList(rows, empty) {
+  if (!rows.length) return `<li>${empty}</li>`;
+  const max = Math.max(...rows.map(r => r.value), 1);
+  return rows.map(r => `
+    <li class="meter-row">
+      <div class="meter-text"><span>${orderEsc(r.label)}</span><span>${orderEsc(r.text)}</span></div>
+      <div class="meter"><i class="${r.tone || ''}" style="width:${Math.max((r.value / max) * 100, r.value > 0 ? 2 : 0)}%"></i></div>
+    </li>`).join('');
+}
+
+function renderReport(data) {
+  const s = data.summary;
+  document.getElementById('reportTotalRevenue').textContent = peso0(s.revenue);
+  document.getElementById('reportOrders').textContent = s.orders.toLocaleString();
+  document.getElementById('reportCompletedOrders').textContent = s.completedOrders.toLocaleString();
+  document.getElementById('reportCancelled').textContent = s.cancelledOrders.toLocaleString();
+  document.getElementById('reportItemsSold').textContent = s.itemsSold.toLocaleString();
+  document.getElementById('reportAvgOrder').textContent = peso0(s.avgOrderValue);
+
+  renderSalesChart(data.byDay);
+  document.getElementById('reportEmpty').classList.toggle('hidden', s.orders + s.cancelledOrders > 0);
+
+  document.getElementById('bestSellersList').innerHTML = data.bestSellers.map((p, i) =>
+    `<li><span><b class="rank">${i + 1}</b> ${orderEsc(p.product_name)}</span><span>${p.totalSold} sold · ${peso0(p.totalRevenue)}</span></li>`
+  ).join('') || '<li>No sales in this period.</li>';
+
+  document.getElementById('categoryRevenueList').innerHTML = meterList(
+    data.byCategory.map(c => ({ label: c.category_name, text: peso0(c.revenue), value: c.revenue })), 'No sales in this period.');
+
+  const statusLabels = { pending: 'Pending', processing: 'Processing', shipped: 'Shipped', completed: 'Completed', cancelled: 'Cancelled' };
+  document.getElementById('statusBreakdown').innerHTML = meterList(
+    Object.keys(statusLabels).map(k => ({ label: statusLabels[k], text: String(data.byStatus[k]), value: data.byStatus[k], tone: k === 'cancelled' ? 'meter-red' : '' })),
+    'No orders in this period.');
+
+  const paymentLabels = { cod: 'Cash on Delivery', gcash: 'GCash' };
+  document.getElementById('paymentBreakdown').innerHTML = meterList(
+    data.byPayment.map(p => ({ label: paymentLabels[p.method], text: `${p.orders} order${p.orders === 1 ? '' : 's'} · ${peso0(p.revenue)}`, value: p.revenue })),
+    'No orders in this period.');
+}
+
+// Bars for every day of the period (no chart library)
+function renderSalesChart(byDay) {
   const chart = document.getElementById('salesChart');
-
-  // Punuan ang huling 7 araw kahit walang sales sa ibang araw (para consistent yung x-axis)
-  const days = [];
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    const dayStr = d.toISOString().split('T')[0];
-    const found = salesByDay.find(s => s.day.split('T')[0] === dayStr);
-    days.push({
-      label: d.toLocaleDateString('en-US', { weekday: 'short' }),
-      revenue: found ? Number(found.revenue) : 0,
-    });
-  }
-
-  const maxRevenue = Math.max(...days.map(d => d.revenue), 1); // hindi hahati sa zero
-
-  chart.innerHTML = days.map(d => {
-    const heightPct = Math.max((d.revenue / maxRevenue) * 100, 2);
+  const count = byDay.length;
+  const max = Math.max(...byDay.map(d => d.revenue), 1);
+  const step = count <= 14 ? 1 : Math.ceil(count / 12); // with many days, only some of the names are written
+  chart.classList.toggle('dense', count > 14);
+  chart.innerHTML = byDay.map((d, i) => {
+    const [y, m, day] = d.day.split('-').map(Number);
+    const date = new Date(y, m - 1, day);
+    const label = count <= 7
+      ? date.toLocaleDateString('en-US', { weekday: 'short', day: 'numeric' })
+      : count <= 31 ? String(day) : date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    const heightPct = d.revenue > 0 ? Math.max((d.revenue / max) * 100, 3) : 1;
     return `
-      <div class="bar-col">
-        <div class="bar-value">${d.revenue > 0 ? '₱' + d.revenue.toLocaleString() : ''}</div>
-        <div class="bar" style="height:${heightPct}%"></div>
-        <div class="bar-label">${d.label}</div>
-      </div>
-    `;
+      <div class="bar-col" title="${orderEsc(niceDay(d.day))}: ${orderEsc(peso0(d.revenue))} (${d.orders} order${d.orders === 1 ? '' : 's'})">
+        <div class="bar-value">${count <= 10 && d.revenue > 0 ? peso0(d.revenue) : ''}</div>
+        <div class="bar ${d.revenue === 0 ? 'bar-empty' : ''}" style="height:${heightPct}%"></div>
+        <div class="bar-label">${i % step === 0 ? orderEsc(label) : ''}</div>
+      </div>`;
   }).join('');
+}
+
+// Downloads the CSV file of the orders of the chosen period (made by the server)
+async function exportReportCsv() {
+  try {
+    const res = await fetch(`${API.ORDERS}/orders/reports/export?from=${reportState.from}&to=${reportState.to}`, { headers: authHeaders() });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Could not make the CSV file.');
+    }
+    downloadFile(`fitora-orders_${reportState.from}_to_${reportState.to}.csv`, await res.blob());
+    showToast('The CSV file was saved.');
+  } catch (err) {
+    showToast(err.message, true);
+  }
 }
 
 // ===========================================================

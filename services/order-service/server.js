@@ -474,6 +474,206 @@ app.get('/api/orders/stats/summary', verifyToken, async (req, res) => {
 // SALES REPORTS
 // =====================================================
 
+// =====================================================
+// SALES REPORT FOR A CHOSEN PERIOD (+ the CSV file of it)
+// The days are the SHOP's days (Philippine time), not the database's. The orders of the period are read with
+// a simple query and added up here, so the numbers can be checked and tested.
+// Revenue = the value of the items of the orders that were NOT cancelled (the shipping fee is not included).
+// =====================================================
+const SHOP_UTC_OFFSET_HOURS = 8; // EDIT DITO: the Philippines is UTC+8. Reports group the days by this time.
+const pad2 = (n) => String(n).padStart(2, '0');
+
+function shopDateKey(date) {
+  const d = new Date(new Date(date).getTime() + SHOP_UTC_OFFSET_HOURS * 3600000);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+function shopDateTime(date) {
+  const d = new Date(new Date(date).getTime() + SHOP_UTC_OFFSET_HOURS * 3600000);
+  return `${shopDateKey(date)} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;
+}
+function isRealDate(key) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(key))) return false;
+  const d = new Date(key + 'T00:00:00Z');
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === key;
+}
+function addDays(key, n) {
+  const d = new Date(key + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function daysBetween(from, to) {
+  return Math.round((new Date(to + 'T00:00:00Z') - new Date(from + 'T00:00:00Z')) / 86400000) + 1;
+}
+
+// Reads ?from=YYYY-MM-DD&to=YYYY-MM-DD (without them: the last 7 days)
+function reportRange(query) {
+  let from = query && query.from;
+  let to = query && query.to;
+  if (!from && !to) {
+    to = shopDateKey(Date.now());
+    from = addDays(to, -6);
+  }
+  if (!isRealDate(from) || !isRealDate(to)) return { error: 'Please choose a valid start date and end date.' };
+  if (from > to) return { error: 'The start date must not be after the end date.' };
+  const days = daysBetween(from, to);
+  if (days > 366) return { error: 'Please choose a period of at most 1 year.' };
+  return { from, to, days };
+}
+
+// The orders (and their items) of the period. The query reads one day more on each side, because the
+// database may keep its time differently; then only the orders that are really in the shop's days are kept.
+async function loadReportData(range) {
+  const start = `${addDays(range.from, -1)} 00:00:00`;
+  const end = `${addDays(range.to, 2)} 00:00:00`;
+  const [candidates] = await pool.query(
+    `SELECT o.order_id, o.order_code, o.order_date, o.status, o.payment_method, o.payment_status, o.total_amount,
+            o.subtotal_amount, o.shipping_fee, o.shipping_discount, o.courier, o.tracking_number, u.full_name AS customer_name
+     FROM orders o LEFT JOIN users u ON u.user_id = o.user_id
+     WHERE o.order_date >= ? AND o.order_date < ?
+     ORDER BY o.order_date ASC, o.order_id ASC`,
+    [start, end]
+  );
+  const orders = candidates.filter((o) => {
+    const key = shopDateKey(o.order_date);
+    return key >= range.from && key <= range.to;
+  });
+  if (orders.length === 0) return { orders, items: [] };
+  const [rows] = await pool.query(
+    `SELECT oi.order_id, oi.product_id, oi.quantity, oi.price, p.product_name, c.category_name
+     FROM order_items oi
+     JOIN orders o ON o.order_id = oi.order_id
+     LEFT JOIN products p ON p.product_id = oi.product_id
+     LEFT JOIN categories c ON c.category_id = p.category_id
+     WHERE o.order_date >= ? AND o.order_date < ?
+     ORDER BY oi.order_item_id`,
+    [start, end]
+  );
+  const wanted = new Set(orders.map((o) => o.order_id));
+  return { orders, items: rows.filter((i) => wanted.has(i.order_id)) };
+}
+
+const orderValue = (o) => Number(o.subtotal_amount != null ? o.subtotal_amount : o.total_amount) || 0;
+
+function buildOverview(range, orders, items) {
+  const counted = orders.filter((o) => o.status !== 'cancelled');
+  const countedIds = new Set(counted.map((o) => o.order_id));
+  const countedItems = items.filter((i) => countedIds.has(i.order_id));
+
+  const revenue = counted.reduce((sum, o) => sum + orderValue(o), 0);
+  const summary = {
+    orders: counted.length,
+    completedOrders: orders.filter((o) => o.status === 'completed').length,
+    cancelledOrders: orders.length - counted.length,
+    itemsSold: countedItems.reduce((sum, i) => sum + Number(i.quantity), 0),
+    revenue: round2(revenue),
+    avgOrderValue: counted.length ? round2(revenue / counted.length) : 0,
+  };
+
+  // one entry for every day of the period, even a day without sales
+  const perDay = new Map();
+  for (let i = 0; i < range.days; i++) perDay.set(addDays(range.from, i), { day: addDays(range.from, i), revenue: 0, orders: 0 });
+  for (const o of counted) {
+    const entry = perDay.get(shopDateKey(o.order_date));
+    entry.revenue += orderValue(o);
+    entry.orders += 1;
+  }
+  const byDay = [...perDay.values()].map((d) => ({ ...d, revenue: round2(d.revenue) }));
+
+  const products = new Map();
+  const categories = new Map();
+  for (const i of countedItems) {
+    const money = Number(i.quantity) * Number(i.price);
+    const p = products.get(i.product_id) || { product_name: i.product_name || 'Removed product', totalSold: 0, totalRevenue: 0 };
+    p.totalSold += Number(i.quantity);
+    p.totalRevenue += money;
+    products.set(i.product_id, p);
+    const name = i.category_name || 'Uncategorized';
+    categories.set(name, (categories.get(name) || 0) + money);
+  }
+  const bestSellers = [...products.values()]
+    .sort((a, b) => b.totalSold - a.totalSold || b.totalRevenue - a.totalRevenue)
+    .slice(0, 10)
+    .map((p) => ({ ...p, totalRevenue: round2(p.totalRevenue) }));
+  const byCategory = [...categories.entries()].map(([category_name, money]) => ({ category_name, revenue: round2(money) })).sort((a, b) => b.revenue - a.revenue);
+
+  const payment = { cod: { method: 'cod', orders: 0, revenue: 0 }, gcash: { method: 'gcash', orders: 0, revenue: 0 } };
+  for (const o of counted) {
+    const entry = payment[o.payment_method === 'gcash' ? 'gcash' : 'cod'];
+    entry.orders += 1;
+    entry.revenue += orderValue(o);
+  }
+  const byPayment = Object.values(payment).map((p) => ({ ...p, revenue: round2(p.revenue) }));
+
+  const byStatus = { pending: 0, processing: 0, shipped: 0, completed: 0, cancelled: 0 };
+  for (const o of orders) if (o.status in byStatus) byStatus[o.status] += 1;
+
+  return { range, summary, byDay, bestSellers, byCategory, byPayment, byStatus };
+}
+
+app.get('/api/orders/reports/overview', verifyToken, requirePermission('reports'), async (req, res) => {
+  try {
+    const range = reportRange(req.query);
+    if (range.error) return res.status(400).json({ error: range.error });
+    const { orders, items } = await loadReportData(range);
+    res.json(buildOverview(range, orders, items));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// A cell of a CSV file. Text that Excel could read as a formula (it starts with = + - @) is made safe.
+function csvText(value) {
+  let text = String(value == null ? '' : value);
+  if (/^[=+\-@\t\r]/.test(text)) text = "'" + text;
+  return /[",\r\n]/.test(text) || /^\s|\s$/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+const csvNumber = (value) => (value == null || value === '' || Number.isNaN(Number(value)) ? '' : String(round2(Number(value))));
+const PAYMENT_LABELS = { cod: 'Cash on Delivery', gcash: 'GCash' };
+const PAYMENT_STATUS_LABELS = { unpaid: 'Unpaid', awaiting_payment: 'Awaiting payment', paid: 'Paid', refund_pending: 'Refund pending', refunded: 'Refunded' };
+
+function buildOrdersCsv(orders, items) {
+  const itemsByOrder = new Map();
+  for (const i of items) {
+    if (!itemsByOrder.has(i.order_id)) itemsByOrder.set(i.order_id, []);
+    itemsByOrder.get(i.order_id).push(`${i.quantity}x ${i.product_name || 'Removed product'}`);
+  }
+  const lines = [['Order code', 'Date (shop time)', 'Customer', 'Items', 'Subtotal', 'Shipping fee', 'Shipping discount', 'Total', 'Payment method', 'Payment status', 'Order status', 'Courier', 'Tracking number'].join(',')];
+  for (const o of orders) {
+    lines.push([
+      csvText(o.order_code || '#' + o.order_id),
+      csvText(shopDateTime(o.order_date)),
+      csvText(o.customer_name || ''),
+      csvText((itemsByOrder.get(o.order_id) || []).join('; ')),
+      csvNumber(o.subtotal_amount != null ? o.subtotal_amount : o.total_amount),
+      csvNumber(o.shipping_fee),
+      csvNumber(o.shipping_discount),
+      csvNumber(o.total_amount),
+      csvText(PAYMENT_LABELS[o.payment_method] || o.payment_method || ''),
+      csvText(PAYMENT_STATUS_LABELS[o.payment_status] || o.payment_status || ''),
+      csvText(o.status ? o.status.charAt(0).toUpperCase() + o.status.slice(1) : ''),
+      csvText(o.courier || ''),
+      csvText(o.tracking_number || ''),
+    ].join(','));
+  }
+  return '\uFEFF' + lines.join('\r\n') + '\r\n'; // the first mark lets Excel read the peso sign and other letters correctly
+}
+
+app.get('/api/orders/reports/export', verifyToken, requirePermission('reports'), async (req, res) => {
+  try {
+    const range = reportRange(req.query);
+    if (range.error) return res.status(400).json({ error: range.error });
+    const { orders, items } = await loadReportData(range);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="fitora-orders_${range.from}_to_${range.to}.csv"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(buildOrdersCsv(orders, items));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
 app.get('/api/orders/reports/summary', verifyToken, requirePermission('reports'), async (req, res) => {
   try {
     const [[{ completedOrders }]] = await pool.query(
@@ -531,11 +731,11 @@ app.get('/api/orders/reports/best-sellers', verifyToken, requirePermission('repo
 app.get('/api/orders/reports/by-category', verifyToken, requirePermission('reports'), async (req, res) => {
   try {
     const [rows] = await pool.query(`
-      SELECT c.category_name, COALESCE(SUM(oi.quantity * oi.price), 0) AS revenue
+      SELECT c.category_name, COALESCE(SUM(CASE WHEN o.order_id IS NOT NULL AND o.status != 'cancelled' THEN oi.quantity * oi.price END), 0) AS revenue
       FROM categories c
       LEFT JOIN products p ON p.category_id = c.category_id
       LEFT JOIN order_items oi ON oi.product_id = p.product_id
-      LEFT JOIN orders o ON oi.order_id = o.order_id AND o.status != 'cancelled'
+      LEFT JOIN orders o ON oi.order_id = o.order_id
       GROUP BY c.category_id, c.category_name
       ORDER BY revenue DESC
     `);

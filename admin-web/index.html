@@ -269,7 +269,36 @@
     <section id="page-orders" class="page">
       <div class="section-header">
         <h2>Orders</h2>
+        <button id="orderExport" class="secondary-btn">Export CSV</button>
       </div>
+
+      <div class="filter-bar">
+        <input type="text" id="orderSearch" placeholder="Search code, customer, item...">
+        <select id="orderStatusFilter">
+          <option value="all">All statuses</option>
+          <option value="pending">Pending</option>
+          <option value="processing">Processing</option>
+          <option value="shipped">Shipped</option>
+          <option value="completed">Completed</option>
+          <option value="cancelled">Cancelled</option>
+          <option value="cancel_requests">Cancel requests</option>
+        </select>
+        <select id="orderPaymentFilter">
+          <option value="all">All payments</option>
+          <option value="cod">Cash on Delivery</option>
+          <option value="gcash">GCash</option>
+          <option value="awaiting">GCash: waiting for payment</option>
+          <option value="refund_pending">Refund pending</option>
+          <option value="refunded">Refunded</option>
+        </select>
+        <div class="date-range">
+          <label class="date-field"><span>From</span><input type="date" id="orderFrom"></label>
+          <label class="date-field"><span>To</span><input type="date" id="orderTo"></label>
+        </div>
+        <button id="orderClear" class="secondary-btn">Clear</button>
+      </div>
+      <p class="result-count" id="orderCount"></p>
+
       <div class="table-wrap">
         <table>
           <thead>
@@ -290,27 +319,42 @@
 
     <!-- ---------------- SALES REPORTS PAGE ---------------- -->
     <section id="page-reports" class="page">
+      <div class="card report-toolbar">
+        <div class="range-chips" id="reportRanges">
+          <button type="button" class="chip" data-range="today">Today</button>
+          <button type="button" class="chip" data-range="7">Last 7 days</button>
+          <button type="button" class="chip" data-range="30">Last 30 days</button>
+          <button type="button" class="chip" data-range="month">This month</button>
+          <button type="button" class="chip" data-range="lastmonth">Last month</button>
+          <button type="button" class="chip" data-range="custom">Choose dates</button>
+        </div>
+        <div class="range-custom hidden" id="reportCustom">
+          <label class="date-field"><span>From</span><input type="date" id="reportFrom"></label>
+          <label class="date-field"><span>To</span><input type="date" id="reportTo"></label>
+          <button type="button" id="reportApply" class="primary-btn">Show report</button>
+        </div>
+        <div class="report-toolbar-bottom">
+          <span class="range-label" id="reportRangeLabel"></span>
+          <button type="button" id="reportExport" class="secondary-btn">Export CSV</button>
+        </div>
+      </div>
+
       <div class="stats-row">
-        <div class="stat-card">
-          <h3>Completed orders</h3>
-          <div class="value" id="reportCompletedOrders">--</div>
-        </div>
-        <div class="stat-card">
-          <h3>Total revenue</h3>
-          <div class="value" id="reportTotalRevenue">--</div>
-        </div>
-        <div class="stat-card">
-          <h3>Avg. order value</h3>
-          <div class="value" id="reportAvgOrder">--</div>
-        </div>
+        <div class="stat-card"><h3>Revenue</h3><div class="value" id="reportTotalRevenue">--</div></div>
+        <div class="stat-card"><h3>Orders</h3><div class="value" id="reportOrders">--</div></div>
+        <div class="stat-card"><h3>Completed</h3><div class="value" id="reportCompletedOrders">--</div></div>
+        <div class="stat-card"><h3>Cancelled</h3><div class="value" id="reportCancelled">--</div></div>
+        <div class="stat-card"><h3>Items sold</h3><div class="value" id="reportItemsSold">--</div></div>
+        <div class="stat-card"><h3>Avg. order value</h3><div class="value" id="reportAvgOrder">--</div></div>
       </div>
 
-      <div class="card" style="margin-bottom:16px;">
-        <h3>Sales, last 7 days</h3>
+      <div class="card" style="margin-bottom:18px;">
+        <h3>Sales per day</h3>
         <div id="salesChart" class="bar-chart"></div>
+        <p id="reportEmpty" class="report-empty hidden">There are no orders in this period.</p>
       </div>
 
-      <div class="dashboard-columns">
+      <div class="dashboard-columns" style="margin-bottom:18px;">
         <div class="card">
           <h3>Best-selling products</h3>
           <ul id="bestSellersList" class="simple-list"><li>Loading...</li></ul>
@@ -320,6 +364,19 @@
           <ul id="categoryRevenueList" class="simple-list"><li>Loading...</li></ul>
         </div>
       </div>
+
+      <div class="dashboard-columns">
+        <div class="card">
+          <h3>Orders by status</h3>
+          <ul id="statusBreakdown" class="simple-list"><li>Loading...</li></ul>
+        </div>
+        <div class="card">
+          <h3>Payment methods</h3>
+          <ul id="paymentBreakdown" class="simple-list"><li>Loading...</li></ul>
+        </div>
+      </div>
+
+      <p class="report-note">Revenue is the value of the items in the orders that were not cancelled (the shipping fee is not included). The days follow Philippine time.</p>
     </section>
 
     <!-- ---------------- REVIEWS PAGE ---------------- -->
