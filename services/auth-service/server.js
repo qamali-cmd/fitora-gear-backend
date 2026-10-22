@@ -351,6 +351,100 @@ app.post('/api/auth/customers/register', async (req, res) => {
   }
 });
 // POST /api/auth/customers/login
+// =====================================================
+// FORGOT PASSWORD (customers)
+//   1) /forgot-password : a 6-digit code is emailed to the email of the account
+//   2) /reset-password  : the code + a new password are sent, and the password is changed
+// The answers never tell whether an account exists (so nobody can use this to find out who has an account).
+// The code only goes to an email the customer VERIFIED, and only for an active account.
+// =====================================================
+const FORGOT_MESSAGE = 'If an account with that email or username exists and its email is verified, we sent a 6-digit code to it. Check your inbox and your Spam folder.';
+
+function resetIdentifier(body) {
+  return String((body && (body.identifier || body.email)) || '').trim().toLowerCase();
+}
+
+async function findCustomerForReset(identifier) {
+  // An "@" means it is an email; usernames can never contain "@"
+  const column = identifier.includes('@') ? 'email' : 'username';
+  const [rows] = await pool.query(
+    `SELECT user_id, full_name, first_name, email, email_verified, is_active, account_status FROM users WHERE ${column} = ?`,
+    [identifier]
+  );
+  const user = rows[0];
+  if (!user || !user.email || !user.email_verified) return null;
+  if (!user.is_active || (user.account_status && user.account_status !== 'active')) return null; // suspended, banned, or deleted
+  return user;
+}
+
+app.post('/api/auth/customers/forgot-password', async (req, res) => {
+  try {
+    const identifier = resetIdentifier(req.body);
+    if (!identifier || identifier.length > 100) return res.status(400).json({ error: 'Please enter your email or username.' });
+    if (!allow('forgot|' + req.ip, 10, 3600000) || !allow('forgot-id|' + identifier, 5, 3600000)) {
+      return res.status(429).json({ error: 'Too many requests. Please try again in an hour.' });
+    }
+    // if emailing is not set up, it is the same for everybody, so it can be said openly
+    if (!process.env.BREVO_API_KEY || !process.env.EMAIL_FROM) {
+      return res.status(503).json({ error: 'Email sending is not set up on the server yet.' });
+    }
+
+    const user = await findCustomerForReset(identifier);
+    if (user) {
+      try {
+        await issueVerificationCode('customer', user.user_id, user.email, user.first_name || user.full_name, {
+          subject: 'Reset your Fitora Gear password',
+          intro: 'Use this code to reset your password:',
+        });
+      } catch (err) {
+        // "a code was just sent" (cooldown) and a failed email look the same from the outside
+        console.warn('The password reset code was not sent:', err.message);
+      }
+    }
+    res.json({ message: FORGOT_MESSAGE });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+app.post('/api/auth/customers/reset-password', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const identifier = resetIdentifier(body);
+    const code = String(body.code || '').trim();
+    const newPassword = String(body.new_password || '');
+    if (!identifier) return res.status(400).json({ error: 'Please enter your email or username.' });
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Please enter the 6-digit code.' });
+    if (!STRONG_PASSWORD_RE.test(newPassword)) return res.status(400).json({ error: PASSWORD_MESSAGE });
+    if (!allow('reset|' + req.ip, 30, 3600000)) return res.status(429).json({ error: 'Too many attempts. Please try again in an hour.' });
+
+    const user = await findCustomerForReset(identifier);
+    // the same words as a real "no code" answer, so an unknown account looks like an account with no code
+    if (!user) return res.status(400).json({ error: 'No code found. Please request a new code.' });
+
+    const result = await checkVerificationCode('customer', user.user_id, user.email, code);
+    if (!result.ok) return res.status(result.status).json({ error: result.message });
+
+    await pool.query('UPDATE users SET password = ? WHERE user_id = ?', [await bcrypt.hash(newPassword, 10), user.user_id]);
+
+    // a short notice to the owner of the email (it never stops the reset)
+    sendEmail({
+      to: user.email,
+      subject: 'Your Fitora Gear password was changed',
+      html: `<div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px">
+        <h2 style="color:#FC408C;margin:0 0 12px">Fitora Gear</h2>
+        <p>Hi ${escapeHtml(user.first_name || user.full_name)},</p>
+        <p>The password of your account was just changed. If it was you, you do not need to do anything.</p>
+        <p style="color:#b8352a">If it was not you, please contact the shop right away.</p>
+      </div>`,
+    }).catch((err) => console.warn('The password changed notice was not sent:', err.message));
+
+    res.json({ message: 'Your password was changed. You can log in now.' });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
 app.post('/api/auth/customers/login', async (req, res) => {
   try {
     const body = req.body || {};
