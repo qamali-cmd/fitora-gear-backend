@@ -25,6 +25,8 @@ let allOrders = []; // the orders of the Orders page
 let ordersPreset = null; // a filter chosen on the Dashboard (for example the pending orders), used when the Orders page opens
 let inventoryPreset = null; // the same for the Inventory page (for example the low stock products)
 let reviewPreset = null; // the same for the Reviews page (the reviews waiting for approval)
+let allProductsList = [];
+let productsPreset = null; // the same for the Products page ('pending' = the products waiting for the Super Admin)
 let allProductsForInventory = []; // the products of the Inventory page
 let allReviews = []; // the reviews of the Reviews page
 const activityState = { before: null, loaded: 0 }; // the Activity page: where the next "Load more" continues
@@ -373,7 +375,7 @@ function navigateTo(page) {
   updateStickyOffsets();
 
   if (page === 'dashboard') loadDashboard();
-  if (page === 'products') loadProducts();
+  if (page === 'products') loadProducts(true);
   if (page === 'categories') loadCategories(true);
   if (page === 'inventory') loadInventory(true);
   if (page === 'customers') loadCustomers();
@@ -422,7 +424,7 @@ async function loadDashboard() {
         if (reviewRes.ok && Array.isArray(reviews)) pendingReviews = reviews.filter(r => r.status === 'pending').length;
       } catch (err) { /* the box simply does not show reviews */ }
     }
-    renderAttention(orders, lowStock, pendingReviews);
+    renderAttention(orders, lowStock, pendingReviews, products);
     applyDashboardLinks();
   } catch (err) {
     console.error(err);
@@ -439,6 +441,7 @@ function goFromDashboard(go, card) {
   }
   if (go === 'inventory') inventoryPreset = d.inventory || 'low';
   if (go === 'reviews') reviewPreset = d.reviews || null;
+  if (go === 'products') productsPreset = d.approval || null;
   if (go === 'reports' && d.preset) {
     const range = presetRange(d.preset);
     Object.assign(reportState, { preset: d.preset, from: range.from, to: range.to });
@@ -447,10 +450,14 @@ function goFromDashboard(go, card) {
 }
 
 // "Needs attention": the things the shop should look at now. Only what this admin may open is shown.
-function renderAttention(orders, lowStock, pendingReviews) {
+function renderAttention(orders, lowStock, pendingReviews, products) {
   const list = document.getElementById('attentionList');
   const count = (test) => orders.filter(test).length;
+  const isSuper = (getCurrentAdmin() || {}).role === 'super_admin';
+  const productCount = (state) => (products || []).filter(p => p.approval_status === state).length;
   const lines = [
+    { n: isSuper ? productCount('pending') : 0, go: 'products', data: { approval: 'pending' }, one: 'product waits for your approval', many: 'products wait for your approval', tone: 'pink' },
+    { n: isSuper ? 0 : productCount('rejected'), go: 'products', data: { approval: 'rejected' }, one: 'product was rejected and needs a change', many: 'products were rejected and need a change', tone: 'red' },
     { n: count(o => o.cancel_request_status === 'requested'), go: 'orders', data: { status: 'cancel_requests' }, one: 'customer asks to cancel an order', many: 'customers ask to cancel an order', tone: 'red' },
     { n: count(o => o.payment_status === 'refund_pending'), go: 'orders', data: { payment: 'refund_pending' }, one: 'refund to give back to a customer', many: 'refunds to give back to customers', tone: 'red' },
     { n: count(o => o.status === 'pending' && !(o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment')), go: 'orders', data: { status: 'pending', payment: 'ready' }, one: 'new order to process', many: 'new orders to process', tone: 'pink' },
@@ -522,10 +529,19 @@ async function loadCategories(renderTable) {
   }
 }
 
-let allProductsList = [];
 
-async function loadProducts() {
+async function loadProducts(resetFilters) {
   const tbody = document.getElementById('productsTableBody');
+  if (resetFilters) {
+    // when the page is opened: empty filters (or what the Dashboard / the bell chose), set at once
+    document.getElementById('productSearch').value = '';
+    document.getElementById('productCategoryFilter').value = 'all';
+    document.getElementById('productAudienceFilter').value = 'all';
+    document.getElementById('productApprovalFilter').value = productsPreset || 'all';
+    document.getElementById('productSort').value = 'default';
+    productsPreset = null;
+    if (allProductsList.length) renderProductsTable();
+  }
   try {
     const res = await fetch(API.PRODUCTS + '/products');
     allProductsList = await res.json();
@@ -561,13 +577,16 @@ function renderProductsTable() {
   const search = document.getElementById('productSearch').value.toLowerCase().trim();
   const categoryFilter = document.getElementById('productCategoryFilter').value;
   const audienceFilter = document.getElementById('productAudienceFilter').value;
+  const approvalFilter = document.getElementById('productApprovalFilter').value;
+  const isSuper = (getCurrentAdmin() || {}).role === 'super_admin';
   const sort = document.getElementById('productSort').value;
 
   let list = allProductsList.filter(p => {
     const matchesSearch = !search || p.product_name.toLowerCase().includes(search);
     const matchesCategory = categoryFilter === 'all' || String(p.category_id) === categoryFilter;
     const matchesAudience = audienceFilter === 'all' || (p.audience || 'unisex') === audienceFilter;
-    return matchesSearch && matchesCategory && matchesAudience;
+    const matchesApproval = approvalFilter === 'all' || (p.approval_status || 'approved') === approvalFilter;
+    return matchesSearch && matchesCategory && matchesAudience && matchesApproval;
   });
 
   if (sort === 'price_asc') list = [...list].sort((a, b) => a.price - b.price);
@@ -577,6 +596,7 @@ function renderProductsTable() {
 
   tbody.innerHTML = list.map(p => {
     const audience = p.audience || 'unisex';
+    const approval = p.approval_status || 'approved';
     return `
     <tr data-product-id="${p.product_id}">
       <td>${p.image
@@ -587,13 +607,16 @@ function renderProductsTable() {
       <td><span class="badge badge-${audience}">${AUDIENCE_LABELS[audience]}</span></td>
       <td>₱${Number(p.price).toLocaleString()}</td>
       <td>${p.stock}</td>
-      <td>
-        <select class="status-select tone-${orderEsc(p.status)}" aria-label="Status" onchange="quickUpdateProduct(${p.product_id}, { status: this.value })">
+      <td>${approval === 'pending'
+        ? '<span class="badge badge-plain badge-pending">Waiting for approval</span><div class="muted-small">Not for sale yet</div>'
+        : approval === 'rejected'
+          ? `<span class="badge badge-plain badge-cancelled">Rejected</span><div class="muted-small">${orderEsc(p.approval_note || '')}</div>`
+          : `<select class="status-select tone-${orderEsc(p.status)}" aria-label="Status" onchange="quickUpdateProduct(${p.product_id}, { status: this.value })">
           <option value="active" ${p.status === 'active' ? 'selected' : ''}>Active</option>
           <option value="inactive" ${p.status === 'inactive' ? 'selected' : ''}>Inactive</option>
-        </select>
-      </td>
+        </select>`}</td>
       <td>
+        ${approval === 'pending' && isSuper ? `<button class="icon-btn" onclick="approveProduct(${p.product_id})">Approve</button><button class="icon-btn danger" onclick="rejectProduct(${p.product_id})">Reject</button>` : ''}
         <button class="icon-btn" onclick="openImagesModal(${p.product_id})">Photos</button>
         <button class="icon-btn" onclick="openProductModal(${p.product_id})">Edit</button>
         <button class="icon-btn danger" onclick="deleteProduct(${p.product_id})">Delete</button>
@@ -624,6 +647,7 @@ document.getElementById('inventorySearch').addEventListener('input', renderInven
 document.getElementById('inventoryFilter').addEventListener('change', renderInventoryTable);
 document.getElementById('reviewStatusFilter').addEventListener('change', renderReviews);
 document.getElementById('productAudienceFilter').addEventListener('change', renderProductsTable);
+document.getElementById('productApprovalFilter').addEventListener('change', renderProductsTable);
 
 // the Orders page
 ['orderSearch'].forEach(id => document.getElementById(id).addEventListener('input', () => renderOrders()));
@@ -645,6 +669,38 @@ document.querySelectorAll('#reportRanges .chip').forEach(chip => chip.addEventLi
 document.getElementById('reportApply').addEventListener('click', applyCustomRange);
 document.getElementById('reportExport').addEventListener('click', exportReportCsv);
 document.getElementById('productSort').addEventListener('change', renderProductsTable);
+
+// ----- the Super Admin decides about the products that staff added -----
+const PRODUCT_REJECT_REASONS = ['Wrong price', 'Wrong or missing photo', 'Wrong name or description', 'Not allowed to sell', 'Other'];
+
+async function sendProductApproval(productId, body) {
+  try {
+    const res = await fetch(API.PRODUCTS + '/products/' + productId + '/approval', { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not save the decision.');
+    await loadProducts();
+    showToast(data.message);
+    return true;
+  } catch (err) {
+    showApiError(err.message);
+    return false;
+  }
+}
+
+async function approveProduct(productId) {
+  const p = allProductsList.find(x => x.product_id === productId);
+  const name = p ? p.product_name : 'this product';
+  if (!(await askConfirm(`Approve "${name}"? It becomes active, and customers can see and buy it.`, 'Approve'))) return;
+  await sendProductApproval(productId, { decision: 'approve' });
+}
+
+function rejectProduct(productId) {
+  const p = allProductsList.find(x => x.product_id === productId);
+  const name = p ? p.product_name : 'this product';
+  openReasonModal(`Reject "${name}"`, 'The product stays hidden from customers. The staff member can change it and send it again.', PRODUCT_REJECT_REASONS, 'Reject', async (reason) => {
+    if (await sendProductApproval(productId, { decision: 'reject', reason })) closeModal();
+  });
+}
 
 async function deleteProduct(id) {
   if (!(await askConfirm('Are you sure you want to delete this product?'))) return;
@@ -673,6 +729,7 @@ function closeModal() {
 }
 
 async function openProductModal(productId) {
+  const isSuper = (getCurrentAdmin() || {}).role === 'super_admin';
   let product = { product_name: '', category_id: '', audience: 'unisex', price: '', stock: 0, weight_grams: 300, status: 'active', description: '', image: '' };
 
   if (productId) {
@@ -683,13 +740,22 @@ async function openProductModal(productId) {
     modalTitle.textContent = 'Add product';
   }
 
+  // What the product is waiting for. A NEW product of a staff member waits for the Super Admin; a product that is waiting or rejected stays inactive.
+  const approval = productId ? (product.approval_status || 'approved') : (isSuper ? 'approved' : 'pending');
+  const approvalNotice = approval === 'pending'
+    ? `<div class="detail-note">${productId ? 'This product is waiting for a Super Admin to approve it. Customers cannot see it yet.' : 'A Super Admin has to approve this product before customers can see it.'}</div>`
+    : approval === 'rejected'
+      ? `<div class="detail-note detail-note-danger">This product was rejected${product.approval_note ? ': ' + orderEsc(product.approval_note) : ''}. ${isSuper ? 'The staff member can change it and send it again.' : 'Change it and press Save to send it for approval again.'}</div>`
+      : '';
+
   const categoryOptions = allCategories.map(c =>
-    `<option value="${c.category_id}" ${c.category_id === product.category_id ? 'selected' : ''}>${c.category_name}</option>`
+    `<option value="${c.category_id}" ${c.category_id === product.category_id ? 'selected' : ''}>${orderEsc(c.category_name)}</option>`
   ).join('');
 
   modalForm.innerHTML = `
+    ${approvalNotice}
     <label>Product name</label>
-    <input type="text" id="f_name" value="${product.product_name || ''}" required>
+    <input type="text" id="f_name" value="${orderEsc(product.product_name || '')}" required>
 
     <label>Category</label>
     <select id="f_category">
@@ -705,10 +771,10 @@ async function openProductModal(productId) {
     </select>
 
     <label>Description</label>
-    <textarea id="f_description" rows="2">${product.description || ''}</textarea>
+    <textarea id="f_description" rows="2">${orderEsc(product.description || '')}</textarea>
 
     <label>Image URL</label>
-    <input type="text" id="f_image" placeholder="https://..." value="${product.image || ''}">
+    <input type="text" id="f_image" placeholder="https://..." value="${orderEsc(product.image || '')}">
 
     <label>Or upload from your computer</label>
     <input type="file" id="f_image_file" accept="image/*">
@@ -730,11 +796,11 @@ async function openProductModal(productId) {
     <label>Weight (grams, used for the shipping fee)</label>
     <input type="number" id="f_weight" min="1" max="50000" step="1" value="${product.weight_grams || 300}" required>
 
-    <label>Status</label>
+    ${approval === 'approved' ? `<label>Status</label>
     <select id="f_status">
       <option value="active" ${product.status === 'active' ? 'selected' : ''}>Active</option>
       <option value="inactive" ${product.status === 'inactive' ? 'selected' : ''}>Inactive</option>
-    </select>
+    </select>` : ''}
 
     <div class="modal-actions">
       <button type="button" class="secondary-btn" onclick="closeModal()">Cancel</button>
@@ -753,15 +819,22 @@ async function openProductModal(productId) {
       price: parseFloat(document.getElementById('f_price').value),
       stock: parseInt(document.getElementById('f_stock').value),
       weight_grams: parseInt(document.getElementById('f_weight').value),
-      status: document.getElementById('f_status').value,
+      status: approval === 'approved' ? document.getElementById('f_status').value : 'inactive', // a product that is not approved is never active
     };
 
     const url = productId ? API.PRODUCTS + '/products/' + productId : API.PRODUCTS + '/products';
     const method = productId ? 'PUT' : 'POST';
 
-    await fetch(url, { method, headers: authHeaders(), body: JSON.stringify(payload) });
-    closeModal();
-    loadProducts();
+    try {
+      const res = await fetch(url, { method, headers: authHeaders(), body: JSON.stringify(payload) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not save the product.');
+      closeModal();
+      await loadProducts();
+      showToast(data.approval_status === 'pending' && data.message ? data.message : (productId ? 'Product saved.' : 'Product added.'));
+    } catch (err) {
+      showApiError(err.message); // the form stays open, so nothing typed is lost
+    }
   };
 
   // BAGO: pag-upload ng larawan mula sa computer papunta sa Cloudinary
@@ -2021,8 +2094,8 @@ async function deleteCustomer(userId, name) {
 // A notification glows until THIS admin opens it. Pressing one goes straight to the order / product.
 // ===========================================================
 let notificationItems = [];
-const NOTIF_PAGES = { new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders', low_stock: 'inventory', new_review: 'reviews' };
-const NOTIF_TABLES = { orders: 'ordersTableBody', inventory: 'inventoryTableBody', reviews: 'reviewsTableBody' };
+const NOTIF_PAGES = { new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders', low_stock: 'inventory', new_review: 'reviews', product_approval: 'products', product_decision: 'products' };
+const NOTIF_TABLES = { orders: 'ordersTableBody', inventory: 'inventoryTableBody', reviews: 'reviewsTableBody', products: 'productsTableBody' };
 
 function timeAgo(value) {
   const time = new Date(value).getTime();
@@ -2099,6 +2172,7 @@ async function openNotification(id) {
   }
   const page = NOTIF_PAGES[item.type];
   if (!page) return;
+  if (item.type === 'product_approval') productsPreset = 'pending'; // the Super Admin lands on the products that wait for the decision
   history.replaceState(null, '', '#' + page);
   navigateTo(page);
   highlightRow(NOTIF_TABLES[page], item.ref_text);

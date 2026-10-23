@@ -18,6 +18,28 @@ app.use(express.json());
 
 // GET /api/categories - kunin lahat ng categories (walang kailangang login,
 // pwede rin itong gamitin ng client/mobile app sa hinaharap)
+// =====================================================
+// APPROVAL OF NEW PRODUCTS
+// A product added by a STAFF admin is saved as "pending" and stays inactive (hidden from customers) until a
+// Super Admin approves it. A product added by a Super Admin is approved at once.
+// =====================================================
+const isSuperAdmin = (req) => !!req.admin && req.admin.role === 'super_admin';
+const isMissingColumn = (err) => !!err && err.code === 'ER_BAD_FIELD_ERROR';
+const APPROVAL_HINT = 'The database was not updated yet. Run migration_product_approval.sql in MySQL Workbench first.';
+const REJECT_REASONS = ['Wrong price', 'Wrong or missing photo', 'Wrong name or description', 'Not allowed to sell', 'Other'];
+const adminLabel = (req) => (req.admin && (req.admin.fullName || req.admin.username)) || 'An admin';
+
+// The approval state of a product. A product made before the update (or a database without the new columns) counts as approved.
+async function getApproval(productId) {
+  try {
+    const [rows] = await pool.query('SELECT approval_status FROM products WHERE product_id = ?', [productId]);
+    return rows[0] ? { status: rows[0].approval_status || 'approved' } : null;
+  } catch (err) {
+    if (isMissingColumn(err)) return null;
+    throw err;
+  }
+}
+
 // Who a product is for
 const AUDIENCES = ['men', 'women', 'unisex'];
 const AUDIENCE_ERROR = 'Please choose who the product is for: men, women, or unisex.';
@@ -152,7 +174,8 @@ app.get('/api/products', async (req, res) => {
       LEFT JOIN categories c ON p.category_id = c.category_id
       ORDER BY p.created_at DESC
     `);
-    res.json(rows);
+    // who added and who approved a product is for the admins only (the Activity page): it is not sent in this public list
+    res.json(rows.map(({ created_by, approved_by, approved_at, ...product }) => product));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -162,9 +185,14 @@ app.get('/api/products', async (req, res) => {
 // GET /api/products/low-stock - products na mababa na ang stock (halimbawa <10)
 app.get('/api/products/low-stock', async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT product_id, product_name, stock FROM products WHERE stock < 10 ORDER BY stock ASC'
-    );
+    // only approved products count as "low stock" (a product waiting for approval is not for sale yet)
+    let rows;
+    try {
+      [rows] = await pool.query("SELECT product_id, product_name, stock FROM products WHERE stock < 10 AND approval_status = 'approved' ORDER BY stock ASC");
+    } catch (err) {
+      if (!isMissingColumn(err)) throw err;
+      [rows] = await pool.query('SELECT product_id, product_name, stock FROM products WHERE stock < 10 ORDER BY stock ASC');
+    }
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -296,7 +324,8 @@ app.get('/api/products/:id', async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT * FROM products WHERE product_id = ?', [req.params.id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Product not found.' });
-    res.json(rows[0]);
+    const { created_by, approved_by, approved_at, ...product } = rows[0]; // who added / approved it is for the admins only
+    res.json(product);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -304,7 +333,7 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // POST /api/products - gumawa ng bagong product
-app.post('/api/products', verifyToken, requirePermission('products'), track('product.create', { describe: (req) => `Added the product "${req.body.product_name}" (₱${Number(req.body.price).toLocaleString('en-US')})`, entity: (req, b, body) => ['product', body.product_id] }), async (req, res) => {
+app.post('/api/products', verifyToken, requirePermission('products'), track('product.create', { describe: (req) => `Added the product "${req.body.product_name}" (₱${Number(req.body.price).toLocaleString('en-US')})${isSuperAdmin(req) ? '' : ' - waiting for approval'}`, entity: (req, b, body) => ['product', body.product_id] }), async (req, res) => {
   try {
     const { category_id, product_name, description, price, stock, image, status, weight_grams, audience } = req.body;
 
@@ -319,13 +348,37 @@ app.post('/api/products', verifyToken, requirePermission('products'), track('pro
     const who = audience === undefined || audience === null || audience === '' ? 'unisex' : audience;
     if (!AUDIENCES.includes(who)) return res.status(400).json({ error: AUDIENCE_ERROR });
 
-    const [result] = await pool.query(
-      `INSERT INTO products (category_id, product_name, description, price, stock, image, status, weight_grams, audience)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [category_id || null, product_name, description || null, price, stock || 0, image || null, status || 'active', weight, who]
-    );
+    const staffMember = !isSuperAdmin(req);
+    const finalStatus = staffMember ? 'inactive' : (status || 'active'); // a product waiting for approval is never active
+    let result;
+    try {
+      [result] = await pool.query(
+        `INSERT INTO products (category_id, product_name, description, price, stock, image, status, weight_grams, audience, approval_status, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [category_id || null, product_name, description || null, price, stock || 0, image || null, finalStatus, weight, who, staffMember ? 'pending' : 'approved', req.admin.adminId || null]
+      );
+    } catch (err) {
+      if (!isMissingColumn(err)) throw err;
+      // The database was not updated yet. A staff member's product can NOT go live without the approval, so it is refused.
+      if (staffMember) return res.status(503).json({ error: APPROVAL_HINT });
+      [result] = await pool.query(
+        `INSERT INTO products (category_id, product_name, description, price, stock, image, status, weight_grams, audience)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [category_id || null, product_name, description || null, price, stock || 0, image || null, finalStatus, weight, who]
+      );
+    }
 
-    res.status(201).json({ product_id: result.insertId, ...req.body });
+    if (staffMember) {
+      await addNotification({ type: 'product_approval', title: 'Product waiting for approval', message: `"${product_name}" was added by ${adminLabel(req)}`, ref_text: product_name, product_id: result.insertId });
+    }
+    // (the answer is built last, so nothing the admin sent can pretend to be the approval or the status)
+    res.status(201).json({
+      ...req.body,
+      product_id: result.insertId,
+      status: finalStatus,
+      approval_status: staffMember ? 'pending' : 'approved',
+      message: staffMember ? 'The product was saved. It is waiting for a Super Admin to approve it before customers can see it.' : 'Product added.',
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -345,15 +398,27 @@ app.put('/api/products/:id', verifyToken, requirePermission('products'), track('
     const who = audience === undefined || audience === null || audience === '' ? null : audience;
     if (who !== null && !AUDIENCES.includes(who)) return res.status(400).json({ error: AUDIENCE_ERROR });
 
+    // A product that is not approved yet cannot be made active by editing it.
+    const approval = await getApproval(req.params.id);
+    const notApproved = !!approval && approval.status !== 'approved';
+    const finalStatus = notApproved ? 'inactive' : status;
+
     await pool.query(
       `UPDATE products
        SET category_id = ?, product_name = ?, description = ?, price = ?, stock = ?, image = ?, status = ?,
            weight_grams = COALESCE(?, weight_grams), audience = COALESCE(?, audience)
        WHERE product_id = ?`,
-      [category_id || null, product_name, description || null, price, stock, image || null, status, weight, who, req.params.id]
+      [category_id || null, product_name, description || null, price, stock, image || null, finalStatus, weight, who, req.params.id]
     );
 
-    res.json({ message: 'Product updated.' });
+    // A staff member who changes a REJECTED product sends it for approval again
+    if (approval && approval.status === 'rejected' && !isSuperAdmin(req)) {
+      await pool.query("UPDATE products SET approval_status = 'pending', approval_note = NULL WHERE product_id = ?", [req.params.id]);
+      await addNotification({ type: 'product_approval', title: 'Product waiting for approval', message: `"${product_name}" was changed and sent again by ${adminLabel(req)}`, ref_text: product_name, product_id: Number(req.params.id) });
+      return res.json({ message: 'The product was sent for approval again.', approval_status: 'pending' });
+    }
+
+    res.json({ message: 'Product updated.', approval_status: approval ? approval.status : 'approved' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -376,8 +441,59 @@ app.put('/api/products/:id/quick', verifyToken, requirePermission('products'), t
     const [found] = await pool.query('SELECT product_id FROM products WHERE product_id = ?', [id]);
     if (found.length === 0) return res.status(404).json({ error: 'Product not found.' });
 
+    const approval = await getApproval(id);
+    if (status === 'active' && approval && approval.status !== 'approved') {
+      return res.status(400).json({ error: 'This product has to be approved by a Super Admin first.' });
+    }
+
     await pool.query('UPDATE products SET status = COALESCE(?, status), audience = COALESCE(?, audience) WHERE product_id = ?', [status, audience, id]);
     res.json({ message: 'Product updated.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// The Super Admin approves a product (it becomes active, and customers can see and buy it) or rejects it (with a reason).
+app.put('/api/products/:id/approval', verifyToken, requirePermission('products'), track(
+  (req) => (req.body && req.body.decision === 'approve' ? 'product.approve' : 'product.reject'),
+  {
+    lookup: lookupProductName,
+    describe: (req, name) => (name ? (req.body.decision === 'approve' ? `Approved the product "${name}"` : `Rejected the product "${name}": ${req.body.reason}`) : null),
+    entity: (req) => ['product', Number(req.params.id)],
+  }), async (req, res) => {
+  try {
+    if (!isSuperAdmin(req)) return res.status(403).json({ error: 'Only a Super Admin can approve or reject products.' });
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid product.' });
+    const decision = (req.body || {}).decision;
+    const reason = String((req.body || {}).reason || '');
+    if (!['approve', 'reject'].includes(decision)) return res.status(400).json({ error: 'Please choose to approve or reject the product.' });
+    if (decision === 'reject' && !REJECT_REASONS.includes(reason)) return res.status(400).json({ error: 'Please choose a reason for rejecting the product.' });
+
+    let rows;
+    try {
+      [rows] = await pool.query('SELECT product_name, approval_status FROM products WHERE product_id = ?', [id]);
+    } catch (err) {
+      if (isMissingColumn(err)) return res.status(503).json({ error: APPROVAL_HINT });
+      throw err;
+    }
+    if (rows.length === 0) return res.status(404).json({ error: 'Product not found.' });
+    if (rows[0].approval_status !== 'pending') return res.status(400).json({ error: 'This product is not waiting for approval.' });
+
+    const now = new Date();
+    if (decision === 'approve') {
+      await pool.query("UPDATE products SET approval_status = 'approved', status = 'active', approved_by = ?, approved_at = ?, approval_note = NULL WHERE product_id = ?", [req.admin.adminId, now, id]);
+    } else {
+      await pool.query("UPDATE products SET approval_status = 'rejected', status = 'inactive', approved_by = ?, approved_at = ?, approval_note = ? WHERE product_id = ?", [req.admin.adminId, now, reason, id]);
+    }
+    await addNotification({
+      type: 'product_decision',
+      title: decision === 'approve' ? 'Product approved' : 'Product rejected',
+      message: decision === 'approve' ? `"${rows[0].product_name}" was approved by ${adminLabel(req)}` : `"${rows[0].product_name}" was rejected by ${adminLabel(req)}: ${reason}`,
+      ref_text: rows[0].product_name, product_id: id,
+    });
+    res.json({ message: decision === 'approve' ? 'The product was approved. Customers can see it now.' : 'The product was rejected.', approval_status: decision === 'approve' ? 'approved' : 'rejected' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });

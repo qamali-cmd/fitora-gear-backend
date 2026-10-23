@@ -1490,6 +1490,7 @@ const LOW_STOCK_LIMIT = 10; // the same rule as the low stock list: fewer than 1
 const NOTIFICATION_PERMISSIONS = {
   new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders',
   low_stock: 'inventory', new_review: 'reviews',
+  product_approval: 'products', product_decision: 'products', // "waiting for approval" is for the Super Admin only (see below)
 };
 
 async function addNotification(n) {
@@ -1571,7 +1572,9 @@ function allowedNotificationTypes(admin) {
   const all = Object.keys(NOTIFICATION_PERMISSIONS);
   if (admin.role === 'super_admin') return all;
   const permissions = admin.permissions || [];
-  return all.filter((type) => permissions.includes(NOTIFICATION_PERMISSIONS[type]));
+  return all
+    .filter((type) => type !== 'product_approval') // only the Super Admin decides, so only the Super Admin is asked
+    .filter((type) => permissions.includes(NOTIFICATION_PERMISSIONS[type]));
 }
 
 app.get('/api/notifications', verifyToken, async (req, res) => {
