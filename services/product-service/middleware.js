@@ -30,14 +30,42 @@ async function verifyToken(req, res, next) {
   }
 
   try {
-    const [rows] = await pool.query('SELECT admin_id, role, permissions FROM admins WHERE admin_id = ?', [decoded.adminId]);
+    let rows;
+    try {
+      [rows] = await pool.query(
+        'SELECT admin_id, username, full_name, role, permissions, is_active, last_seen_at, sessions_valid_after FROM admins WHERE admin_id = ?',
+        [decoded.adminId]
+      );
+    } catch (err) {
+      if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+      // the database was not updated yet (the new columns are missing): the older check is used until it is
+      [rows] = await pool.query('SELECT admin_id, username, full_name, role, permissions FROM admins WHERE admin_id = ?', [decoded.adminId]);
+    }
     if (rows.length === 0) {
       return res.status(401).json({ error: 'This admin account no longer exists. Please log in again.' });
     }
+    const admin = rows[0];
+
+    // The Super Admin can deactivate an account, or log an admin out. Both stop the admin at once.
+    if (admin.is_active === 0 || admin.is_active === false) {
+      return res.status(401).json({ error: 'This admin account was deactivated. Please contact the Super Admin.', code: 'ADMIN_INACTIVE' });
+    }
+    if (admin.sessions_valid_after && decoded.iat * 1000 < new Date(admin.sessions_valid_after).getTime()) {
+      return res.status(401).json({ error: 'The Super Admin logged you out. Please log in again.', code: 'LOGGED_OUT' });
+    }
+
+    // "Online": write down that this admin is active now (at most once a minute, and it never stops the request)
+    const now = Date.now();
+    if (admin.last_seen_at !== undefined && (!admin.last_seen_at || now - new Date(admin.last_seen_at).getTime() > 60000)) {
+      Promise.resolve(pool.query('UPDATE admins SET last_seen_at = ? WHERE admin_id = ?', [new Date(now), admin.admin_id])).catch(() => {});
+    }
+
     req.admin = {
       ...decoded,
-      role: rows[0].role,
-      permissions: rows[0].permissions ? String(rows[0].permissions).split(',').map((p) => p.trim()).filter(Boolean) : [],
+      username: admin.username,
+      fullName: admin.full_name,
+      role: admin.role,
+      permissions: admin.permissions ? String(admin.permissions).split(',').map((p) => p.trim()).filter(Boolean) : [],
     };
     return next();
   } catch (err) {

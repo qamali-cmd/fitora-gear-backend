@@ -43,7 +43,60 @@ app.get('/api/categories', async (req, res) => {
 });
 
 // POST /api/categories - gumawa ng bagong category (kailangan naka-login)
-app.post('/api/categories', verifyToken, requirePermission('categories'), async (req, res) => {
+// =====================================================
+// ACTIVITY LOG: writes down what an admin did, AFTER it worked.
+// It never stops or changes the action: if writing fails, the action is still done.
+// =====================================================
+async function logActivity(admin, action, description, entityType, entityId) {
+  try {
+    await pool.query(
+      'INSERT INTO admin_activity (admin_id, admin_name, action, description, entity_type, entity_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [admin.adminId || null, String(admin.fullName || admin.username || 'Admin').slice(0, 100), action, String(description).slice(0, 300), entityType || null, entityId || null, new Date()]
+    );
+  } catch (err) {
+    console.warn('The activity was not written down:', err.message);
+  }
+}
+
+// Put it in a route after the permission check:  track('product.delete', { lookup, describe, entity })
+//   action   = a text, or a function (req, before, body) that gives the text
+//   lookup   = reads what is needed BEFORE the action (for example the name of something about to be deleted)
+//   describe = the sentence (return nothing to write nothing)
+//   entity   = [type, id] of what was changed
+function track(action, { lookup, describe, entity }) {
+  return async (req, res, next) => {
+    let before = null;
+    if (lookup) { try { before = await lookup(req); } catch (err) { before = null; } }
+    const send = res.json.bind(res);
+    res.json = (body) => {
+      const out = send(body);
+      const status = res.statusCode || res.code || 200;
+      if (status < 400) {
+        Promise.resolve()
+          .then(async () => {
+            const text = await describe(req, before, body || {});
+            if (!text) return;
+            const name = typeof action === 'function' ? action(req, before, body || {}) : action;
+            const [entityType, entityId] = entity ? entity(req, before, body || {}) : [];
+            await logActivity(req.admin, name, text, entityType, entityId);
+          })
+          .catch((err) => console.warn('The activity was not written down:', err.message));
+      }
+      return out;
+    };
+    return next();
+  };
+}
+
+const lookupProductName = async (req) => { const [r] = await pool.query('SELECT product_name FROM products WHERE product_id = ?', [Number(req.params.id)]); return r[0] ? r[0].product_name : null; };
+const lookupCategoryName = async (req) => { const [r] = await pool.query('SELECT category_name FROM categories WHERE category_id = ?', [Number(req.params.id)]); return r[0] ? r[0].category_name : null; };
+const lookupReview = async (req) => {
+  const [r] = await pool.query('SELECT r.status, p.product_name, u.full_name AS customer_name FROM reviews r LEFT JOIN products p ON p.product_id = r.product_id LEFT JOIN users u ON u.user_id = r.user_id WHERE r.review_id = ?', [Number(req.params.id)]);
+  return r[0] || null;
+};
+const lookupImageProduct = async (req) => { const [r] = await pool.query('SELECT p.product_name FROM product_images i JOIN products p ON p.product_id = i.product_id WHERE i.image_id = ?', [Number(req.params.imageId)]); return r[0] ? r[0].product_name : null; };
+
+app.post('/api/categories', verifyToken, requirePermission('categories'), track('category.create', { describe: (req) => `Added the category "${req.body.category_name}"`, entity: (req, b, body) => ['category', body.category_id] }), async (req, res) => {
   try {
     const { category_name, description } = req.body;
     if (!category_name) {
@@ -61,7 +114,7 @@ app.post('/api/categories', verifyToken, requirePermission('categories'), async 
 });
 
 // PUT /api/categories/:id - i-update ang isang category
-app.put('/api/categories/:id', verifyToken, requirePermission('categories'), async (req, res) => {
+app.put('/api/categories/:id', verifyToken, requirePermission('categories'), track('category.update', { lookup: lookupCategoryName, describe: (req, name) => (name ? `Edited the category "${name}"${req.body.category_name && req.body.category_name !== name ? ` (now "${req.body.category_name}")` : ''}` : null), entity: (req) => ['category', Number(req.params.id)] }), async (req, res) => {
   try {
     const { category_name, description } = req.body;
     await pool.query(
@@ -76,7 +129,7 @@ app.put('/api/categories/:id', verifyToken, requirePermission('categories'), asy
 });
 
 // DELETE /api/categories/:id
-app.delete('/api/categories/:id', verifyToken, requirePermission('categories'), async (req, res) => {
+app.delete('/api/categories/:id', verifyToken, requirePermission('categories'), track('category.delete', { lookup: lookupCategoryName, describe: (req, name) => (name ? `Deleted the category "${name}"` : null), entity: (req) => ['category', Number(req.params.id)] }), async (req, res) => {
   try {
     await pool.query('DELETE FROM categories WHERE category_id = ?', [req.params.id]);
     res.json({ message: 'Category deleted.' });
@@ -131,7 +184,17 @@ const STOCK_REMOVE_REASONS = ['Damaged', 'Lost', 'Other'];
 //   add    = restock: the quantity is ADDED to the stock
 //   remove = damaged / lost: the quantity is TAKEN AWAY from the stock
 //   set    = correction: the stock BECOMES the quantity (it is not added)
-app.post('/api/products/:id/stock-adjustment', verifyToken, requirePermission('inventory'), async (req, res) => {
+app.post('/api/products/:id/stock-adjustment', verifyToken, requirePermission('inventory'), track('stock.adjust', {
+  lookup: lookupProductName,
+  describe: (req, name, body) => {
+    if (!name || body.newStock === undefined) return null;
+    const mode = (req.body || {}).mode || (Number((req.body || {}).change_amount) > 0 ? 'add' : 'remove');
+    if (mode === 'add') return `Restocked "${name}": +${body.change} (${body.previousStock} → ${body.newStock})`;
+    if (mode === 'set') return `Corrected the stock of "${name}": ${body.previousStock} → ${body.newStock}`;
+    return `Removed ${Math.abs(body.change)} of "${name}"${req.body.reason ? ' (' + req.body.reason + ')' : ''}: ${body.previousStock} → ${body.newStock}`;
+  },
+  entity: (req) => ['product', Number(req.params.id)],
+}), async (req, res) => {
   const productId = Number(req.params.id);
   const body = req.body || {};
   if (!Number.isInteger(productId) || productId <= 0) return res.status(400).json({ error: 'Invalid product.' });
@@ -241,7 +304,7 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // POST /api/products - gumawa ng bagong product
-app.post('/api/products', verifyToken, requirePermission('products'), async (req, res) => {
+app.post('/api/products', verifyToken, requirePermission('products'), track('product.create', { describe: (req) => `Added the product "${req.body.product_name}" (₱${Number(req.body.price).toLocaleString('en-US')})`, entity: (req, b, body) => ['product', body.product_id] }), async (req, res) => {
   try {
     const { category_id, product_name, description, price, stock, image, status, weight_grams, audience } = req.body;
 
@@ -270,7 +333,7 @@ app.post('/api/products', verifyToken, requirePermission('products'), async (req
 });
 
 // PUT /api/products/:id - i-update ang isang product
-app.put('/api/products/:id', verifyToken, requirePermission('products'), async (req, res) => {
+app.put('/api/products/:id', verifyToken, requirePermission('products'), track('product.update', { lookup: lookupProductName, describe: (req, name) => (name ? `Edited the product "${name}"` : null), entity: (req) => ['product', Number(req.params.id)] }), async (req, res) => {
   try {
     const { category_id, product_name, description, price, stock, image, status, weight_grams, audience } = req.body;
 
@@ -299,7 +362,7 @@ app.put('/api/products/:id', verifyToken, requirePermission('products'), async (
 
 // DELETE /api/products/:id
 // Changes only the status and / or the audience of a product (the dropdowns in the Products table)
-app.put('/api/products/:id/quick', verifyToken, requirePermission('products'), async (req, res) => {
+app.put('/api/products/:id/quick', verifyToken, requirePermission('products'), track('product.status', { lookup: lookupProductName, describe: (req, name) => (name ? (req.body.status ? `Set "${name}" to ${req.body.status}` : `Changed who "${name}" is for to ${req.body.audience}`) : null), entity: (req) => ['product', Number(req.params.id)] }), async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid product.' });
@@ -321,7 +384,7 @@ app.put('/api/products/:id/quick', verifyToken, requirePermission('products'), a
   }
 });
 
-app.delete('/api/products/:id', verifyToken, requirePermission('products'), async (req, res) => {
+app.delete('/api/products/:id', verifyToken, requirePermission('products'), track('product.delete', { lookup: lookupProductName, describe: (req, name) => (name ? `Deleted the product "${name}"` : null), entity: (req) => ['product', Number(req.params.id)] }), async (req, res) => {
   try {
     await pool.query('DELETE FROM products WHERE product_id = ?', [req.params.id]);
     res.json({ message: 'Product deleted.' });
@@ -415,7 +478,17 @@ app.get('/api/reviews', verifyToken, requirePermission('reviews'), async (req, r
 });
 
 // PUT /api/reviews/:id/status - i-approve o i-hide ang isang review (admin lang)
-app.put('/api/reviews/:id/status', verifyToken, requirePermission('reviews'), async (req, res) => {
+app.put('/api/reviews/:id/status', verifyToken, requirePermission('reviews'), track(
+  (req, before) => (req.body.status === 'hidden' ? 'review.hide' : before && before.status === 'pending' ? 'review.approve' : 'review.show'),
+  {
+    lookup: lookupReview,
+    describe: (req, review) => {
+      if (!review) return null;
+      const verb = req.body.status === 'hidden' ? 'Hid' : review.status === 'pending' ? 'Approved' : 'Showed';
+      return `${verb} the review of ${review.customer_name || 'a customer'} on "${review.product_name || 'a product'}"`;
+    },
+    entity: (req) => ['review', Number(req.params.id)],
+  }), async (req, res) => {
   try {
     const { status } = req.body;
     const validStatuses = ['pending', 'approved', 'hidden'];
@@ -433,7 +506,7 @@ app.put('/api/reviews/:id/status', verifyToken, requirePermission('reviews'), as
 });
 
 // DELETE /api/reviews/:id - permanenteng tanggalin ang isang review (admin lang)
-app.delete('/api/reviews/:id', verifyToken, requirePermission('reviews'), async (req, res) => {
+app.delete('/api/reviews/:id', verifyToken, requirePermission('reviews'), track('review.delete', { lookup: lookupReview, describe: (req, review) => (review ? `Deleted the review of ${review.customer_name || 'a customer'} on "${review.product_name || 'a product'}"` : null), entity: (req) => ['review', Number(req.params.id)] }), async (req, res) => {
   try {
     await pool.query('DELETE FROM reviews WHERE review_id = ?', [req.params.id]);
     res.json({ message: 'Review deleted.' });
@@ -593,7 +666,7 @@ app.get('/api/products/:id/images', async (req, res) => {
 });
 
 // POST /api/products/:id/images - magdagdag ng bagong larawan sa gallery (admin lang)
-app.post('/api/products/:id/images', verifyToken, requirePermission('products'), async (req, res) => {
+app.post('/api/products/:id/images', verifyToken, requirePermission('products'), track('product.update', { lookup: lookupProductName, describe: (req, name) => (name ? `Added a photo to "${name}"` : null), entity: (req) => ['product', Number(req.params.id)] }), async (req, res) => {
   try {
     const { image_url } = req.body;
     if (!image_url) {
@@ -618,7 +691,7 @@ app.post('/api/products/:id/images', verifyToken, requirePermission('products'),
 });
 
 // DELETE /api/products/images/:imageId - tanggalin ang isang larawan sa gallery (admin lang)
-app.delete('/api/products/images/:imageId', verifyToken, requirePermission('products'), async (req, res) => {
+app.delete('/api/products/images/:imageId', verifyToken, requirePermission('products'), track('product.update', { lookup: lookupImageProduct, describe: (req, name) => (name ? `Removed a photo of "${name}"` : null), entity: () => ['product', null] }), async (req, res) => {
   try {
     await pool.query('DELETE FROM product_images WHERE image_id = ?', [req.params.imageId]);
     res.json({ message: 'Image deleted.' });

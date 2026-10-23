@@ -60,6 +60,7 @@
       <a href="#reports" data-page="reports" class="nav-link">Sales Reports</a>
       <a href="#reviews" data-page="reviews" class="nav-link">Reviews</a>
       <a href="#admins" data-page="admins" class="nav-link">Admins</a>
+      <a href="#activity" data-page="activity" class="nav-link">Activity</a>
       <a href="#profile" data-page="profile" class="nav-link">My profile</a>
     </nav>
     <button id="logoutBtn" class="logout-btn">Log out</button>
@@ -95,22 +96,31 @@
     <!-- ---------------- DASHBOARD PAGE ---------------- -->
     <section id="page-dashboard" class="page active">
       <div class="stats-row">
-        <div class="stat-card">
+        <div class="stat-card" data-go="products">
           <h3>Total products</h3>
           <div class="value" id="statTotalProducts">--</div>
+          <span class="stat-link">View products &rarr;</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" data-go="orders">
           <h3>Total orders</h3>
           <div class="value" id="statTotalOrders">--</div>
+          <span class="stat-link">View orders &rarr;</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" data-go="orders" data-filter="pending">
           <h3>Pending orders</h3>
           <div class="value" id="statPendingOrders">--</div>
+          <span class="stat-link">View pending orders &rarr;</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" data-go="reports" data-preset="year">
           <h3>Revenue</h3>
           <div class="value" id="statRevenue">--</div>
+          <span class="stat-link">View sales reports &rarr;</span>
         </div>
+      </div>
+
+      <div class="card attention-card">
+        <h3>Needs attention</h3>
+        <ul id="attentionList" class="simple-list"><li>Loading...</li></ul>
       </div>
 
       <div class="dashboard-columns">
@@ -127,11 +137,11 @@
 
     <!-- ---------------- PRODUCTS PAGE ---------------- -->
     <section id="page-products" class="page">
+      <div class="page-head">
       <div class="section-header">
         <h2>Products</h2>
         <button id="addProductBtn" class="primary-btn">+ Add product</button>
       </div>
-
       <div class="filter-bar">
         <input type="text" id="productSearch" placeholder="Search product name...">
         <select id="productCategoryFilter">
@@ -151,8 +161,9 @@
           <option value="stock_desc">Stock: High to low</option>
         </select>
       </div>
+      </div>
 
-      <div class="table-wrap">
+      <div class="table-wrap fit">
         <table>
           <thead>
             <tr>
@@ -175,11 +186,13 @@
 
     <!-- ---------------- CATEGORIES PAGE ---------------- -->
     <section id="page-categories" class="page">
+      <div class="page-head">
       <div class="section-header">
         <h2>Categories</h2>
         <button id="addCategoryBtn" class="primary-btn">+ Add category</button>
       </div>
-      <div class="table-wrap">
+      </div>
+      <div class="table-wrap fit">
         <table>
           <thead>
             <tr>
@@ -201,12 +214,10 @@
 
     <!-- ---------------- INVENTORY PAGE ---------------- -->
     <section id="page-inventory" class="page">
+      <div class="page-head">
       <div class="section-header">
         <h2>Inventory</h2>
       </div>
-
-      <div id="inventoryStats" class="stats-row"></div>
-
       <div class="filter-bar">
         <input type="text" id="inventorySearch" placeholder="Search product name...">
         <select id="inventoryFilter">
@@ -216,6 +227,8 @@
           <option value="ok">In stock</option>
         </select>
       </div>
+      </div>
+      <div id="inventoryStats" class="stats-row"></div>
 
       <div class="table-wrap">
         <table>
@@ -242,11 +255,13 @@
 
     <!-- ---------------- CUSTOMERS PAGE ---------------- -->
     <section id="page-customers" class="page">
+      <div class="page-head">
       <div class="section-header">
         <h2>Customers</h2>
         <input type="text" id="customerSearch" placeholder="Search name or email..." style="max-width:260px;">
       </div>
-      <div class="table-wrap">
+      </div>
+      <div class="table-wrap fit">
         <table>
           <thead>
             <tr>
@@ -267,11 +282,11 @@
 
     <!-- ---------------- ORDERS PAGE ---------------- -->
     <section id="page-orders" class="page">
+      <div class="page-head">
       <div class="section-header">
         <h2>Orders</h2>
         <button id="orderExport" class="secondary-btn">Export CSV</button>
       </div>
-
       <div class="filter-bar">
         <input type="text" id="orderSearch" placeholder="Search code, customer, item...">
         <select id="orderStatusFilter">
@@ -285,6 +300,7 @@
         </select>
         <select id="orderPaymentFilter">
           <option value="all">All payments</option>
+          <option value="ready">Ready to process (COD or paid)</option>
           <option value="cod">Cash on Delivery</option>
           <option value="gcash">GCash</option>
           <option value="awaiting">GCash: waiting for payment</option>
@@ -298,8 +314,9 @@
         <button id="orderClear" class="secondary-btn">Clear</button>
       </div>
       <p class="result-count" id="orderCount"></p>
+      </div>
 
-      <div class="table-wrap">
+      <div class="table-wrap fit">
         <table>
           <thead>
             <tr>
@@ -326,6 +343,7 @@
           <button type="button" class="chip" data-range="30">Last 30 days</button>
           <button type="button" class="chip" data-range="month">This month</button>
           <button type="button" class="chip" data-range="lastmonth">Last month</button>
+          <button type="button" class="chip" data-range="year">Last 12 months</button>
           <button type="button" class="chip" data-range="custom">Choose dates</button>
         </div>
         <div class="range-custom hidden" id="reportCustom">
@@ -381,6 +399,7 @@
 
     <!-- ---------------- REVIEWS PAGE ---------------- -->
     <section id="page-reviews" class="page">
+      <div class="page-head">
       <div class="section-header">
         <h2>Reviews</h2>
         <select id="reviewStatusFilter" class="status-select">
@@ -390,7 +409,8 @@
           <option value="hidden">Hidden</option>
         </select>
       </div>
-      <div class="table-wrap">
+      </div>
+      <div class="table-wrap fit">
         <table>
           <thead>
             <tr>
@@ -411,26 +431,74 @@
 
     <!-- ---------------- ADMIN MANAGEMENT PAGE ---------------- -->
     <section id="page-admins" class="page">
+      <div class="page-head">
       <div class="section-header">
         <h2>Admins</h2>
         <button id="addAdminBtn" class="primary-btn">+ Add admin</button>
       </div>
-      <div class="table-wrap">
+      </div>
+      <div class="table-wrap fit">
         <table>
           <thead>
             <tr>
               <th>Admin</th>
               <th>Username</th>
               <th>Role</th>
+              <th>Status</th>
               <th>Access</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody id="adminsTableBody">
-            <tr><td colspan="5">Loading...</td></tr>
+            <tr><td colspan="6">Loading...</td></tr>
           </tbody>
         </table>
       </div>
+    </section>
+
+    <!-- ---------------- ACTIVITY PAGE (Super Admin only) ---------------- -->
+    <section id="page-activity" class="page">
+      <div class="page-head">
+        <div class="section-header">
+          <h2>Activity</h2>
+          <button id="activityRefresh" class="secondary-btn">Refresh</button>
+        </div>
+        <div class="filter-bar">
+          <select id="activityAdmin"><option value="">All admins</option></select>
+          <select id="activityType">
+            <option value="">All activity</option>
+            <option value="product">Products</option>
+            <option value="stock">Stock</option>
+            <option value="category">Categories</option>
+            <option value="order">Orders</option>
+            <option value="customer">Customers</option>
+            <option value="review">Reviews</option>
+            <option value="admin">Admin accounts and logins</option>
+            <option value="profile">Own profile</option>
+          </select>
+          <div class="date-range">
+            <label class="date-field"><span>From</span><input type="date" id="activityFrom"></label>
+            <label class="date-field"><span>To</span><input type="date" id="activityTo"></label>
+          </div>
+          <button id="activityClear" class="secondary-btn">Clear</button>
+        </div>
+      </div>
+      <div class="table-wrap fit">
+        <table>
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Admin</th>
+              <th>Type</th>
+              <th>What they did</th>
+            </tr>
+          </thead>
+          <tbody id="activityBody">
+            <tr><td colspan="4">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="load-more"><button id="activityMore" class="secondary-btn hidden">Load more</button></div>
     </section>
 
     <!-- ---------------- MY PROFILE PAGE (the admin who is logged in) ---------------- -->

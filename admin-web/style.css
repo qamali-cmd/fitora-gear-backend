@@ -641,3 +641,59 @@ a.admin-chip:hover { transform: translateY(-1px); border-color: rgba(252, 64, 14
 .date-range { display: flex; align-items: center; gap: 12px; flex-wrap: nowrap; }
 #page-orders .filter-bar input[type="text"] { flex: 1 1 260px; min-width: 240px; }
 .date-range .date-field input { width: 150px; }
+
+/* ---------------------------------------------------------------------
+   APP SHELL: the sidebar (and the logo) and the top bar NEVER move. Only the content area scrolls.
+   On a list page the title and the filters stay in place and only the table scrolls.
+   --------------------------------------------------------------------- */
+body.app-open { overflow: hidden; overscroll-behavior: none; }
+body.app-open .app-layout { height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; }
+body.app-open .sidebar { height: 100%; overscroll-behavior: contain; }
+body.app-open .main-content { height: 100%; overflow-y: auto; overflow-x: hidden; overscroll-behavior: none; }
+.page-head { position: sticky; top: var(--topbar-h, 78px); z-index: 25; margin: -4px -38px 0; padding: 4px 38px 2px;
+  background: rgba(246, 243, 246, 0.90); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); }
+.page-head .filter-bar:last-child, .page-head .result-count:last-child { margin-bottom: 14px; }
+.page-head .section-header { margin-bottom: 14px; }
+body.app-open .table-wrap.fit { max-height: calc(100vh - var(--topbar-h, 78px) - var(--head-h, 0px) - 90px); max-height: calc(100dvh - var(--topbar-h, 78px) - var(--head-h, 0px) - 90px); min-height: 200px; overscroll-behavior: auto; }
+.table-wrap tbody tr { scroll-margin-top: 64px; }
+@media (max-width: 900px) { .page-head { margin: -4px -18px 0; padding: 4px 18px 2px; } }
+
+/* the cards and lines of the Dashboard that lead somewhere */
+.stat-card .stat-link { display: none; margin-top: 10px; font-size: 12px; font-weight: 700; color: var(--primary-dark); letter-spacing: 0.01em; }
+.stat-card.clickable { cursor: pointer; transition: transform 0.18s, box-shadow 0.18s, border-color 0.18s; }
+.stat-card.clickable .stat-link { display: inline-block; }
+.stat-card.clickable:hover { transform: translateY(-3px); box-shadow: 0 16px 34px rgba(252, 64, 140, 0.18); border-color: rgba(252, 64, 140, 0.35); }
+.stat-card.clickable:focus-visible { outline: 3px solid rgba(252, 64, 140, 0.45); outline-offset: 2px; }
+.simple-list li.clickable { cursor: pointer; border-radius: 12px; transition: background 0.15s; }
+.simple-list li.clickable:hover { background: #fff3f8; }
+
+/* ---------------------------------------------------------------------
+   PRESENCE (online / offline / inactive), the ACTIVITY page, and NEEDS ATTENTION
+   --------------------------------------------------------------------- */
+.presence { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; font-size: 13px; }
+.presence i { width: 9px; height: 9px; border-radius: 50%; background: #b9b2bc; display: inline-block; }
+.presence-online { color: #1e8e4f; }
+.presence-online i { background: #28c76f; box-shadow: 0 0 0 4px rgba(40, 199, 111, 0.2); }
+.presence-offline { color: #6d6573; }
+.presence-inactive { color: #cf3a2c; }
+.presence-inactive i { background: #e5584a; }
+tr.row-inactive td { opacity: 0.62; }
+tr.row-inactive td:last-child { opacity: 1; }
+.activity-product { background: #e8f0ff; color: #2f5fd0; }
+.activity-stock { background: #e5f7f4; color: #137a69; }
+.activity-category { background: #efe9fb; color: #6a45c2; }
+.activity-order { background: #ffe8f1; color: #d6246f; }
+.activity-customer { background: #fff1de; color: #a8650c; }
+.activity-review { background: #fff8d9; color: #8a6d0b; }
+.activity-admin { background: #fdecea; color: #b8352a; }
+.activity-profile { background: #efecef; color: #5f5865; }
+.activity-login { background: #e8f8ee; color: #1e8e4f; }
+.load-more { display: flex; justify-content: center; padding: 18px 0 8px; }
+.attention-card { margin-bottom: 18px; }
+.attention-card .simple-list li { padding: 13px 14px; }
+.attention-card .simple-list li b { font-size: 17px; margin-right: 4px; }
+.attention-card li.attention-red { border-left: 4px solid #e5584a; }
+.attention-card li.attention-pink { border-left: 4px solid var(--primary); }
+.attention-card li.attention-amber { border-left: 4px solid #f0a53a; }
+.attention-card li.attention-clear { color: #176b3b; background: #e8f8ee; border-radius: 12px; justify-content: center; }
+.attention-view { color: var(--primary-dark); font-size: 12.5px; font-weight: 700; }

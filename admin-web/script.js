@@ -22,6 +22,12 @@ const CLOUDINARY_UPLOAD_PRESET = 'IMAGES';
 // The state of the My profile page. These are declared HERE, at the top, because the page can be opened
 // right when the site loads (for example by refreshing while on My profile).
 let allOrders = []; // the orders of the Orders page
+let ordersPreset = null; // a filter chosen on the Dashboard (for example the pending orders), used when the Orders page opens
+let inventoryPreset = null; // the same for the Inventory page (for example the low stock products)
+let reviewPreset = null; // the same for the Reviews page (the reviews waiting for approval)
+let allProductsForInventory = []; // the products of the Inventory page
+let allReviews = []; // the reviews of the Reviews page
+const activityState = { before: null, loaded: 0 }; // the Activity page: where the next "Load more" continues
 const reportState = { preset: '7', from: '', to: '' }; // the period of the Sales Reports page
 let reportRequest = 0;
 let profileState = null;
@@ -142,7 +148,8 @@ window.fetch = async (...args) => {
   const url = typeof args[0] === 'string' ? args[0] : '';
   if (response.status === 401 && /onrender\.com/.test(url) && getToken() && !sessionEndedShown) {
     sessionEndedShown = true;
-    openPopup({ type: 'warning', title: 'Logged out', message: 'Your session has ended, or this account is no longer available. Please log in again.', buttons: [{ text: 'OK', value: true }] })
+    const data = await response.clone().json().catch(() => ({}));
+    openPopup({ type: 'warning', title: 'Logged out', message: data.error || 'Your session has ended, or this account is no longer available. Please log in again.', buttons: [{ text: 'OK', value: true }] })
       .then(() => { sessionStorage.clear(); location.reload(); });
   }
   return response;
@@ -191,7 +198,11 @@ loginForm.addEventListener('submit', async (e) => {
   }
 });
 
-document.getElementById('logoutBtn').addEventListener('click', () => {
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  sessionEndedShown = true; // no "Logged out" message: the admin pressed the button
+  try {
+    await Promise.race([fetch(API.AUTH + '/admins/me/logout', { method: 'POST', headers: authHeaders() }), new Promise(resolve => setTimeout(resolve, 2500))]);
+  } catch (err) { /* not important: the admin is logged out here anyway */ }
   sessionStorage.removeItem('fitora_token');
   sessionStorage.removeItem('fitora_admin');
   location.hash = '';
@@ -201,6 +212,9 @@ document.getElementById('logoutBtn').addEventListener('click', () => {
 function showApp() {
   loginScreen.classList.add('hidden');
   adminApp.classList.remove('hidden');
+  document.body.classList.add('app-open'); // from now on the page itself does not scroll: only the content area does
+  setupStickyOffsets();
+  applyDashboardLinks();
 
   const admin = JSON.parse(sessionStorage.getItem('fitora_admin') || '{}');
   renderAdminChip();
@@ -264,6 +278,32 @@ async function refreshAdminSession() {
   }
 }
 
+// ===========================================================
+// FIXED TOP PARTS: the sizes that the CSS needs to keep the title and the filters of a page in place
+// (--topbar-h = the top bar, --head-h = the title and filters of the open page)
+// ===========================================================
+function updateStickyOffsets() {
+  const style = document.documentElement.style;
+  const topbar = document.querySelector('.topbar');
+  const head = document.querySelector('.page.active .page-head');
+  if (topbar) style.setProperty('--topbar-h', Math.ceil(topbar.getBoundingClientRect().height) + 'px');
+  style.setProperty('--head-h', head ? Math.ceil(head.getBoundingClientRect().height) + 'px' : '0px');
+}
+
+let stickyWatching = false;
+function setupStickyOffsets() {
+  updateStickyOffsets();
+  if (stickyWatching) return;
+  stickyWatching = true;
+  window.addEventListener('resize', updateStickyOffsets);
+  if (typeof ResizeObserver === 'function') {
+    const watcher = new ResizeObserver(updateStickyOffsets); // the filters can wrap to a second line, or a count can appear
+    const topbar = document.querySelector('.topbar');
+    if (topbar) watcher.observe(topbar);
+    document.querySelectorAll('.page-head').forEach(head => watcher.observe(head));
+  }
+}
+
 // EDIT DITO: ito ang listahan ng mga "gated" na tabs (hindi kasama ang dashboard,
 // dahil laging bukas ito sa lahat ng naka-login na admin)
 const GATED_PAGES = ['products', 'categories', 'inventory', 'customers', 'orders', 'reports', 'reviews'];
@@ -273,7 +313,7 @@ const GATED_PAGES = ['products', 'categories', 'inventory', 'customers', 'orders
 function hasAccess(page) {
   const admin = JSON.parse(sessionStorage.getItem('fitora_admin') || '{}');
   if (page === 'dashboard' || page === 'profile') return true; // everyone can open their own profile
-  if (page === 'admins') return admin.role === 'super_admin';
+  if (page === 'admins' || page === 'activity') return admin.role === 'super_admin';
   if (admin.role === 'super_admin') return true;
   return (admin.permissions || []).includes(page);
 }
@@ -329,16 +369,19 @@ function navigateTo(page) {
   document.getElementById('page-' + page).classList.add('active');
   document.querySelector('.nav-link[data-page="' + page + '"]').classList.add('active');
   document.getElementById('pageTitle').textContent = page.charAt(0).toUpperCase() + page.slice(1);
+  document.querySelector('.main-content').scrollTop = 0; // every page starts at its top
+  updateStickyOffsets();
 
   if (page === 'dashboard') loadDashboard();
   if (page === 'products') loadProducts();
   if (page === 'categories') loadCategories(true);
-  if (page === 'inventory') loadInventory();
+  if (page === 'inventory') loadInventory(true);
   if (page === 'customers') loadCustomers();
   if (page === 'orders') loadOrders(true);
   if (page === 'reports') loadReports();
-  if (page === 'reviews') loadReviews();
+  if (page === 'reviews') loadReviews(true);
   if (page === 'admins') loadAdmins();
+  if (page === 'activity') loadActivity(true);
   if (page === 'profile') loadProfile();
 }
 
@@ -357,22 +400,95 @@ async function loadDashboard() {
     document.getElementById('statTotalProducts').textContent = products.length;
     document.getElementById('statTotalOrders').textContent = orderStats.totalOrders;
     document.getElementById('statPendingOrders').textContent = orderStats.pendingOrders;
-    document.getElementById('statRevenue').textContent = '₱' + Number(orderStats.totalRevenue).toLocaleString();
+    document.getElementById('statRevenue').textContent = peso0(orderStats.totalRevenue);
 
+    // a line of the low stock list opens the Inventory page, showing only the low stock products
     const lowStockList = document.getElementById('lowStockList');
     lowStockList.innerHTML = lowStock.length
-      ? lowStock.map(p => `<li><span>${p.product_name}</span><span>${p.stock} left</span></li>`).join('')
+      ? lowStock.map(p => `<li class="clickable" data-go="inventory" data-inventory="low"><span>${orderEsc(p.product_name)}</span><span>${p.stock} left</span></li>`).join('')
       : '<li>No low-stock products.</li>';
 
+    // a line of the recent orders opens the details of that order
     const recentList = document.getElementById('recentOrdersList');
     recentList.innerHTML = orders.slice(0, 5).map(o =>
-      `<li><span><b>${orderEsc(o.order_code || 'Order #' + o.order_id)}</b> · ${orderEsc(o.customer_name || 'N/A')}${o.items_summary ? `<span class="muted-small" style="display:block">${orderEsc(o.items_summary)}</span>` : ''}</span><span>₱${Number(o.total_amount).toLocaleString()}</span></li>`
+      `<li class="clickable" data-order-id="${o.order_id}"><span><b>${orderEsc(o.order_code || 'Order #' + o.order_id)}</b> · ${orderEsc(o.customer_name || 'N/A')}${o.items_summary ? `<span class="muted-small" style="display:block">${orderEsc(o.items_summary)}</span>` : ''}</span><span class="badge badge-${orderEsc(o.status)}">${orderEsc(o.status)}</span></li>`
     ).join('') || '<li>No orders yet.</li>';
-
+    // reviews waiting for approval (only if this admin may open the Reviews page)
+    let pendingReviews = 0;
+    if (hasAccess('reviews')) {
+      try {
+        const reviewRes = await fetch(API.PRODUCTS + '/reviews', { headers: authHeaders() });
+        const reviews = await reviewRes.json();
+        if (reviewRes.ok && Array.isArray(reviews)) pendingReviews = reviews.filter(r => r.status === 'pending').length;
+      } catch (err) { /* the box simply does not show reviews */ }
+    }
+    renderAttention(orders, lowStock, pendingReviews);
+    applyDashboardLinks();
   } catch (err) {
     console.error(err);
   }
 }
+
+// What a card or line of the Dashboard opens. A card is only pressable if this admin may open that page.
+function goFromDashboard(go, card) {
+  if (!hasAccess(go)) return;
+  const d = (card && card.dataset) || {};
+  if (go === 'orders') {
+    const status = d.status || d.filter;
+    ordersPreset = status || d.payment ? { status, payment: d.payment } : null;
+  }
+  if (go === 'inventory') inventoryPreset = d.inventory || 'low';
+  if (go === 'reviews') reviewPreset = d.reviews || null;
+  if (go === 'reports' && d.preset) {
+    const range = presetRange(d.preset);
+    Object.assign(reportState, { preset: d.preset, from: range.from, to: range.to });
+  }
+  location.hash = '#' + go;
+}
+
+// "Needs attention": the things the shop should look at now. Only what this admin may open is shown.
+function renderAttention(orders, lowStock, pendingReviews) {
+  const list = document.getElementById('attentionList');
+  const count = (test) => orders.filter(test).length;
+  const lines = [
+    { n: count(o => o.cancel_request_status === 'requested'), go: 'orders', data: { status: 'cancel_requests' }, one: 'customer asks to cancel an order', many: 'customers ask to cancel an order', tone: 'red' },
+    { n: count(o => o.payment_status === 'refund_pending'), go: 'orders', data: { payment: 'refund_pending' }, one: 'refund to give back to a customer', many: 'refunds to give back to customers', tone: 'red' },
+    { n: count(o => o.status === 'pending' && !(o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment')), go: 'orders', data: { status: 'pending', payment: 'ready' }, one: 'new order to process', many: 'new orders to process', tone: 'pink' },
+    { n: count(o => o.status === 'processing'), go: 'orders', data: { status: 'processing' }, one: 'order to ship', many: 'orders to ship', tone: 'pink' },
+    { n: count(o => o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment'), go: 'orders', data: { payment: 'awaiting' }, one: 'GCash order waiting for payment', many: 'GCash orders waiting for payment', tone: 'amber' },
+    { n: lowStock.filter(p => Number(p.stock) <= 0).length, go: 'inventory', data: { inventory: 'out' }, one: 'product is out of stock', many: 'products are out of stock', tone: 'red' },
+    { n: lowStock.filter(p => Number(p.stock) > 0).length, go: 'inventory', data: { inventory: 'low' }, one: 'product is running low', many: 'products are running low', tone: 'amber' },
+    { n: pendingReviews, go: 'reviews', data: { reviews: 'pending' }, one: 'review waits for approval', many: 'reviews wait for approval', tone: 'amber' },
+  ].filter(line => line.n > 0 && hasAccess(line.go));
+  list.innerHTML = lines.length
+    ? lines.map(line => `<li class="clickable attention-${line.tone}" data-go="${line.go}" ${Object.entries(line.data).map(([k, v]) => `data-${k}="${v}"`).join(' ')}><span><b>${line.n}</b> ${line.n === 1 ? line.one : line.many}</span><span class="attention-view">View &rarr;</span></li>`).join('')
+    : '<li class="attention-clear">All clear. Nothing needs your attention right now.</li>';
+}
+
+function applyDashboardLinks() {
+  document.querySelectorAll('#page-dashboard .stat-card[data-go]').forEach(card => {
+    const allowed = hasAccess(card.dataset.go);
+    card.classList.toggle('clickable', allowed);
+    if (allowed) { card.setAttribute('role', 'button'); card.setAttribute('tabindex', '0'); }
+    else { card.removeAttribute('role'); card.removeAttribute('tabindex'); }
+  });
+}
+
+document.querySelectorAll('#page-dashboard .stat-card[data-go]').forEach(card => {
+  card.addEventListener('click', () => goFromDashboard(card.dataset.go, card));
+  card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goFromDashboard(card.dataset.go, card); } });
+});
+document.getElementById('recentOrdersList').addEventListener('click', (e) => {
+  const line = e.target.closest('[data-order-id]');
+  if (line) openOrderDetails(Number(line.dataset.orderId));
+});
+document.getElementById('lowStockList').addEventListener('click', (e) => {
+  if (e.target.closest('[data-go]')) goFromDashboard('inventory');
+});
+document.getElementById('attentionList').addEventListener('click', (e) => {
+  const line = e.target.closest('[data-go]');
+  if (line) goFromDashboard(line.dataset.go, line);
+});
 
 // ===========================================================
 // PRODUCTS
@@ -514,6 +630,15 @@ document.getElementById('productAudienceFilter').addEventListener('change', rend
 ['orderStatusFilter', 'orderPaymentFilter', 'orderFrom', 'orderTo'].forEach(id => document.getElementById(id).addEventListener('change', () => renderOrders()));
 document.getElementById('orderClear').addEventListener('click', () => { resetOrderFilterInputs(); renderOrders(); });
 document.getElementById('orderExport').addEventListener('click', exportOrdersCsv);
+
+// the Activity page
+['activityAdmin', 'activityType', 'activityFrom', 'activityTo'].forEach(id => document.getElementById(id).addEventListener('change', () => loadActivity(true)));
+document.getElementById('activityRefresh').addEventListener('click', () => loadActivity(true));
+document.getElementById('activityMore').addEventListener('click', () => loadActivity(false));
+document.getElementById('activityClear').addEventListener('click', () => {
+  ['activityAdmin', 'activityType', 'activityFrom', 'activityTo'].forEach(id => { document.getElementById(id).value = ''; });
+  loadActivity(true);
+});
 
 // the Reports page
 document.querySelectorAll('#reportRanges .chip').forEach(chip => chip.addEventListener('click', () => choosePreset(chip.dataset.range)));
@@ -987,10 +1112,16 @@ modalOverlay.addEventListener('click', (e) => {
 // ===========================================================
 // INVENTORY MANAGEMENT
 // ===========================================================
-let allProductsForInventory = [];
 
-async function loadInventory() {
+async function loadInventory(resetFilters) {
   const tbody = document.getElementById('inventoryTableBody');
+  if (resetFilters) {
+    // the filter is set at once (what the Dashboard chose, or empty)
+    document.getElementById('inventorySearch').value = '';
+    document.getElementById('inventoryFilter').value = inventoryPreset || 'all';
+    inventoryPreset = null;
+    if (allProductsForInventory.length) renderInventoryTable();
+  }
   try {
     const res = await fetch(API.PRODUCTS + '/products');
     allProductsForInventory = await res.json();
@@ -1241,13 +1372,22 @@ async function markRefunded(orderId) {
 // after an action (ship, cancel...) the list is refreshed with the same filters.
 async function loadOrders(resetFilters) {
   const tbody = document.getElementById('ordersTableBody');
+  if (resetFilters) {
+    // the filters are set at once (what the Dashboard chose, or empty), so the old list is never seen with the wrong filter
+    resetOrderFilterInputs();
+    if (ordersPreset) {
+      if (ordersPreset.status) document.getElementById('orderStatusFilter').value = ordersPreset.status;
+      if (ordersPreset.payment) document.getElementById('orderPaymentFilter').value = ordersPreset.payment;
+      ordersPreset = null;
+    }
+    if (allOrders.length) renderOrders();
+  }
   try {
     const res = await fetch(API.ORDERS + '/orders', { headers: authHeaders() });
     const orders = await res.json();
     if (!res.ok) throw new Error(orders.error || 'Could not load the orders.');
     ordersCache = Object.fromEntries(orders.map(o => [o.order_id, o]));
     allOrders = orders;
-    if (resetFilters) resetOrderFilterInputs();
     renderOrders();
   } catch (err) {
     tbody.innerHTML = '<tr><td colspan="5">Cannot reach the order service. Please try again.</td></tr>';
@@ -1271,6 +1411,7 @@ function currentOrderFilters() {
 function orderMatches(o, f) {
   if (f.status === 'cancel_requests') { if (o.cancel_request_status !== 'requested') return false; }
   else if (f.status !== 'all' && o.status !== f.status) return false;
+  if (f.payment === 'ready' && o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment') return false; // not waiting for its payment
   if (f.payment === 'cod' && o.payment_method !== 'cod') return false;
   if (f.payment === 'gcash' && o.payment_method !== 'gcash') return false;
   if (f.payment === 'awaiting' && !(o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment')) return false;
@@ -1624,6 +1765,7 @@ function presetRange(preset) {
   if (preset === 'today') return { from: localDateKey(today), to: localDateKey(today) };
   if (preset === '7') return { from: back(6), to: localDateKey(today) };
   if (preset === '30') return { from: back(29), to: localDateKey(today) };
+  if (preset === 'year') return { from: back(364), to: localDateKey(today) };
   if (preset === 'month') return { from: localDateKey(new Date(today.getFullYear(), today.getMonth(), 1)), to: localDateKey(today) };
   if (preset === 'lastmonth') return { from: localDateKey(new Date(today.getFullYear(), today.getMonth() - 1, 1)), to: localDateKey(new Date(today.getFullYear(), today.getMonth(), 0)) };
   return null;
@@ -2211,10 +2353,15 @@ async function openCustomerDetails(userId, back) {
 // ===========================================================
 // REVIEWS MANAGEMENT
 // ===========================================================
-let allReviews = [];
 
-async function loadReviews() {
+async function loadReviews(resetFilter) {
   const tbody = document.getElementById('reviewsTableBody');
+  if (resetFilter) {
+    // the filter is set at once (what the Dashboard chose, or all)
+    document.getElementById('reviewStatusFilter').value = reviewPreset || 'all';
+    reviewPreset = null;
+    if (allReviews.length) renderReviews();
+  }
   try {
     const res = await fetch(API.PRODUCTS + '/reviews', { headers: authHeaders() });
     allReviews = await res.json();
@@ -2318,6 +2465,14 @@ function showApiError(message, title) {
   openPopup({ type: 'error', title: title || 'This could not be done', message, buttons: [{ text: 'OK', value: true }] });
 }
 
+// "Online now", "Last seen 5 min ago", "Last login ...", or "Never logged in"
+function adminPresence(a) {
+  if (a.online) return 'Online now';
+  if (a.last_seen_at) return 'Last seen ' + timeAgo(a.last_seen_at);
+  if (a.last_login_at) return 'Last login ' + timeAgo(a.last_login_at);
+  return 'Never logged in';
+}
+
 async function loadAdmins() {
   const tbody = document.getElementById('adminsTableBody');
   try {
@@ -2328,12 +2483,23 @@ async function loadAdmins() {
 
     tbody.innerHTML = allAdmins.map(a => {
       const isYou = currentAdmin && currentAdmin.id === a.admin_id;
+      const inactive = a.is_active === 0;
       const permissions = (a.permissions || '').split(',').filter(Boolean);
       const access = a.role === 'super_admin'
         ? '<span class="badge badge-plain badge-active">Full access</span>'
         : (permissions.map(p => `<span class="pill">${orderEsc(PERMISSION_LABELS[p] || p)}</span>`).join('') || '<span class="muted-small">No sections yet</span>');
+      const status = inactive
+        ? '<span class="presence presence-inactive"><i></i>Inactive</span><div class="muted-small">Cannot log in</div>'
+        : `<span class="presence ${a.online ? 'presence-online' : 'presence-offline'}"><i></i>${a.online ? 'Online' : 'Offline'}</span><div class="muted-small">${orderEsc(adminPresence(a))}</div>`;
+      const actions = isYou
+        ? '<button class="icon-btn" onclick="location.hash = \'profile\'">My profile</button>'
+        : `<button class="icon-btn" onclick="openEditAdmin(${a.admin_id})">Edit</button>
+           <button class="icon-btn" onclick="openResetPassword(${a.admin_id})">Reset password</button>
+           ${inactive ? '' : `<button class="icon-btn" onclick="forceLogoutAdmin(${a.admin_id})">Log out</button>`}
+           <button class="icon-btn ${inactive ? '' : 'danger'}" onclick="setAdminActive(${a.admin_id}, ${inactive ? 'true' : 'false'})">${inactive ? 'Activate' : 'Deactivate'}</button>
+           <button class="icon-btn danger" onclick="deleteAdmin(${a.admin_id})">Delete</button>`;
       return `
-      <tr data-admin-id="${a.admin_id}">
+      <tr data-admin-id="${a.admin_id}" class="${inactive ? 'row-inactive' : ''}">
         <td>
           <div class="inv-product">
             ${avatarPicture(a.profile_photo, a.full_name)}
@@ -2345,18 +2511,110 @@ async function loadAdmins() {
         </td>
         <td>@${orderEsc(a.username)}</td>
         <td>${a.role === 'super_admin' ? '<span class="badge badge-active">Super Admin</span>' : '<span class="badge">Staff</span>'}</td>
+        <td>${status}</td>
         <td>${access}</td>
-        <td>
-          ${isYou
-            ? '<button class="icon-btn" onclick="location.hash = \'profile\'">My profile</button>'
-            : `<button class="icon-btn" onclick="openEditAdmin(${a.admin_id})">Edit</button>
-          <button class="icon-btn" onclick="openResetPassword(${a.admin_id})">Reset password</button>
-          <button class="icon-btn danger" onclick="deleteAdmin(${a.admin_id})">Delete</button>`}
-        </td>
+        <td>${actions}</td>
       </tr>`;
-    }).join('') || '<tr><td colspan="5">No admins yet.</td></tr>';
+    }).join('') || '<tr><td colspan="6">No admins yet.</td></tr>';
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="5">Cannot reach the auth service. Please try again.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6">Cannot reach the auth service. Please try again.</td></tr>';
+  }
+}
+
+// the "online" dots are refreshed every 20 seconds while the Admins page is open
+setInterval(() => {
+  if (!document.hidden && document.querySelector('#page-admins.active') && !document.querySelector('#modalOverlay:not(.hidden)')) loadAdmins();
+}, 20000);
+
+// The Super Admin logs an admin out (they are sent to the login page; they can log in again)
+async function forceLogoutAdmin(adminId) {
+  const a = allAdmins.find(x => x.admin_id === adminId);
+  const name = a ? a.full_name : 'this admin';
+  if (!(await askConfirm(`Log out ${name}? They are sent back to the login page right away. They can log in again.`, 'Log out'))) return;
+  try {
+    const res = await fetch(API.AUTH + '/admins/' + adminId + '/force-logout', { method: 'POST', headers: authHeaders() });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not log the admin out.');
+    await loadAdmins();
+    showToast(`${name} was logged out.`);
+  } catch (err) {
+    showApiError(err.message);
+  }
+}
+
+// Deactivate = cannot log in (and is logged out now). Activate = can log in again.
+async function setAdminActive(adminId, active) {
+  const a = allAdmins.find(x => x.admin_id === adminId);
+  const name = a ? a.full_name : 'this admin';
+  if (!active && !(await askConfirm(`Deactivate ${name}? They are logged out right away, and cannot log in until you activate the account again.`, 'Deactivate'))) return;
+  try {
+    const res = await fetch(API.AUTH + '/admins/' + adminId + '/active', { method: 'PUT', headers: authHeaders(), body: JSON.stringify({ active }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not change the account.');
+    await loadAdmins();
+    showToast(active ? `${name} can log in again.` : `${name} was deactivated.`);
+  } catch (err) {
+    showApiError(err.message);
+  }
+}
+
+// ===========================================================
+// ACTIVITY (Super Admin only): who did what, newest first
+// ===========================================================
+const ACTIVITY_LABELS = { product: 'Product', stock: 'Stock', category: 'Category', order: 'Order', customer: 'Customer', review: 'Review', admin: 'Admin account', profile: 'Own profile' };
+function activityKind(action) {
+  if (action === 'admin.login') return ['Login', 'login'];
+  if (action === 'admin.logout') return ['Logout', 'login'];
+  const group = String(action).split('.')[0];
+  return [ACTIVITY_LABELS[group] || group, group];
+}
+
+async function loadActivity(reset) {
+  const body = document.getElementById('activityBody');
+  const more = document.getElementById('activityMore');
+  if (reset) { activityState.before = null; activityState.loaded = 0; body.innerHTML = '<tr><td colspan="4">Loading...</td></tr>'; more.classList.add('hidden'); }
+  try {
+    // the choice of admins is filled from the list of admins (once)
+    const select = document.getElementById('activityAdmin');
+    if (select.options.length <= 1) {
+      const listRes = await fetch(API.AUTH + '/admins', { headers: authHeaders() });
+      const admins = await listRes.json();
+      if (listRes.ok && Array.isArray(admins)) {
+        allAdmins = admins;
+        admins.forEach(a => select.add(new Option(a.full_name + ' (@' + a.username + ')', String(a.admin_id))));
+      }
+    }
+    const params = new URLSearchParams({ limit: '50' });
+    const f = { admin_id: select.value, type: document.getElementById('activityType').value, from: document.getElementById('activityFrom').value, to: document.getElementById('activityTo').value };
+    Object.entries(f).forEach(([k, v]) => { if (v) params.set(k, v); });
+    if (activityState.before) params.set('before', activityState.before);
+    const res = await fetch(API.AUTH + '/admin-activity?' + params.toString(), { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not load the activity.');
+    if (data.notReady) { body.innerHTML = '<tr><td colspan="4">The activity log is not ready yet. Run <b>migration_admin_activity.sql</b> in MySQL Workbench first.</td></tr>'; return; }
+
+    const rows = data.items.map(item => {
+      const [label, kind] = activityKind(item.action);
+      const when = new Date(item.created_at);
+      return `<tr>
+        <td><div>${orderEsc(when.toLocaleString())}</div><div class="muted-small">${orderEsc(timeAgo(item.created_at))}</div></td>
+        <td><div class="inv-product">${avatarPicture(null, item.admin_name)}<b>${orderEsc(item.admin_name)}</b></div></td>
+        <td><span class="badge badge-plain activity-${orderEsc(kind)}">${orderEsc(label)}</span></td>
+        <td>${orderEsc(item.description)}</td>
+      </tr>`;
+    }).join('');
+    if (reset) body.innerHTML = '';
+    if (data.items.length) {
+      body.insertAdjacentHTML('beforeend', rows);
+      activityState.before = data.items[data.items.length - 1].activity_id;
+      activityState.loaded += data.items.length;
+    } else if (reset) {
+      body.innerHTML = '<tr><td colspan="4">No activity found.</td></tr>';
+    }
+    more.classList.toggle('hidden', !data.hasMore);
+  } catch (err) {
+    if (reset) body.innerHTML = `<tr><td colspan="4">${orderEsc(err.message)}</td></tr>`;
+    else showToast(err.message, true);
   }
 }
 

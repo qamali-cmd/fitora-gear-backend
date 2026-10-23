@@ -208,6 +208,54 @@ async function checkVerificationCode(accountType, accountId, email, code) {
 // Tinatanggap: { username, password }
 // Ibinabalik: { token, admin: {...} } kung tama, o error kung mali
 // -----------------------------------------------------
+// =====================================================
+// ACTIVITY LOG: writes down what an admin did, AFTER it worked.
+// It never stops or changes the action: if writing fails, the action is still done.
+// =====================================================
+async function logActivity(admin, action, description, entityType, entityId) {
+  try {
+    await pool.query(
+      'INSERT INTO admin_activity (admin_id, admin_name, action, description, entity_type, entity_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [admin.adminId || null, String(admin.fullName || admin.username || 'Admin').slice(0, 100), action, String(description).slice(0, 300), entityType || null, entityId || null, new Date()]
+    );
+  } catch (err) {
+    console.warn('The activity was not written down:', err.message);
+  }
+}
+
+// Put it in a route after the permission check:  track('product.delete', { lookup, describe, entity })
+//   action   = a text, or a function (req, before, body) that gives the text
+//   lookup   = reads what is needed BEFORE the action (for example the name of something about to be deleted)
+//   describe = the sentence (return nothing to write nothing)
+//   entity   = [type, id] of what was changed
+function track(action, { lookup, describe, entity }) {
+  return async (req, res, next) => {
+    let before = null;
+    if (lookup) { try { before = await lookup(req); } catch (err) { before = null; } }
+    const send = res.json.bind(res);
+    res.json = (body) => {
+      const out = send(body);
+      const status = res.statusCode || res.code || 200;
+      if (status < 400) {
+        Promise.resolve()
+          .then(async () => {
+            const text = await describe(req, before, body || {});
+            if (!text) return;
+            const name = typeof action === 'function' ? action(req, before, body || {}) : action;
+            const [entityType, entityId] = entity ? entity(req, before, body || {}) : [];
+            await logActivity(req.admin, name, text, entityType, entityId);
+          })
+          .catch((err) => console.warn('The activity was not written down:', err.message));
+      }
+      return out;
+    };
+    return next();
+  };
+}
+
+const lookupCustomerName = async (req) => { const [r] = await pool.query('SELECT full_name FROM users WHERE user_id = ?', [Number(req.params.id)]); return r[0] ? r[0].full_name : null; };
+const lookupAdminName = async (req) => { const [r] = await pool.query('SELECT full_name FROM admins WHERE admin_id = ?', [Number(req.params.id)]); return r[0] ? r[0].full_name : null; };
+
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -229,6 +277,11 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Incorrect username or password.' });
     }
 
+    // A deactivated account cannot log in (this is checked AFTER the password, so a stranger learns nothing)
+    if (admin.is_active === 0 || admin.is_active === false) {
+      return res.status(403).json({ error: 'This admin account was deactivated. Please contact the Super Admin.', code: 'ADMIN_INACTIVE' });
+    }
+
     // Gawing array ang permissions (naka-store bilang comma-separated text sa DB)
     const permissionsArray = admin.permissions
       ? admin.permissions.split(',').map(p => p.trim()).filter(Boolean)
@@ -239,6 +292,11 @@ app.post('/api/auth/login', async (req, res) => {
       JWT_SECRET,
       { expiresIn: '8h' }
     );
+
+    // write down the login (this never stops the login; it fails quietly if the database was not updated yet)
+    const loginTime = new Date();
+    Promise.resolve(pool.query('UPDATE admins SET last_login_at = ?, last_seen_at = ? WHERE admin_id = ?', [loginTime, loginTime, admin.admin_id])).catch(() => {});
+    await logActivity({ adminId: admin.admin_id, fullName: admin.full_name, username: admin.username }, 'admin.login', 'Logged in', 'admin', admin.admin_id);
 
     res.json({
       token,
@@ -772,7 +830,18 @@ app.get('/api/auth/customers/:id', verifyToken, requirePermission('customers'), 
 });
 
 // ADMIN: activate, suspend, or ban a customer (suspend and ban need a reason, which the customer is shown)
-app.put('/api/auth/customers/:id/status', verifyToken, requirePermission('customers'), async (req, res) => {
+app.put('/api/auth/customers/:id/status', verifyToken, requirePermission('customers'), track(
+  (req) => { const st = (req.body || {}).status || ((req.body || {}).is_active ? 'active' : 'suspended'); return st === 'banned' ? 'customer.ban' : st === 'suspended' ? 'customer.suspend' : 'customer.reactivate'; },
+  {
+    lookup: lookupCustomerName,
+    describe: (req, name) => {
+      if (!name) return null;
+      const st = (req.body || {}).status || ((req.body || {}).is_active ? 'active' : 'suspended');
+      const why = (req.body || {}).reason ? `: ${req.body.reason}` : '';
+      return st === 'banned' ? `Banned the customer ${name}${why}` : st === 'suspended' ? `Suspended the customer ${name}${why}` : `Reactivated the customer ${name}`;
+    },
+    entity: (req) => ['customer', Number(req.params.id)],
+  }), async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid customer.' });
@@ -808,7 +877,7 @@ app.put('/api/auth/customers/:id/status', verifyToken, requirePermission('custom
 
 // ADMIN: delete a customer. If they never ordered or reviewed, the account is removed completely.
 // If they did, the order history stays for the sales records but every personal detail is erased.
-app.delete('/api/auth/customers/:id', verifyToken, requirePermission('customers'), async (req, res) => {
+app.delete('/api/auth/customers/:id', verifyToken, requirePermission('customers'), track('customer.delete', { lookup: lookupCustomerName, describe: (req, name) => (name ? `Deleted the account of the customer ${name}` : null), entity: (req) => ['customer', Number(req.params.id)] }), async (req, res) => {
   let conn;
   try {
     const id = Number(req.params.id);
@@ -906,7 +975,19 @@ app.get('/api/auth/admins/me', verifyToken, async (req, res) => {
 });
 
 // Changing the email marks it as "not verified" until the new code is confirmed
-app.put('/api/auth/admins/me', verifyToken, async (req, res) => {
+app.put('/api/auth/admins/me', verifyToken, track('profile.update', {
+  lookup: async (req) => { const [r] = await pool.query('SELECT full_name, email, profile_photo FROM admins WHERE admin_id = ?', [req.admin.adminId]); return r[0] || null; },
+  describe: (req, before) => {
+    if (!before) return null;
+    const b = req.body || {};
+    const changed = [];
+    if (String(b.full_name || '').trim() !== before.full_name) changed.push('name');
+    if (String(b.email || '').trim().toLowerCase() !== String(before.email || '').toLowerCase()) changed.push('email');
+    if (b.profile_photo !== undefined && (b.profile_photo || null) !== (before.profile_photo || null)) changed.push(b.profile_photo ? 'photo' : 'photo (removed)');
+    return changed.length ? `Changed own ${changed.join(', ')}` : null;
+  },
+  entity: (req) => ['admin', req.admin.adminId],
+}), async (req, res) => {
   try {
     const body = req.body || {};
     const fullName = String(body.full_name || '').trim();
@@ -1080,7 +1161,7 @@ app.post('/api/auth/admins/me/changes/request', verifyToken, async (req, res) =>
   }
 });
 
-app.post('/api/auth/admins/me/changes/confirm', verifyToken, async (req, res) => {
+app.post('/api/auth/admins/me/changes/confirm', verifyToken, track('profile.update', { describe: (req, before, body) => (body.changed && body.changed.length ? `Changed own ${body.changed.join(', ')} (confirmed with the email code)` : null), entity: (req) => ['admin', req.admin.adminId] }), async (req, res) => {
   try {
     const admin = await loadAdminWithPassword(req.admin.adminId);
     if (!admin) return res.status(404).json({ error: 'Admin not found.' });
@@ -1114,6 +1195,7 @@ app.post('/api/auth/admins/me/changes/confirm', verifyToken, async (req, res) =>
     }
     res.json({
       message: 'Your changes were saved.',
+      changed: [...(d.full_name !== undefined ? ['name'] : []), ...(d.username !== undefined ? ['username'] : []), ...(d.email !== undefined ? ['email'] : []), ...(pending.passwordHash ? ['password'] : [])],
       emailChanged: d.email !== undefined,
       passwordChanged: !!pending.passwordHash,
       admin: adminProfile(await loadAdmin(admin.admin_id)),
@@ -1125,13 +1207,131 @@ app.post('/api/auth/admins/me/changes/confirm', verifyToken, async (req, res) =>
 
 // GET /api/auth/admins - listahan ng lahat ng admin accounts (walang kasamang password)
 // Super Admin lang ang makakakita nito
+const ONLINE_WINDOW_MS = 2 * 60 * 1000; // an admin who did something in the last 2 minutes is "online"
+
+const isMissingColumn = (err) => err && (err.code === 'ER_BAD_FIELD_ERROR' || err.code === 'ER_NO_SUCH_TABLE');
+const MIGRATION_HINT = 'The database was not updated yet. Run migration_admin_activity.sql in MySQL Workbench first.';
+
 app.get('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT admin_id, username, full_name, email, email_verified, profile_photo, role, permissions, created_at FROM admins ORDER BY created_at DESC'
-    );
-    res.json(rows);
+    let rows;
+    try {
+      [rows] = await pool.query(
+        'SELECT admin_id, username, full_name, email, email_verified, profile_photo, role, permissions, created_at, is_active, last_seen_at, last_login_at FROM admins ORDER BY created_at DESC'
+      );
+    } catch (err) {
+      if (!isMissingColumn(err)) throw err;
+      // the database was not updated yet: the list still works (everybody is shown as active, nobody as online)
+      [rows] = await pool.query('SELECT admin_id, username, full_name, email, email_verified, profile_photo, role, permissions, created_at FROM admins ORDER BY created_at DESC');
+      rows = rows.map((r) => ({ ...r, is_active: 1, last_seen_at: null, last_login_at: null }));
+    }
+    const now = Date.now();
+    res.json(rows.map((r) => ({
+      ...r,
+      is_active: r.is_active === 0 ? 0 : 1,
+      online: r.is_active !== 0 && !!r.last_seen_at && now - new Date(r.last_seen_at).getTime() < ONLINE_WINDOW_MS,
+    })));
   } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// The admin pressed "Log out": shown as offline at once
+app.post('/api/auth/admins/me/logout', verifyToken, async (req, res) => {
+  try {
+    await Promise.resolve(pool.query('UPDATE admins SET last_seen_at = NULL WHERE admin_id = ?', [req.admin.adminId])).catch(() => {});
+    await logActivity(req.admin, 'admin.logout', 'Logged out', 'admin', req.admin.adminId);
+    res.json({ message: 'Logged out.' });
+  } catch (err) {
+    handleError(res, err);
+  }
+});
+
+// The Super Admin logs an admin out: their login stops working at once, but they can log in again.
+app.post('/api/auth/admins/:id/force-logout', verifyToken, requireSuperAdmin, track('admin.force_logout', { lookup: lookupAdminName, describe: (req, name) => (name ? `Logged out ${name}` : null), entity: (req) => ['admin', Number(req.params.id)] }), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });
+    if (id === req.admin.adminId) return res.status(400).json({ error: 'You cannot log yourself out here. Use "Log out" instead.' });
+    const [rows] = await pool.query('SELECT admin_id FROM admins WHERE admin_id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Admin not found.' });
+    // every login made before this moment stops working (the time is cut to whole seconds, like the time inside a login)
+    await pool.query('UPDATE admins SET sessions_valid_after = ?, last_seen_at = NULL WHERE admin_id = ?', [new Date(Math.floor(Date.now() / 1000) * 1000), id]);
+    res.json({ message: 'The admin was logged out. They can log in again.' });
+  } catch (err) {
+    if (isMissingColumn(err)) return res.status(503).json({ error: MIGRATION_HINT });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// The Super Admin deactivates an admin (cannot log in, and is stopped at once) or activates the account again.
+app.put('/api/auth/admins/:id/active', verifyToken, requireSuperAdmin, track((req) => (req.body && req.body.active === false ? 'admin.deactivate' : 'admin.activate'), { lookup: lookupAdminName, describe: (req, name) => (name ? (req.body.active === false ? `Deactivated the admin account of ${name}` : `Activated the admin account of ${name}`) : null), entity: (req) => ['admin', Number(req.params.id)] }), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });
+    const active = (req.body || {}).active;
+    if (typeof active !== 'boolean') return res.status(400).json({ error: 'Please say whether the account should be active or not.' });
+    if (id === req.admin.adminId) return res.status(400).json({ error: 'You cannot deactivate your own account.' });
+
+    const [rows] = await pool.query('SELECT admin_id, role FROM admins WHERE admin_id = ?', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Admin not found.' });
+    if (!active && rows[0].role === 'super_admin') {
+      const [others] = await pool.query("SELECT COUNT(*) AS n FROM admins WHERE role = 'super_admin' AND is_active = 1 AND admin_id <> ?", [id]);
+      if (Number(others[0].n) === 0) return res.status(400).json({ error: 'There must always be at least one active Super Admin.' });
+    }
+    if (active) {
+      await pool.query('UPDATE admins SET is_active = 1 WHERE admin_id = ?', [id]);
+    } else {
+      await pool.query('UPDATE admins SET is_active = 0, sessions_valid_after = ?, last_seen_at = NULL WHERE admin_id = ?', [new Date(Math.floor(Date.now() / 1000) * 1000), id]);
+    }
+    res.json({ message: active ? 'The account is active again.' : 'The account was deactivated. The admin is logged out right away.' });
+  } catch (err) {
+    if (isMissingColumn(err)) return res.status(503).json({ error: MIGRATION_HINT });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// The activity log (Super Admin only): who did what, newest first. Filters: admin, type, dates (shop time), and "load more".
+const ACTIVITY_TYPES = ['product', 'stock', 'category', 'order', 'customer', 'review', 'admin', 'profile'];
+const SHOP_DAY_START = (key) => new Date(key + 'T00:00:00+08:00'); // EDIT DITO: the Philippines is UTC+8
+
+app.get('/api/auth/admin-activity', verifyToken, requireSuperAdmin, async (req, res) => {
+  try {
+    const q = req.query || {};
+    const limit = Math.min(Math.max(parseInt(q.limit, 10) || 50, 1), 200);
+    const where = [];
+    const params = [];
+    if (q.admin_id) {
+      const adminId = Number(q.admin_id);
+      if (!Number.isInteger(adminId) || adminId <= 0) return res.status(400).json({ error: 'Invalid admin.' });
+      where.push('admin_id = ?'); params.push(adminId);
+    }
+    if (q.type) {
+      if (!ACTIVITY_TYPES.includes(q.type)) return res.status(400).json({ error: 'Invalid type.' });
+      where.push('action LIKE ?'); params.push(q.type + '.%');
+    }
+    for (const key of ['from', 'to']) {
+      if (q[key] && (!/^\d{4}-\d{2}-\d{2}$/.test(q[key]) || Number.isNaN(SHOP_DAY_START(q[key]).getTime()))) return res.status(400).json({ error: 'Please choose valid dates.' });
+    }
+    if (q.from) { where.push('created_at >= ?'); params.push(SHOP_DAY_START(q.from)); }
+    if (q.to) { where.push('created_at < ?'); params.push(new Date(SHOP_DAY_START(q.to).getTime() + 86400000)); }
+    if (q.before) {
+      const before = Number(q.before);
+      if (!Number.isInteger(before) || before <= 0) return res.status(400).json({ error: 'Invalid page.' });
+      where.push('activity_id < ?'); params.push(before);
+    }
+    const [rows] = await pool.query(
+      `SELECT activity_id, admin_id, admin_name, action, description, entity_type, entity_id, created_at
+       FROM admin_activity ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY activity_id DESC LIMIT ?`,
+      [...params, limit + 1]
+    );
+    res.json({ items: rows.slice(0, limit), hasMore: rows.length > limit });
+  } catch (err) {
+    if (err && err.code === 'ER_NO_SUCH_TABLE') return res.json({ items: [], hasMore: false, notReady: true });
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
   }
@@ -1163,7 +1363,7 @@ async function countSuperAdmins() {
 }
 
 // POST /api/auth/admins - gumawa ng bagong admin account
-app.post('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) => {
+app.post('/api/auth/admins', verifyToken, requireSuperAdmin, track('admin.create', { describe: (req, before, body) => `Added the admin account of ${body.full_name} (@${body.username}) as ${body.role === 'super_admin' ? 'Super Admin' : 'staff'}`, entity: (req, before, body) => ['admin', body.admin_id] }), async (req, res) => {
   try {
     const body = req.body || {};
     const parsed = checkAdminFields(body);
@@ -1185,7 +1385,7 @@ app.post('/api/auth/admins', verifyToken, requireSuperAdmin, async (req, res) =>
 });
 
 // PUT /api/auth/admins/:id - the Super Admin edits the details of another admin
-app.put('/api/auth/admins/:id', verifyToken, requireSuperAdmin, async (req, res) => {
+app.put('/api/auth/admins/:id', verifyToken, requireSuperAdmin, track('admin.update', { lookup: lookupAdminName, describe: (req, name) => (name ? `Edited the admin account of ${name}` : null), entity: (req) => ['admin', Number(req.params.id)] }), async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });
@@ -1221,7 +1421,7 @@ app.put('/api/auth/admins/:id', verifyToken, requireSuperAdmin, async (req, res)
 });
 
 // PUT /api/auth/admins/:id/password - the Super Admin sets a new password for another admin
-app.put('/api/auth/admins/:id/password', verifyToken, requireSuperAdmin, async (req, res) => {
+app.put('/api/auth/admins/:id/password', verifyToken, requireSuperAdmin, track('admin.password_reset', { lookup: lookupAdminName, describe: (req, name) => (name ? `Reset the password of ${name}` : null), entity: (req) => ['admin', Number(req.params.id)] }), async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });
@@ -1240,7 +1440,7 @@ app.put('/api/auth/admins/:id/password', verifyToken, requireSuperAdmin, async (
 });
 
 // DELETE /api/auth/admins/:id - tanggalin ang isang admin account
-app.delete('/api/auth/admins/:id', verifyToken, requireSuperAdmin, async (req, res) => {
+app.delete('/api/auth/admins/:id', verifyToken, requireSuperAdmin, track('admin.delete', { lookup: lookupAdminName, describe: (req, name) => (name ? `Deleted the admin account of ${name}` : null), entity: (req) => ['admin', Number(req.params.id)] }), async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Invalid admin.' });

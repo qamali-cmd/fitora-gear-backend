@@ -415,7 +415,55 @@ app.get('/api/orders/:id', verifyToken, async (req, res) => {
 });
 
 // PUT /api/orders/:id/status - i-update ang status ng order (ADMIN)
-app.put('/api/orders/:id/status', verifyToken, requirePermission('orders'), async (req, res) => {
+// =====================================================
+// ACTIVITY LOG: writes down what an admin did, AFTER it worked.
+// It never stops or changes the action: if writing fails, the action is still done.
+// =====================================================
+async function logActivity(admin, action, description, entityType, entityId) {
+  try {
+    await pool.query(
+      'INSERT INTO admin_activity (admin_id, admin_name, action, description, entity_type, entity_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [admin.adminId || null, String(admin.fullName || admin.username || 'Admin').slice(0, 100), action, String(description).slice(0, 300), entityType || null, entityId || null, new Date()]
+    );
+  } catch (err) {
+    console.warn('The activity was not written down:', err.message);
+  }
+}
+
+// Put it in a route after the permission check:  track('product.delete', { lookup, describe, entity })
+//   action   = a text, or a function (req, before, body) that gives the text
+//   lookup   = reads what is needed BEFORE the action (for example the name of something about to be deleted)
+//   describe = the sentence (return nothing to write nothing)
+//   entity   = [type, id] of what was changed
+function track(action, { lookup, describe, entity }) {
+  return async (req, res, next) => {
+    let before = null;
+    if (lookup) { try { before = await lookup(req); } catch (err) { before = null; } }
+    const send = res.json.bind(res);
+    res.json = (body) => {
+      const out = send(body);
+      const status = res.statusCode || res.code || 200;
+      if (status < 400) {
+        Promise.resolve()
+          .then(async () => {
+            const text = await describe(req, before, body || {});
+            if (!text) return;
+            const name = typeof action === 'function' ? action(req, before, body || {}) : action;
+            const [entityType, entityId] = entity ? entity(req, before, body || {}) : [];
+            await logActivity(req.admin, name, text, entityType, entityId);
+          })
+          .catch((err) => console.warn('The activity was not written down:', err.message));
+      }
+      return out;
+    };
+    return next();
+  };
+}
+
+const lookupOrderCode = async (req) => { const [r] = await pool.query('SELECT order_code FROM orders WHERE order_id = ?', [Number(req.params.id)]); return r[0] ? (r[0].order_code || '#' + Number(req.params.id)) : null; };
+const orderEntity = (req) => ['order', Number(req.params.id)];
+
+app.put('/api/orders/:id/status', verifyToken, requirePermission('orders'), track('order.status', { lookup: lookupOrderCode, describe: (req, code) => (code ? `Changed order ${code} to ${req.body.status}` : null), entity: orderEntity }), async (req, res) => {
   try {
     const { status } = req.body;
     const validStatuses = ['pending', 'processing', 'shipped', 'completed', 'cancelled'];
@@ -871,7 +919,7 @@ app.put('/api/orders/my/:id/cancel', verifyCustomerToken, (req, res) => {
 });
 
 // ADMIN: cancel an order (for example when an item is out of stock)
-app.put('/api/orders/:id/cancel', verifyToken, requirePermission('orders'), (req, res) => {
+app.put('/api/orders/:id/cancel', verifyToken, requirePermission('orders'), track('order.cancel', { lookup: lookupOrderCode, describe: (req, code) => (code ? `Cancelled order ${code}${req.body.reason ? ': ' + req.body.reason : ''}` : null), entity: orderEntity }), (req, res) => {
   const id = Number(req.params.id);
   const reason = String((req.body || {}).reason || '');
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
@@ -889,7 +937,7 @@ app.put('/api/orders/:id/cancel', verifyToken, requirePermission('orders'), (req
 });
 
 // ADMIN: approve or decline a customer's cancellation request
-app.put('/api/orders/:id/cancel-request', verifyToken, requirePermission('orders'), (req, res) => {
+app.put('/api/orders/:id/cancel-request', verifyToken, requirePermission('orders'), track('order.cancel_request', { lookup: lookupOrderCode, describe: (req, code) => (code ? (req.body.decision === 'approve' ? `Approved the cancellation request of order ${code}` : `Declined the cancellation request of order ${code}${req.body.reason ? ': ' + req.body.reason : ''}`) : null), entity: orderEntity }), (req, res) => {
   const id = Number(req.params.id);
   const decision = (req.body || {}).decision;
   const reason = String((req.body || {}).reason || '');
@@ -1086,7 +1134,7 @@ async function sendOrderEmail(orderId, kind) {
 }
 
 // ADMIN: mark an order as shipped with its courier and tracking number
-app.put('/api/orders/:id/ship', verifyToken, requirePermission('orders'), (req, res) => {
+app.put('/api/orders/:id/ship', verifyToken, requirePermission('orders'), track('order.ship', { lookup: lookupOrderCode, describe: (req, code) => (code ? `Shipped order ${code} via ${req.body.courier}${req.body.tracking_number ? ' (' + req.body.tracking_number + ')' : ''}` : null), entity: orderEntity }), (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
   const parsed = parseShipping(req.body || {});
@@ -1116,7 +1164,7 @@ app.put('/api/orders/:id/ship', verifyToken, requirePermission('orders'), (req, 
 });
 
 // ADMIN: fix the courier or tracking number of an order that is already shipped
-app.put('/api/orders/:id/shipping-info', verifyToken, requirePermission('orders'), (req, res) => {
+app.put('/api/orders/:id/shipping-info', verifyToken, requirePermission('orders'), track('order.ship', { lookup: lookupOrderCode, describe: (req, code) => (code ? `Changed the courier and tracking number of order ${code}` : null), entity: orderEntity }), (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
   const parsed = parseShipping(req.body || {});
@@ -1365,7 +1413,7 @@ app.get('/pay/cancelled', (req, res) => {
 });
 
 // ADMIN: the shop gave the money back (after refunding in the PayMongo dashboard), so mark it as done
-app.put('/api/orders/:id/refunded', verifyToken, requirePermission('orders'), (req, res) => {
+app.put('/api/orders/:id/refunded', verifyToken, requirePermission('orders'), track('order.refund', { lookup: lookupOrderCode, describe: (req, code) => (code ? `Marked the refund of order ${code} as done` : null), entity: orderEntity }), (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
   return inTransaction(res, async (conn) => {
