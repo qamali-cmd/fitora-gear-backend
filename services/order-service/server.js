@@ -307,7 +307,22 @@ app.get('/api/orders/my', verifyCustomerToken, async (req, res) => {
       'SELECT * FROM orders WHERE user_id = ? ORDER BY order_date DESC',
       [req.customer.userId]
     );
-    res.json(rows);
+
+    // Every order also carries its items (name, how many, price, and the photo), so the app can show them in the list.
+    // It is ONE extra question for all the orders (not one for each order).
+    const byOrder = {};
+    if (rows.length > 0) {
+      const [items] = await pool.query(
+        `SELECT oi.order_id, oi.product_id, oi.quantity, oi.price, p.product_name, p.image
+         FROM order_items oi
+         LEFT JOIN products p ON p.product_id = oi.product_id
+         WHERE oi.order_id IN (?)
+         ORDER BY oi.order_item_id`,
+        [rows.map((o) => o.order_id)]
+      );
+      for (const item of items) (byOrder[item.order_id] = byOrder[item.order_id] || []).push(item);
+    }
+    res.json(rows.map((o) => ({ ...o, items: byOrder[o.order_id] || [] })));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -324,7 +339,7 @@ app.get('/api/orders/my/:id', verifyCustomerToken, async (req, res) => {
     if (!order) return res.status(404).json({ error: 'Order not found.' });
 
     const [items] = await pool.query(
-      `SELECT oi.*, p.product_name FROM order_items oi
+      `SELECT oi.*, p.product_name, p.image FROM order_items oi
        LEFT JOIN products p ON oi.product_id = p.product_id
        WHERE oi.order_id = ?`,
       [req.params.id]

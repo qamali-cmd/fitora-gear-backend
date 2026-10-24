@@ -168,14 +168,25 @@ app.delete('/api/categories/:id', verifyToken, requirePermission('categories'), 
 // GET /api/products - kunin lahat ng products (kasama ang category name)
 app.get('/api/products', async (req, res) => {
   try {
+    // Each product also carries what the shop window shows: how many were SOLD (items of orders that the shop
+    // accepted and did not cancel) and the RATING (from the approved reviews only).
     const [rows] = await pool.query(`
-      SELECT p.*, c.category_name
+      SELECT p.*, c.category_name,
+        COALESCE((SELECT SUM(oi.quantity) FROM order_items oi JOIN orders o ON o.order_id = oi.order_id
+                  WHERE oi.product_id = p.product_id AND o.status IN ('processing', 'shipped', 'completed')), 0) AS sold_count,
+        (SELECT ROUND(AVG(r.rating), 1) FROM reviews r WHERE r.product_id = p.product_id AND r.status = 'approved') AS rating_avg,
+        (SELECT COUNT(*) FROM reviews r WHERE r.product_id = p.product_id AND r.status = 'approved') AS rating_count
       FROM products p
       LEFT JOIN categories c ON p.category_id = c.category_id
       ORDER BY p.created_at DESC
     `);
     // who added and who approved a product is for the admins only (the Activity page): it is not sent in this public list
-    res.json(rows.map(({ created_by, approved_by, approved_at, ...product }) => product));
+    res.json(rows.map(({ created_by, approved_by, approved_at, sold_count, rating_avg, rating_count, ...product }) => ({
+      ...product,
+      sold_count: Number(sold_count) || 0,
+      rating_avg: rating_avg === null || rating_avg === undefined ? null : Number(rating_avg),
+      rating_count: Number(rating_count) || 0,
+    })));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
