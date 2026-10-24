@@ -586,6 +586,14 @@ function showToast(message, isError) {
 
 const AUDIENCE_LABELS = { men: 'Men', women: 'Women', unisex: 'Unisex' };
 
+// the stock in a colored pill: green is fine, yellow is low (fewer than 10), red is out of stock
+function stockPill(value) {
+  const n = Number(value) || 0;
+  const tone = n <= 0 ? 'stock-out' : n < 10 ? 'stock-low' : 'stock-ok';
+  const note = n <= 0 ? 'Out of stock' : n < 10 ? 'Low stock' : '';
+  return `<span class="stock-pill ${tone}">${n}</span>${note ? `<div class="muted-small">${note}</div>` : ''}`;
+}
+
 function renderProductsTable() {
   const tbody = document.getElementById('productsTableBody');
   const search = document.getElementById('productSearch').value.toLowerCase().trim();
@@ -620,7 +628,7 @@ function renderProductsTable() {
       <td>${orderEsc(p.category_name || '-')}</td>
       <td><span class="badge badge-${audience}">${AUDIENCE_LABELS[audience]}</span></td>
       <td>₱${Number(p.price).toLocaleString()}</td>
-      <td>${p.stock}</td>
+      <td>${stockPill(p.stock)}</td>
       <td>${approval === 'pending'
         ? '<span class="badge badge-plain badge-pending">Waiting for approval</span><div class="muted-small">Not for sale yet</div>'
         : approval === 'rejected'

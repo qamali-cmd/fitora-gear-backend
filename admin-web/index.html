@@ -139,10 +139,6 @@
     <!-- ---------------- PRODUCTS PAGE ---------------- -->
     <section id="page-products" class="page">
       <div class="page-head">
-      <div class="section-header">
-        <h2>Products</h2>
-        <button id="addProductBtn" class="primary-btn">+ Add product</button>
-      </div>
       <div class="filter-bar">
         <input type="text" id="productSearch" placeholder="Search product name...">
         <select id="productCategoryFilter">
@@ -166,6 +162,7 @@
           <option value="stock_asc">Stock: Low to high</option>
           <option value="stock_desc">Stock: High to low</option>
         </select>
+        <button id="addProductBtn" class="primary-btn push-right">+ Add product</button>
       </div>
       </div>
 
@@ -193,9 +190,8 @@
     <!-- ---------------- CATEGORIES PAGE ---------------- -->
     <section id="page-categories" class="page">
       <div class="page-head">
-      <div class="section-header">
-        <h2>Categories</h2>
-        <button id="addCategoryBtn" class="primary-btn">+ Add category</button>
+      <div class="filter-bar">
+        <button id="addCategoryBtn" class="primary-btn push-right">+ Add category</button>
       </div>
       </div>
       <div class="table-wrap fit">
@@ -221,9 +217,6 @@
     <!-- ---------------- INVENTORY PAGE ---------------- -->
     <section id="page-inventory" class="page">
       <div class="page-head">
-      <div class="section-header">
-        <h2>Inventory</h2>
-      </div>
       <div class="filter-bar">
         <input type="text" id="inventorySearch" placeholder="Search product name...">
         <select id="inventoryFilter">
@@ -262,9 +255,8 @@
     <!-- ---------------- CUSTOMERS PAGE ---------------- -->
     <section id="page-customers" class="page">
       <div class="page-head">
-      <div class="section-header">
-        <h2>Customers</h2>
-        <input type="text" id="customerSearch" placeholder="Search name or email..." style="max-width:260px;">
+      <div class="filter-bar">
+        <input type="text" id="customerSearch" placeholder="Search name or email..." >
       </div>
       </div>
       <div class="table-wrap fit">
@@ -289,10 +281,6 @@
     <!-- ---------------- ORDERS PAGE ---------------- -->
     <section id="page-orders" class="page">
       <div class="page-head">
-      <div class="section-header">
-        <h2>Orders</h2>
-        <button id="orderExport" class="secondary-btn">Export CSV</button>
-      </div>
       <div class="filter-bar">
         <input type="text" id="orderSearch" placeholder="Search code, customer, item...">
         <select id="orderStatusFilter">
@@ -318,8 +306,9 @@
           <label class="date-field"><span>To</span><input type="date" id="orderTo"></label>
         </div>
         <button id="orderClear" class="secondary-btn">Clear</button>
+        <button id="orderExport" class="secondary-btn push-right">Export CSV</button>
       </div>
-      <p class="result-count" id="orderCount"></p>
+        <p class="result-count" id="orderCount"></p>
       </div>
 
       <div class="table-wrap fit">
@@ -406,9 +395,8 @@
     <!-- ---------------- REVIEWS PAGE ---------------- -->
     <section id="page-reviews" class="page">
       <div class="page-head">
-      <div class="section-header">
-        <h2>Reviews</h2>
-        <select id="reviewStatusFilter" class="status-select">
+      <div class="filter-bar">
+        <select id="reviewStatusFilter">
           <option value="all">All reviews</option>
           <option value="pending">Waiting for approval</option>
           <option value="approved">Visible</option>
@@ -438,9 +426,8 @@
     <!-- ---------------- ADMIN MANAGEMENT PAGE ---------------- -->
     <section id="page-admins" class="page">
       <div class="page-head">
-      <div class="section-header">
-        <h2>Admins</h2>
-        <button id="addAdminBtn" class="primary-btn">+ Add admin</button>
+      <div class="filter-bar">
+        <button id="addAdminBtn" class="primary-btn push-right">+ Add admin</button>
       </div>
       </div>
       <div class="table-wrap fit">
@@ -464,14 +451,11 @@
 
     <!-- ---------------- MESSAGES PAGE: the chat with the customers ---------------- -->
     <section id="page-messages" class="page">
-      <div class="page-head">
-        <div class="section-header">
-          <h2>Messages</h2>
-          <button id="messagesRefresh" class="secondary-btn">Refresh</button>
+            <div class="chat-layout">
+        <div class="chat-list-wrap">
+          <div class="chat-list-head"><b>Conversations</b><button id="messagesRefresh" class="secondary-btn">Refresh</button></div>
+          <div class="chat-list" id="chatList"><p class="chat-note">Loading...</p></div>
         </div>
-      </div>
-      <div class="chat-layout">
-        <div class="chat-list" id="chatList"><p class="chat-note">Loading...</p></div>
         <div class="chat-panel">
           <div class="chat-empty" id="chatEmpty">
             <div class="chat-empty-icon"></div>
@@ -495,12 +479,8 @@
     <!-- ---------------- ACTIVITY PAGE (Super Admin only) ---------------- -->
     <section id="page-activity" class="page">
       <div class="page-head">
-        <div class="section-header">
-          <h2>Activity</h2>
-          <button id="activityRefresh" class="secondary-btn">Refresh</button>
-        </div>
-        <div class="filter-bar">
-          <select id="activityAdmin"><option value="">All admins</option></select>
+      <div class="filter-bar">
+        <select id="activityAdmin"><option value="">All admins</option></select>
           <select id="activityType">
             <option value="">All activity</option>
             <option value="product">Products</option>
@@ -517,7 +497,8 @@
             <label class="date-field"><span>To</span><input type="date" id="activityTo"></label>
           </div>
           <button id="activityClear" class="secondary-btn">Clear</button>
-        </div>
+        <button id="activityRefresh" class="secondary-btn push-right">Refresh</button>
+      </div>
       </div>
       <div class="table-wrap fit">
         <table>
