@@ -299,6 +299,185 @@ app.post('/api/orders/place', verifyCustomerToken, async (req, res) => {
   }
 });
 
+// =====================================================
+// MESSAGES: the chat between a customer and the shop
+// (these routes are before "/api/orders/:id" on purpose, so that "messages" is not taken as an order number)
+// =====================================================
+const MESSAGE_MAX = 1000;
+const MESSAGE_MIN_GAP_COUNT = 10; // a customer can send at most 10 messages in one minute
+const NOT_READY = 'Messages are not ready yet. Run migration_messages.sql in MySQL Workbench first.';
+const tableMissing = (err) => !!err && (err.code === 'ER_NO_SUCH_TABLE' || err.code === 'ER_BAD_FIELD_ERROR');
+const previewOf = (text) => (text.length > 110 ? text.slice(0, 110).trim() + '\u2026' : text);
+
+function cleanMessage(raw) {
+  const body = String(raw || '').replace(/\r\n/g, '\n').trim();
+  if (!body) return { error: 'Please type a message.' };
+  if (body.length > MESSAGE_MAX) return { error: `A message can have at most ${MESSAGE_MAX.toLocaleString('en-US')} letters.` };
+  return { body };
+}
+
+async function lastMessages(threadId, limit) {
+  const [rows] = await pool.query(
+    'SELECT message_id, sender, admin_name, body, created_at FROM messages WHERE thread_id = ? ORDER BY message_id DESC LIMIT ?',
+    [threadId, limit]
+  );
+  return rows.reverse();
+}
+
+// ----- the customer -----
+// the numbers for the little badge of the app (how many replies of the shop were not read yet)
+app.get('/api/orders/messages/my/unread', verifyCustomerToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT customer_unread FROM message_threads WHERE user_id = ?', [req.customer.userId]);
+    res.json({ unread: rows[0] ? Number(rows[0].customer_unread) || 0 : 0 });
+  } catch (err) {
+    if (tableMissing(err)) return res.json({ unread: 0 });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// the conversation of the customer with the shop
+app.get('/api/orders/messages/my', verifyCustomerToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT thread_id, customer_unread FROM message_threads WHERE user_id = ?', [req.customer.userId]);
+    if (rows.length === 0) return res.json({ messages: [], unread: 0 });
+    res.json({ messages: await lastMessages(rows[0].thread_id, 200), unread: Number(rows[0].customer_unread) || 0 });
+  } catch (err) {
+    if (tableMissing(err)) return res.status(503).json({ error: NOT_READY });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// the customer has opened the conversation: the replies are read
+app.put('/api/orders/messages/my/read', verifyCustomerToken, async (req, res) => {
+  try {
+    await pool.query('UPDATE message_threads SET customer_unread = 0 WHERE user_id = ?', [req.customer.userId]);
+    res.json({ unread: 0 });
+  } catch (err) {
+    if (tableMissing(err)) return res.json({ unread: 0 });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// the customer sends a message to the shop
+app.post('/api/orders/messages/my', verifyCustomerToken, async (req, res) => {
+  try {
+    const cleaned = cleanMessage((req.body || {}).body);
+    if (cleaned.error) return res.status(400).json({ error: cleaned.error });
+    const userId = req.customer.userId;
+
+    const [[recent]] = await pool.query(
+      "SELECT COUNT(*) AS n FROM messages m JOIN message_threads t ON t.thread_id = m.thread_id WHERE t.user_id = ? AND m.sender = 'customer' AND m.created_at > ?",
+      [userId, new Date(Date.now() - 60000)]
+    );
+    if (Number(recent.n) >= MESSAGE_MIN_GAP_COUNT) return res.status(429).json({ error: 'You are sending messages too fast. Please wait a moment.' });
+
+    const now = new Date();
+    let [threads] = await pool.query('SELECT thread_id, admin_unread FROM message_threads WHERE user_id = ?', [userId]);
+    if (threads.length === 0) {
+      try {
+        await pool.query("INSERT INTO message_threads (user_id, last_message_at, last_preview, created_at) VALUES (?, ?, '', ?)", [userId, now, now]);
+      } catch (err) {
+        if (err.code !== 'ER_DUP_ENTRY') throw err; // two messages at the same time: the other one made the conversation
+      }
+      [threads] = await pool.query('SELECT thread_id, admin_unread FROM message_threads WHERE user_id = ?', [userId]);
+    }
+    const thread = threads[0];
+    const [added] = await pool.query("INSERT INTO messages (thread_id, sender, body, created_at) VALUES (?, 'customer', ?, ?)", [thread.thread_id, cleaned.body, now]);
+    await pool.query('UPDATE message_threads SET last_message_at = ?, last_preview = ?, admin_unread = admin_unread + 1, customer_unread = 0 WHERE thread_id = ?', [now, previewOf(cleaned.body), thread.thread_id]);
+
+    // the bell of the admins rings once for a conversation that was already read (not for every message)
+    if (Number(thread.admin_unread) === 0) {
+      const [people] = await pool.query('SELECT full_name FROM users WHERE user_id = ?', [userId]);
+      const name = people[0] ? people[0].full_name : 'A customer';
+      await addNotification({ type: 'new_message', title: 'New message', message: `${name}: "${previewOf(cleaned.body)}"`, ref_text: name });
+    }
+    res.status(201).json({ message: { message_id: added.insertId, sender: 'customer', admin_name: null, body: cleaned.body, created_at: now } });
+  } catch (err) {
+    if (tableMissing(err)) return res.status(503).json({ error: NOT_READY });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// ----- the admin (the Messages page) -----
+const canSeeMessages = requireAnyPermission(['orders', 'customers']);
+
+// how many messages of customers are waiting (the number for the Dashboard and the menu)
+app.get('/api/orders/messages/unread-count', verifyToken, canSeeMessages, async (req, res) => {
+  try {
+    const [[row]] = await pool.query('SELECT COALESCE(SUM(admin_unread), 0) AS total FROM message_threads');
+    res.json({ unread: Number(row.total) || 0 });
+  } catch (err) {
+    if (tableMissing(err)) return res.json({ unread: 0 });
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// the list of the conversations, the newest first
+app.get('/api/orders/messages', verifyToken, canSeeMessages, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT t.thread_id, t.user_id, t.last_message_at, t.last_preview, t.admin_unread,
+              COALESCE(u.full_name, 'Deleted customer') AS customer_name, u.profile_photo
+       FROM message_threads t
+       LEFT JOIN users u ON u.user_id = t.user_id
+       ORDER BY t.last_message_at DESC
+       LIMIT 200`
+    );
+    res.json(rows.map((r) => ({ ...r, admin_unread: Number(r.admin_unread) || 0 })));
+  } catch (err) {
+    if (tableMissing(err)) return res.json([]);
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// one conversation (opening it marks the messages as read)
+app.get('/api/orders/messages/:threadId', verifyToken, canSeeMessages, async (req, res) => {
+  try {
+    const threadId = Number(req.params.threadId);
+    if (!Number.isInteger(threadId) || threadId <= 0) return res.status(400).json({ error: 'Invalid conversation.' });
+    const [rows] = await pool.query(
+      `SELECT t.thread_id, t.user_id, COALESCE(u.full_name, 'Deleted customer') AS customer_name, u.email, u.profile_photo
+       FROM message_threads t LEFT JOIN users u ON u.user_id = t.user_id WHERE t.thread_id = ?`,
+      [threadId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Conversation not found.' });
+    const messages = await lastMessages(threadId, 300);
+    await pool.query('UPDATE message_threads SET admin_unread = 0 WHERE thread_id = ?', [threadId]);
+    res.json({ ...rows[0], messages });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
+// the shop answers
+app.post('/api/orders/messages/:threadId', verifyToken, canSeeMessages, async (req, res) => {
+  try {
+    const threadId = Number(req.params.threadId);
+    if (!Number.isInteger(threadId) || threadId <= 0) return res.status(400).json({ error: 'Invalid conversation.' });
+    const cleaned = cleanMessage((req.body || {}).body);
+    if (cleaned.error) return res.status(400).json({ error: cleaned.error });
+    const [threads] = await pool.query('SELECT thread_id FROM message_threads WHERE thread_id = ?', [threadId]);
+    if (threads.length === 0) return res.status(404).json({ error: 'Conversation not found.' });
+
+    const now = new Date();
+    const name = String(req.admin.fullName || req.admin.username || 'Fitora Gear').slice(0, 100);
+    const [added] = await pool.query("INSERT INTO messages (thread_id, sender, admin_id, admin_name, body, created_at) VALUES (?, 'admin', ?, ?, ?, ?)", [threadId, req.admin.adminId || null, name, cleaned.body, now]);
+    await pool.query('UPDATE message_threads SET last_message_at = ?, last_preview = ?, customer_unread = customer_unread + 1, admin_unread = 0 WHERE thread_id = ?', [now, previewOf(cleaned.body), threadId]);
+    res.status(201).json({ message: { message_id: added.insertId, sender: 'admin', admin_name: name, body: cleaned.body, created_at: now } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+});
+
 // GET /api/orders/my - lahat ng order ng naka-login na customer
 app.get('/api/orders/my', verifyCustomerToken, async (req, res) => {
   try {
@@ -1506,6 +1685,7 @@ const NOTIFICATION_PERMISSIONS = {
   new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders',
   low_stock: 'inventory', new_review: 'reviews',
   product_approval: 'products', product_decision: 'products', // "waiting for approval" is for the Super Admin only (see below)
+  new_message: 'orders',
 };
 
 async function addNotification(n) {

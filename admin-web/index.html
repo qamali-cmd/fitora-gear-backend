@@ -57,6 +57,7 @@
       <a href="#inventory" data-page="inventory" class="nav-link">Inventory</a>
       <a href="#customers" data-page="customers" class="nav-link">Customers</a>
       <a href="#orders" data-page="orders" class="nav-link">Orders</a>
+      <a href="#messages" data-page="messages" class="nav-link">Messages<span id="messagesBadge" class="nav-badge hidden"></span></a>
       <a href="#reports" data-page="reports" class="nav-link">Sales Reports</a>
       <a href="#reviews" data-page="reviews" class="nav-link">Reviews</a>
       <a href="#admins" data-page="admins" class="nav-link">Admins</a>
@@ -458,6 +459,36 @@
             <tr><td colspan="6">Loading...</td></tr>
           </tbody>
         </table>
+      </div>
+    </section>
+
+    <!-- ---------------- MESSAGES PAGE: the chat with the customers ---------------- -->
+    <section id="page-messages" class="page">
+      <div class="page-head">
+        <div class="section-header">
+          <h2>Messages</h2>
+          <button id="messagesRefresh" class="secondary-btn">Refresh</button>
+        </div>
+      </div>
+      <div class="chat-layout">
+        <div class="chat-list" id="chatList"><p class="chat-note">Loading...</p></div>
+        <div class="chat-panel">
+          <div class="chat-empty" id="chatEmpty">
+            <div class="chat-empty-icon"></div>
+            <p>Choose a conversation to read it and answer.</p>
+          </div>
+          <div class="chat-box hidden" id="chatBox">
+            <div class="chat-head">
+              <div class="chat-head-info" id="chatHeadInfo"></div>
+              <button type="button" class="secondary-btn" id="chatCustomerBtn">View customer</button>
+            </div>
+            <div class="chat-messages" id="chatMessages"></div>
+            <form class="chat-compose" id="chatForm">
+              <textarea id="chatInput" rows="2" maxlength="1000" placeholder="Type your answer... (Enter to send, Shift+Enter for a new line)"></textarea>
+              <button type="submit" class="primary-btn" id="chatSend">Send</button>
+            </form>
+          </div>
+        </div>
       </div>
     </section>
 

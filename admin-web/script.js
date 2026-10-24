@@ -30,6 +30,7 @@ let productsPreset = null; // the same for the Products page ('pending' = the pr
 let allProductsForInventory = []; // the products of the Inventory page
 let allReviews = []; // the reviews of the Reviews page
 const activityState = { before: null, loaded: 0 }; // the Activity page: where the next "Load more" continues
+const chatState = { threads: [], activeId: null, activeUserId: null, lastKey: '', sending: false }; // the Messages page: the conversations, and the one that is open
 const reportState = { preset: '7', from: '', to: '' }; // the period of the Sales Reports page
 let reportRequest = 0;
 let profileState = null;
@@ -217,6 +218,7 @@ function showApp() {
   document.body.classList.add('app-open'); // from now on the page itself does not scroll: only the content area does
   setupStickyOffsets();
   applyDashboardLinks();
+  refreshMessageBadge();
 
   const admin = JSON.parse(sessionStorage.getItem('fitora_admin') || '{}');
   renderAdminChip();
@@ -317,6 +319,7 @@ function hasAccess(page) {
   if (page === 'dashboard' || page === 'profile') return true; // everyone can open their own profile
   if (page === 'admins' || page === 'activity') return admin.role === 'super_admin';
   if (admin.role === 'super_admin') return true;
+  if (page === 'messages') return (admin.permissions || []).includes('orders') || (admin.permissions || []).includes('customers'); // the messages are for the people who work with orders or customers
   return (admin.permissions || []).includes(page);
 }
 
@@ -384,6 +387,7 @@ function navigateTo(page) {
   if (page === 'reviews') loadReviews(true);
   if (page === 'admins') loadAdmins();
   if (page === 'activity') loadActivity(true);
+  if (page === 'messages') openMessagesPage();
   if (page === 'profile') loadProfile();
 }
 
@@ -424,7 +428,16 @@ async function loadDashboard() {
         if (reviewRes.ok && Array.isArray(reviews)) pendingReviews = reviews.filter(r => r.status === 'pending').length;
       } catch (err) { /* the box simply does not show reviews */ }
     }
-    renderAttention(orders, lowStock, pendingReviews, products);
+    // messages of customers that nobody has read yet (only if this admin may open the Messages page)
+    let unreadMessages = 0;
+    if (hasAccess('messages')) {
+      try {
+        const messagesRes = await fetch(API.ORDERS + '/orders/messages/unread-count', { headers: authHeaders() });
+        const messagesData = await messagesRes.json();
+        if (messagesRes.ok) unreadMessages = Number(messagesData.unread) || 0;
+      } catch (err) { /* the box simply does not show messages */ }
+    }
+    renderAttention(orders, lowStock, pendingReviews, products, unreadMessages);
     applyDashboardLinks();
   } catch (err) {
     console.error(err);
@@ -450,7 +463,7 @@ function goFromDashboard(go, card) {
 }
 
 // "Needs attention": the things the shop should look at now. Only what this admin may open is shown.
-function renderAttention(orders, lowStock, pendingReviews, products) {
+function renderAttention(orders, lowStock, pendingReviews, products, unreadMessages) {
   const list = document.getElementById('attentionList');
   const count = (test) => orders.filter(test).length;
   const isSuper = (getCurrentAdmin() || {}).role === 'super_admin';
@@ -458,6 +471,7 @@ function renderAttention(orders, lowStock, pendingReviews, products) {
   const lines = [
     { n: isSuper ? productCount('pending') : 0, go: 'products', data: { approval: 'pending' }, one: 'product waits for your approval', many: 'products wait for your approval', tone: 'pink' },
     { n: isSuper ? 0 : productCount('rejected'), go: 'products', data: { approval: 'rejected' }, one: 'product was rejected and needs a change', many: 'products were rejected and need a change', tone: 'red' },
+    { n: unreadMessages || 0, go: 'messages', data: {}, one: 'unread message from a customer', many: 'unread messages from customers', tone: 'pink' },
     { n: count(o => o.cancel_request_status === 'requested'), go: 'orders', data: { status: 'cancel_requests' }, one: 'customer asks to cancel an order', many: 'customers ask to cancel an order', tone: 'red' },
     { n: count(o => o.payment_status === 'refund_pending'), go: 'orders', data: { payment: 'refund_pending' }, one: 'refund to give back to a customer', many: 'refunds to give back to customers', tone: 'red' },
     { n: count(o => o.status === 'pending' && !(o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment')), go: 'orders', data: { status: 'pending', payment: 'ready' }, one: 'new order to process', many: 'new orders to process', tone: 'pink' },
@@ -2094,7 +2108,7 @@ async function deleteCustomer(userId, name) {
 // A notification glows until THIS admin opens it. Pressing one goes straight to the order / product.
 // ===========================================================
 let notificationItems = [];
-const NOTIF_PAGES = { new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders', low_stock: 'inventory', new_review: 'reviews', product_approval: 'products', product_decision: 'products' };
+const NOTIF_PAGES = { new_message: 'messages', new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders', low_stock: 'inventory', new_review: 'reviews', product_approval: 'products', product_decision: 'products' };
 const NOTIF_TABLES = { orders: 'ordersTableBody', inventory: 'inventoryTableBody', reviews: 'reviewsTableBody', products: 'productsTableBody' };
 
 function timeAgo(value) {
@@ -2175,7 +2189,7 @@ async function openNotification(id) {
   if (item.type === 'product_approval') productsPreset = 'pending'; // the Super Admin lands on the products that wait for the decision
   history.replaceState(null, '', '#' + page);
   navigateTo(page);
-  highlightRow(NOTIF_TABLES[page], item.ref_text);
+  if (NOTIF_TABLES[page]) highlightRow(NOTIF_TABLES[page], item.ref_text);
 }
 
 document.getElementById('notifList').addEventListener('click', (e) => {
@@ -2631,6 +2645,140 @@ async function setAdminActive(adminId, active) {
     showApiError(err.message);
   }
 }
+
+// ===========================================================
+// MESSAGES: the chat between the shop and the customers
+// ===========================================================
+
+function chatTime(value) {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
+    : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+// the little number in the menu: how many messages of customers are not read yet
+async function refreshMessageBadge() {
+  if (!hasAccess('messages')) return;
+  try {
+    const res = await fetch(API.ORDERS + '/orders/messages/unread-count', { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) return;
+    const n = Number(data.unread) || 0;
+    const badge = document.getElementById('messagesBadge');
+    badge.textContent = n > 99 ? '99+' : String(n);
+    badge.classList.toggle('hidden', n === 0);
+  } catch (err) { /* not important */ }
+}
+setInterval(() => { if (!document.hidden && getToken()) refreshMessageBadge(); }, 20000);
+
+function renderChatList() {
+  const box = document.getElementById('chatList');
+  if (chatState.threads.length === 0) {
+    box.innerHTML = '<p class="chat-note">No messages yet. When a customer writes to the shop, the conversation shows up here.</p>';
+    return;
+  }
+  box.innerHTML = chatState.threads.map(t => `
+    <button type="button" class="chat-item ${t.thread_id === chatState.activeId ? 'active' : ''}" data-thread-id="${t.thread_id}">
+      ${avatarPicture(t.profile_photo, t.customer_name)}
+      <div class="chat-item-text">
+        <div class="chat-item-top"><b>${orderEsc(t.customer_name)}</b><span class="chat-item-time">${orderEsc(chatTime(t.last_message_at))}</span></div>
+        <div class="chat-item-preview ${t.admin_unread > 0 ? 'unread' : ''}">${orderEsc(t.last_preview || '')}</div>
+      </div>
+      ${t.admin_unread > 0 ? `<span class="chat-unread">${t.admin_unread > 99 ? '99+' : t.admin_unread}</span>` : ''}
+    </button>`).join('');
+}
+
+async function loadChatList(quiet) {
+  const box = document.getElementById('chatList');
+  try {
+    const res = await fetch(API.ORDERS + '/orders/messages', { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not load the messages.');
+    chatState.threads = data;
+    renderChatList();
+    // something new in the conversation that is open: it is opened again, quietly
+    const open = data.find(t => t.thread_id === chatState.activeId);
+    if (open && (open.admin_unread > 0 || String(open.last_message_at) !== chatState.lastKey)) openThread(open.thread_id, true);
+  } catch (err) {
+    if (!quiet) box.innerHTML = `<p class="chat-note">${orderEsc(err.message)}</p>`;
+  }
+}
+
+function openMessagesPage() {
+  chatState.activeId = null;
+  chatState.activeUserId = null;
+  document.getElementById('chatBox').classList.add('hidden');
+  document.getElementById('chatEmpty').classList.remove('hidden');
+  document.getElementById('chatList').innerHTML = '<p class="chat-note">Loading...</p>';
+  loadChatList(false);
+  refreshMessageBadge();
+}
+
+async function openThread(threadId, quiet) {
+  try {
+    const res = await fetch(API.ORDERS + '/orders/messages/' + threadId, { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not open the conversation.');
+    const list = document.getElementById('chatMessages');
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+    chatState.activeId = threadId;
+    chatState.activeUserId = data.user_id;
+    chatState.lastKey = data.messages.length ? String(data.messages[data.messages.length - 1].created_at) : '';
+    document.getElementById('chatEmpty').classList.add('hidden');
+    document.getElementById('chatBox').classList.remove('hidden');
+    document.getElementById('chatHeadInfo').innerHTML = `${avatarPicture(data.profile_photo, data.customer_name)}<div><b>${orderEsc(data.customer_name)}</b><div class="muted-small">${orderEsc(data.email || '')}</div></div>`;
+    document.getElementById('chatCustomerBtn').classList.toggle('hidden', !data.user_id);
+    let lastDay = '';
+    list.innerHTML = data.messages.map(m => {
+      const day = new Date(m.created_at).toDateString();
+      const separator = day !== lastDay ? `<div class="chat-day">${orderEsc(day === new Date().toDateString() ? 'Today' : new Date(m.created_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }))}</div>` : '';
+      lastDay = day;
+      return `${separator}<div class="chat-bubble ${m.sender === 'admin' ? 'admin' : 'customer'}"><div class="chat-text">${orderEsc(m.body)}</div><div class="chat-meta">${m.sender === 'admin' && m.admin_name ? orderEsc(m.admin_name) + ' · ' : ''}${orderEsc(new Date(m.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))}</div></div>`;
+    }).join('') || '<p class="chat-note">No messages yet.</p>';
+    if (!quiet || atBottom) list.scrollTop = list.scrollHeight;
+    const thread = chatState.threads.find(t => t.thread_id === threadId);
+    if (thread) thread.admin_unread = 0; // opening it marked the messages as read
+    renderChatList();
+    refreshMessageBadge();
+  } catch (err) {
+    if (!quiet) showApiError(err.message);
+  }
+}
+
+document.getElementById('chatList').addEventListener('click', (e) => {
+  const item = e.target.closest('[data-thread-id]');
+  if (item) openThread(Number(item.dataset.threadId), false);
+});
+document.getElementById('messagesRefresh').addEventListener('click', () => loadChatList(false));
+document.getElementById('chatCustomerBtn').addEventListener('click', () => { if (chatState.activeUserId) openCustomerDetails(chatState.activeUserId); });
+document.getElementById('chatInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('chatForm').requestSubmit(); } // Enter sends, Shift+Enter is a new line
+});
+document.getElementById('chatForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('chatInput');
+  const body = input.value.trim();
+  if (!body || !chatState.activeId || chatState.sending) return;
+  chatState.sending = true;
+  document.getElementById('chatSend').disabled = true;
+  try {
+    const res = await fetch(API.ORDERS + '/orders/messages/' + chatState.activeId, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ body }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not send the message.');
+    input.value = ''; // only a message that was sent is removed from the box
+    await openThread(chatState.activeId, false);
+    loadChatList(true);
+  } catch (err) {
+    showApiError(err.message);
+  } finally {
+    chatState.sending = false;
+    document.getElementById('chatSend').disabled = false;
+  }
+});
+// every 10 seconds the list (and the open conversation, if it has something new) is refreshed
+setInterval(() => { if (!document.hidden && document.querySelector('#page-messages.active')) loadChatList(true); }, 10000);
 
 // ===========================================================
 // ACTIVITY (Super Admin only): who did what, newest first
