@@ -501,7 +501,17 @@ app.get('/api/orders/my', verifyCustomerToken, async (req, res) => {
       );
       for (const item of items) (byOrder[item.order_id] = byOrder[item.order_id] || []).push(item);
     }
-    res.json(rows.map((o) => ({ ...o, items: byOrder[o.order_id] || [] })));
+    // the state of the refund request of each order (a tag in the app); if the table does not exist yet, there is none
+    const refundByOrder = {};
+    if (rows.length > 0) {
+      try {
+        const [requests] = await pool.query('SELECT order_id, status FROM refund_requests WHERE order_id IN (?)', [rows.map((o) => o.order_id)]);
+        for (const r of requests) refundByOrder[r.order_id] = r.status;
+      } catch (err) {
+        if (!tableMissing(err)) throw err;
+      }
+    }
+    res.json(rows.map((o) => ({ ...o, items: byOrder[o.order_id] || [], refund_request_status: refundByOrder[o.order_id] || null })));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -524,7 +534,17 @@ app.get('/api/orders/my/:id', verifyCustomerToken, async (req, res) => {
       [req.params.id]
     );
 
-    res.json({ ...order, items });
+    // the refund request of this order (if any), and whether the customer can still send one
+    const refund = await loadRefundRequest(order.order_id);
+    const eligibility = refundEligibility(order, refund);
+    res.json({
+      ...order,
+      items,
+      refund_request: refund.request,
+      refund_eligible: eligibility.ok,
+      refund_deadline: eligibility.deadline ? eligibility.deadline.toISOString() : null,
+      refund_blocked_reason: eligibility.ok ? null : eligibility.why,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -547,6 +567,15 @@ app.get('/api/orders', verifyToken, async (req, res) => {
       LEFT JOIN users u ON o.user_id = u.user_id
       ORDER BY o.order_date DESC
     `);
+    // the orders with a refund request get its state (for the tag, the filter, and the Dashboard)
+    try {
+      const [requests] = await pool.query('SELECT order_id, status FROM refund_requests');
+      const byOrder = {};
+      for (const r of requests) byOrder[r.order_id] = r.status;
+      for (const o of rows) o.refund_request_status = byOrder[o.order_id] || null;
+    } catch (err) {
+      if (!tableMissing(err)) throw err;
+    }
     res.json(rows);
   } catch (err) {
     console.error(err);
@@ -601,7 +630,8 @@ app.get('/api/orders/:id', verifyToken, async (req, res) => {
       [req.params.id]
     );
 
-    res.json({ ...orderRows[0], items: itemRows });
+    const refund = await loadRefundRequest(orderRows[0].order_id);
+    res.json({ ...orderRows[0], items: itemRows, refund_request: refund.request });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Something went wrong on the server.' });
@@ -1619,6 +1649,169 @@ app.put('/api/orders/:id/refunded', verifyToken, requirePermission('orders'), tr
   });
 });
 
+// =====================================================
+// REFUND REQUESTS: after the customer received the order, the customer can ask for a refund of the items with a problem
+// (run migration_refund_requests.sql first)
+// =====================================================
+const REFUND_WINDOW_DAYS = 7; // EDIT DITO: how many days after "Order Received" a request can be sent
+const REFUND_REASONS = {
+  defective: 'Defective item',
+  damaged: 'Damaged on arrival',
+  wrong_item: 'Wrong item received',
+  not_as_described: 'Not as described',
+  missing_parts: 'Missing parts',
+};
+const REFUND_NOT_READY = 'Refund requests are not ready yet. Run migration_refund_requests.sql in MySQL Workbench first.';
+
+function parsePhotos(text) {
+  try {
+    const list = JSON.parse(text || '[]');
+    return Array.isArray(list) ? list.filter((x) => typeof x === 'string') : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+// the request of one order with its items; "ready: false" means the SQL was not run yet
+async function loadRefundRequest(orderId, db = pool) {
+  try {
+    const [rows] = await db.query('SELECT * FROM refund_requests WHERE order_id = ? ORDER BY request_id DESC LIMIT 1', [orderId]);
+    if (rows.length === 0) return { ready: true, request: null };
+    const r = rows[0];
+    const [items] = await db.query(
+      `SELECT ri.order_item_id, ri.quantity, ri.amount, p.product_name, p.image
+       FROM refund_request_items ri
+       JOIN order_items oi ON oi.order_item_id = ri.order_item_id
+       LEFT JOIN products p ON p.product_id = oi.product_id
+       WHERE ri.request_id = ? ORDER BY ri.id`,
+      [r.request_id]
+    );
+    return {
+      ready: true,
+      request: {
+        request_id: r.request_id, order_id: r.order_id, reason: r.reason, reason_label: REFUND_REASONS[r.reason] || r.reason,
+        details: r.details, photos: parsePhotos(r.photos), status: r.status, refund_amount: Number(r.refund_amount),
+        admin_note: r.admin_note, created_at: r.created_at, decided_at: r.decided_at, refunded_at: r.refunded_at,
+        items: items.map((i) => ({ ...i, amount: Number(i.amount) })),
+      },
+    };
+  } catch (err) {
+    if (tableMissing(err)) return { ready: false, request: null };
+    throw err;
+  }
+}
+
+// can the customer send a request for this order now?
+function refundEligibility(order, state) {
+  if (!state.ready) return { ok: false, why: 'Refund requests are not available yet.' };
+  if (state.request) return { ok: false, why: 'You already sent a refund request for this order.' };
+  if (order.status !== 'completed') return { ok: false, why: 'You can ask for a refund after you receive the order.' };
+  if (order.payment_status !== 'paid') return { ok: false, why: 'Only paid orders can be refunded.' };
+  if (!order.received_at) return { ok: true, deadline: null }; // the shop completed it: no start day to count from
+  const deadline = new Date(new Date(order.received_at).getTime() + REFUND_WINDOW_DAYS * 86400000);
+  if (Date.now() > deadline.getTime()) return { ok: false, why: `The ${REFUND_WINDOW_DAYS} days to ask for a refund have passed.`, deadline };
+  return { ok: true, deadline };
+}
+
+// the customer sends the request
+app.post('/api/orders/my/:id/refund-request', verifyCustomerToken, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
+  const body = req.body || {};
+  const reason = String(body.reason || '');
+  if (!REFUND_REASONS[reason]) return res.status(400).json({ error: 'Please choose the reason.' });
+  const details = String(body.details || '').replace(/\r\n/g, '\n').trim();
+  if (details.length < 10) return res.status(400).json({ error: 'Please describe the problem (at least 10 letters).' });
+  if (details.length > 1000) return res.status(400).json({ error: 'The description can have at most 1,000 letters.' });
+  const photos = Array.isArray(body.photos) ? body.photos : [];
+  if (photos.length < 1 || photos.length > 3 || photos.some((u) => typeof u !== 'string' || !/^https:\/\/\S{5,480}$/.test(u))) {
+    return res.status(400).json({ error: 'Please add 1 to 3 photos of the problem.' });
+  }
+  const wanted = Array.isArray(body.items) ? body.items : [];
+  const ids = wanted.map((w) => Number(w && w.order_item_id));
+  if (wanted.length === 0 || ids.some((n) => !Number.isInteger(n) || n <= 0) || new Set(ids).size !== ids.length) {
+    return res.status(400).json({ error: 'Please choose the items with a problem.' });
+  }
+  try {
+    const check = await loadRefundRequest(-1);
+    if (!check.ready) return res.status(503).json({ error: REFUND_NOT_READY });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Something went wrong on the server.' });
+  }
+
+  return inTransaction(res, async (conn) => {
+    const [orders] = await conn.query('SELECT * FROM orders WHERE order_id = ? AND user_id = ? FOR UPDATE', [id, req.customer.userId]);
+    if (orders.length === 0) return fail(404, 'Order not found.');
+    const eligibility = refundEligibility(orders[0], await loadRefundRequest(id, conn));
+    if (!eligibility.ok) return fail(400, eligibility.why);
+
+    const [items] = await conn.query('SELECT order_item_id, quantity, price FROM order_items WHERE order_id = ?', [id]);
+    const byId = new Map(items.map((i) => [Number(i.order_item_id), i]));
+    let amount = 0;
+    const lines = [];
+    for (const w of wanted) {
+      const row = byId.get(Number(w.order_item_id));
+      const quantity = Number(w.quantity);
+      if (!row) return fail(400, 'One of the items is not in this order.');
+      if (!Number.isInteger(quantity) || quantity < 1 || quantity > Number(row.quantity)) return fail(400, 'Please choose a quantity that is not more than you bought.');
+      const line = Math.round(Number(row.price) * quantity * 100) / 100;
+      amount += line;
+      lines.push([row.order_item_id, quantity, line]);
+    }
+    amount = Math.round(amount * 100) / 100;
+
+    const [added] = await conn.query(
+      "INSERT INTO refund_requests (order_id, user_id, reason, details, photos, status, refund_amount, created_at) VALUES (?, ?, ?, ?, ?, 'requested', ?, NOW())",
+      [id, req.customer.userId, reason, details, JSON.stringify(photos), amount]
+    );
+    for (const [itemId, quantity, line] of lines) {
+      await conn.query('INSERT INTO refund_request_items (request_id, order_item_id, quantity, amount) VALUES (?, ?, ?, ?)', [added.insertId, itemId, quantity, line]);
+    }
+    return {
+      ok: true,
+      status: 201,
+      body: { message: 'Your refund request was sent. The shop will review it.', request_id: added.insertId, refund_amount: amount },
+      after: () => notifyOrder(id, 'refund_request', REFUND_REASONS[reason]),
+    };
+  });
+});
+
+// ADMIN: answer a request (approve, reject with a reason) or mark it as refunded (the money was sent)
+function answerRefund(req, res, { from, to, noteRequired, done }) {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid order.' });
+  const note = String((req.body || {}).note || '').trim();
+  if (noteRequired && note.length < 3) return res.status(400).json({ error: 'Please write the reason, so the customer can read it.' });
+  if (note.length > 500) return res.status(400).json({ error: 'The note can have at most 500 letters.' });
+  return inTransaction(res, async (conn) => {
+    let rows;
+    try {
+      [rows] = await conn.query('SELECT * FROM refund_requests WHERE order_id = ? FOR UPDATE', [id]);
+    } catch (err) {
+      if (tableMissing(err)) return fail(503, REFUND_NOT_READY);
+      throw err;
+    }
+    if (rows.length === 0) return fail(404, 'This order has no refund request.');
+    if (rows[0].status !== from) return fail(400, from === 'requested' ? 'This request was already answered.' : 'Approve the request first.');
+    if (to === 'refunded') {
+      await conn.query("UPDATE refund_requests SET status = 'refunded', refunded_at = NOW() WHERE request_id = ?", [rows[0].request_id]);
+    } else {
+      await conn.query(`UPDATE refund_requests SET status = '${to}', decided_by = ?, decided_at = NOW(), admin_note = ? WHERE request_id = ?`, [req.admin.adminId || null, note || null, rows[0].request_id]);
+    }
+    return succeed({ message: done });
+  });
+}
+
+app.put('/api/orders/:id/refund-request/approve', verifyToken, requirePermission('orders'), track('order.refund_request', { lookup: lookupOrderCode, describe: (req, code) => (code ? `Approved the refund request of order ${code}` : null), entity: orderEntity }), (req, res) =>
+  answerRefund(req, res, { from: 'requested', to: 'approved', noteRequired: false, done: 'The request was approved. Send the money, then mark it as refunded.' }));
+
+app.put('/api/orders/:id/refund-request/reject', verifyToken, requirePermission('orders'), track('order.refund_request', { lookup: lookupOrderCode, describe: (req, code) => (code ? `Rejected the refund request of order ${code}` : null), entity: orderEntity }), (req, res) =>
+  answerRefund(req, res, { from: 'requested', to: 'rejected', noteRequired: true, done: 'The request was rejected.' }));
+
+app.put('/api/orders/:id/refund-request/refunded', verifyToken, requirePermission('orders'), track('order.refund_request', { lookup: lookupOrderCode, describe: (req, code) => (code ? `Marked the refund of order ${code} (after the request) as sent` : null), entity: orderEntity }), (req, res) =>
+  answerRefund(req, res, { from: 'approved', to: 'refunded', noteRequired: false, done: 'The refund was marked as sent.' }));
+
 // ---------- unpaid GCash orders are cancelled after 30 minutes and their stock goes back ----------
 async function cancelUnpaidOrder(orderId) {
   let conn;
@@ -1682,7 +1875,7 @@ if (expiryTimer.unref) expiryTimer.unref();
 // =====================================================
 const LOW_STOCK_LIMIT = 10; // the same rule as the low stock list: fewer than 10 left
 const NOTIFICATION_PERMISSIONS = {
-  new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders',
+  new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders', refund_request: 'orders',
   low_stock: 'inventory', new_review: 'reviews',
   product_approval: 'products', product_decision: 'products', // "waiting for approval" is for the Super Admin only (see below)
   new_message: 'orders',
@@ -1725,6 +1918,7 @@ async function notifyOrder(orderId, kind, extra) {
       payment: [`Payment received · ${code}`, `${who} paid ${total} through GCash for ${items}`],
       cancel_request: [`Cancel request · ${code}`, `${who} wants to cancel${extra ? ` (${extra})` : ''}: ${items}`],
       order_cancelled: [`Order cancelled · ${code}`, `${who} cancelled ${items}${extra ? ` (${extra})` : ''}`],
+      refund_request: [`Refund request · ${code}`, `${who} asks for a refund${extra ? ` (${extra})` : ''}: ${items}`],
       refund: [`Refund needed · ${code}`, `Refund ${total} to ${who} through GCash for the cancelled order: ${items}`],
     };
     if (!texts[kind]) return;
