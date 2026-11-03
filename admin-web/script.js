@@ -473,6 +473,8 @@ function renderAttention(orders, lowStock, pendingReviews, products, unreadMessa
     { n: isSuper ? 0 : productCount('rejected'), go: 'products', data: { approval: 'rejected' }, one: 'product was rejected and needs a change', many: 'products were rejected and need a change', tone: 'red' },
     { n: unreadMessages || 0, go: 'messages', data: {}, one: 'unread message from a customer', many: 'unread messages from customers', tone: 'pink' },
     { n: count(o => o.cancel_request_status === 'requested'), go: 'orders', data: { status: 'cancel_requests' }, one: 'customer asks to cancel an order', many: 'customers ask to cancel an order', tone: 'red' },
+    { n: count(o => o.refund_request_status === 'requested'), go: 'orders', data: { status: 'refund_requests' }, one: 'customer asks for a refund', many: 'customers ask for a refund', tone: 'red' },
+    { n: count(o => o.refund_request_status === 'approved'), go: 'orders', data: { status: 'refund_requests' }, one: 'approved refund waits to be sent', many: 'approved refunds wait to be sent', tone: 'amber' },
     { n: count(o => o.payment_status === 'refund_pending'), go: 'orders', data: { payment: 'refund_pending' }, one: 'refund to give back to a customer', many: 'refunds to give back to customers', tone: 'red' },
     { n: count(o => o.status === 'pending' && !(o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment')), go: 'orders', data: { status: 'pending', payment: 'ready' }, one: 'new order to process', many: 'new orders to process', tone: 'pink' },
     { n: count(o => o.status === 'processing'), go: 'orders', data: { status: 'processing' }, one: 'order to ship', many: 'orders to ship', tone: 'pink' },
@@ -1505,6 +1507,7 @@ function currentOrderFilters() {
 
 function orderMatches(o, f) {
   if (f.status === 'cancel_requests') { if (o.cancel_request_status !== 'requested') return false; }
+  else if (f.status === 'refund_requests') { if (!['requested', 'approved'].includes(o.refund_request_status)) return false; } // asked, or approved and not sent yet
   else if (f.status !== 'all' && o.status !== f.status) return false;
   if (f.payment === 'ready' && o.payment_method === 'gcash' && o.payment_status === 'awaiting_payment') return false; // not waiting for its payment
   if (f.payment === 'cod' && o.payment_method !== 'cod') return false;
@@ -1542,6 +1545,7 @@ function updateOrderStatusCounts() {
     completed: `Completed (${count(o => o.status === 'completed')})`,
     cancelled: `Cancelled (${count(o => o.status === 'cancelled')})`,
     cancel_requests: `Cancel requests (${count(o => o.cancel_request_status === 'requested')})`,
+    refund_requests: `Refund requests (${count(o => ['requested', 'approved'].includes(o.refund_request_status))})`,
   };
   Array.from(box.options).forEach(option => { option.textContent = labels[option.value]; });
 }
@@ -1580,6 +1584,15 @@ function renderOrders() {
         ? `<div style="${NOTE_STYLE}">Shipped via <b>${orderEsc(o.courier)}</b>${o.tracking_number ? ' · ' + orderEsc(o.tracking_number) : ''}
             ${o.status === 'shipped' ? `<button class="icon-btn" onclick="openShipModal(${o.order_id}, true)">Edit tracking</button>` : ''}</div>`
         : '';
+      // the refund request of the customer (after receiving the order): what it needs, and a button to open it
+      const refundStates = {
+        requested: ['The customer asks for a refund', '#b9770e', 'Review request'],
+        approved: ['Refund approved: send the money', '#2874a6', 'Review request'],
+        refunded: ['Refund sent to the customer', '#666', 'View request'],
+        rejected: ['Refund request was rejected', '#666', 'View request'],
+      };
+      const rs = refundStates[o.refund_request_status];
+      const refundNote = rs ? `<div style="${NOTE_STYLE} color:${rs[1]};">${rs[0]}<div style="margin-top:4px;"><button class="icon-btn" onclick="openOrderDetails(${o.order_id})">${rs[2]}</button></div></div>` : '';
       const refundButton = o.payment_status === 'refund_pending'
         ? `<div style="margin-top:4px;"><button class="icon-btn" onclick="markRefunded(${o.order_id})">Mark as refunded</button></div>`
         : '';
@@ -1597,7 +1610,7 @@ function renderOrders() {
         <td><button type="button" class="link-btn order-code" onclick="openOrderDetails(${o.order_id})">${orderEsc(o.order_code || '#' + o.order_id)}</button>${o.items_summary ? `<div class="muted-small">${orderEsc(o.items_summary)}</div>` : ''}</td>
         <td>${o.user_id ? `<button type="button" class="link-btn" onclick="openCustomerDetails(${o.user_id})">${orderEsc(o.customer_name || 'N/A')}</button>` : orderEsc(o.customer_name || 'N/A')}</td>
         <td>₱${Number(o.total_amount).toLocaleString()}</td>
-        <td>${statusControl}${paymentLine(o)}${shipNote}${note}${refundButton}${cancelButton}${slipButton}</td>
+        <td>${statusControl}${paymentLine(o)}${shipNote}${note}${refundNote}${refundButton}${cancelButton}${slipButton}</td>
         <td>${new Date(o.order_date).toLocaleDateString()}</td>
       </tr>`;
     }).join('') || `<tr><td colspan="5">${allOrders.length ? 'No orders match these filters.' : 'No orders yet.'}</td></tr>`;
@@ -2116,7 +2129,7 @@ async function deleteCustomer(userId, name) {
 // A notification glows until THIS admin opens it. Pressing one goes straight to the order / product.
 // ===========================================================
 let notificationItems = [];
-const NOTIF_PAGES = { new_message: 'messages', new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders', low_stock: 'inventory', new_review: 'reviews', product_approval: 'products', product_decision: 'products' };
+const NOTIF_PAGES = { new_message: 'messages', new_order: 'orders', payment: 'orders', cancel_request: 'orders', order_cancelled: 'orders', refund: 'orders', refund_request: 'orders', low_stock: 'inventory', new_review: 'reviews', product_approval: 'products', product_decision: 'products' };
 const NOTIF_TABLES = { orders: 'ordersTableBody', inventory: 'inventoryTableBody', reviews: 'reviewsTableBody', products: 'productsTableBody' };
 
 function timeAgo(value) {
@@ -2272,6 +2285,62 @@ function backButton(back) {
   return back ? '<button type="button" class="back-link" id="detailBack">← Back</button>' : '';
 }
 
+// ----- REFUND REQUESTS (the customer asks for a refund after receiving the order) -----
+const REFUND_STATUS_WORDS = { requested: 'Refund requested', approved: 'Refund approved', refunded: 'Refunded', rejected: 'Rejected' };
+const REFUND_REJECT_REASONS = ['The photos do not show a problem with the item', 'The item looks used or damaged by the customer', 'The request is not covered by the rules of the shop', 'Other'];
+
+// a small tag under a product of the order, if the customer asked a refund for it
+function refundTag(request, item) {
+  const asked = request ? (request.items || []).find(r => Number(r.order_item_id) === Number(item.order_item_id)) : null;
+  if (!asked) return '';
+  const part = Number(asked.quantity) < Number(item.quantity) ? ` · ${asked.quantity} of ${item.quantity}` : '';
+  return `<span class="badge badge-refund-${orderEsc(request.status)}">${orderEsc(REFUND_STATUS_WORDS[request.status] || request.status)}${part}</span>`;
+}
+
+function refundCard(o) {
+  const rr = o.refund_request;
+  if (!rr) return '';
+  const small = (url) => (url.includes('/image/upload/') ? url.replace('/image/upload/', '/image/upload/c_fill,w_220,h_220,q_auto/') : url);
+  let actions = '';
+  if (rr.status === 'requested') {
+    actions = `<div class="refund-actions"><button type="button" class="primary-btn" data-refund="approve">Approve</button><button type="button" class="secondary-btn danger" data-refund="reject">Reject</button></div>`;
+  } else if (rr.status === 'approved') {
+    actions = `<div class="detail-note">Send ${peso(rr.refund_amount)} to the customer${o.payment_method === 'gcash' ? ' through GCash' : ' (ask the customer for a GCash number or a bank account in the Messages page)'}, then press the button.</div>
+      <div class="refund-actions"><button type="button" class="primary-btn" data-refund="sent">Mark as refunded</button></div>`;
+  } else if (rr.status === 'refunded') {
+    actions = `<div class="detail-note">The refund was sent${rr.refunded_at ? ' on ' + orderEsc(new Date(rr.refunded_at).toLocaleDateString()) : ''}.</div>`;
+  }
+  return `
+    <div class="detail-card refund-card">
+      <div class="detail-label">Refund request</div>
+      <div class="refund-head">
+        <span class="badge badge-refund-${orderEsc(rr.status)}">${orderEsc(REFUND_STATUS_WORDS[rr.status] || rr.status)}</span>
+        <b>${peso(rr.refund_amount)}</b>
+        <span class="muted-small">${orderEsc(new Date(rr.created_at).toLocaleString())}</span>
+      </div>
+      <div class="detail-line"><span>Reason</span><b>${orderEsc(rr.reason_label)}</b></div>
+      <div class="refund-text">${orderEsc(rr.details)}</div>
+      <div class="refund-photos">${(rr.photos || []).map(url => `<button type="button" class="refund-photo" data-photo="${orderEsc(url)}" aria-label="Open the photo"><img src="${orderEsc(small(url))}" alt="Photo of the problem"></button>`).join('')}</div>
+      ${rr.admin_note ? `<div class="detail-note">${rr.status === 'rejected' ? 'Reason given to the customer' : 'Note'}: ${orderEsc(rr.admin_note)}</div>` : ''}
+      ${actions}
+    </div>`;
+}
+
+async function handleRefundButton(kind, orderId, back) {
+  const refresh = () => { loadOrders(); loadNotifications(); openOrderDetails(orderId, back); };
+  if (kind === 'approve') {
+    if (!(await askConfirm('Approve this refund request? After that, send the money to the customer and mark it as refunded.', 'Approve'))) return;
+    if (await sendOrderAction('/orders/' + orderId + '/refund-request/approve', {})) refresh();
+  } else if (kind === 'reject') {
+    openReasonModal('Reject the refund request', 'The order stays as it is. The customer will read this reason in the app.', REFUND_REJECT_REASONS, 'Reject request', async (reason) => {
+      if (await sendOrderAction('/orders/' + orderId + '/refund-request/reject', { note: reason })) { closeModal(); refresh(); }
+    });
+  } else if (kind === 'sent') {
+    if (!(await askConfirm('Mark this refund as sent? Do this after you sent the money to the customer.', 'Mark as refunded'))) return;
+    if (await sendOrderAction('/orders/' + orderId + '/refund-request/refunded', {})) refresh();
+  }
+}
+
 async function openOrderDetails(orderId, back) {
   showDetails('Order details', '<p class="detail-loading">Loading...</p>');
   try {
@@ -2286,6 +2355,7 @@ async function openOrderDetails(orderId, back) {
         <div class="detail-item-main">
           <button type="button" class="link-btn" data-product="${orderEsc(i.product_name || '')}">${orderEsc(i.product_name || 'Removed product')}</button>
           <div class="muted-small">${i.quantity} × ${peso(i.price)}</div>
+          ${refundTag(o.refund_request, i)}
         </div>
         <div class="detail-item-total">${peso(i.price * i.quantity)}</div>
       </div>`).join('') || '<p class="muted-small">No items.</p>';
@@ -2340,12 +2410,15 @@ async function openOrderDetails(orderId, back) {
           <div class="detail-line detail-total"><span>Total</span><b>${peso(o.total_amount)}</b></div>
         </div>
       </div>
+      ${refundCard(o)}
       <div class="modal-actions">
         ${o.status !== 'cancelled' ? `<button type="button" class="secondary-btn" onclick="printPackingSlip(${o.order_id})">Print slip</button>` : ''}
         <button type="button" class="primary-btn" onclick="closeModal()">Close</button>
       </div>`);
 
     if (back) document.getElementById('detailBack').addEventListener('click', back);
+    modalForm.querySelectorAll('[data-photo]').forEach(btn => btn.addEventListener('click', () => openMediaViewer(btn.dataset.photo, 'image')));
+    modalForm.querySelectorAll('[data-refund]').forEach(btn => btn.addEventListener('click', () => handleRefundButton(btn.dataset.refund, o.order_id, back)));
     modalForm.querySelectorAll('[data-product]').forEach(btn => btn.addEventListener('click', () => {
       closeModal();
       history.replaceState(null, '', '#products');

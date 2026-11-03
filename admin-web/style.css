@@ -391,7 +391,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .notif-icon[data-type="payment"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h15a1 1 0 011 1v10a1 1 0 01-1 1H5a2 2 0 01-2-2V6a2 2 0 012-2h12'/%3E%3Ccircle cx='16' cy='13' r='1.2'/%3E%3C/svg%3E"); --tone: #1e8e4f; --tint: #e8f8ee; }
 .notif-icon[data-type="cancel_request"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7v5l3 2'/%3E%3C/svg%3E"); --tone: #b7791f; --tint: #fff4e0; }
 .notif-icon[data-type="order_cancelled"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E"); --tone: #cf3a2c; --tint: #fdecea; }
-.notif-icon[data-type="refund"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 14L4 9l5-5'/%3E%3Cpath d='M4 9h10a6 6 0 010 12h-3'/%3E%3C/svg%3E"); --tone: #cf3a2c; --tint: #fdecea; }
+.notif-icon[data-type="refund"], .notif-icon[data-type="refund_request"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 14L4 9l5-5'/%3E%3Cpath d='M4 9h10a6 6 0 010 12h-3'/%3E%3C/svg%3E"); --tone: #cf3a2c; --tint: #fdecea; }
 .notif-icon[data-type="low_stock"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 8l-9-5-9 5v8l9 5 9-5V8z'/%3E%3Cpath d='M3 8l9 5 9-5M12 13v8'/%3E%3C/svg%3E"); --tone: #c2570c; --tint: #fff0e0; }
 .notif-icon[data-type="new_review"] { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9L12 3z'/%3E%3C/svg%3E"); --tone: #c99100; --tint: #fff8e0; }
 .simple-list li.notif-item span { text-align: left; }
@@ -792,3 +792,19 @@ td .stock-pill + .muted-small { margin-top: 4px; }
 .chat-list-head b { font-size: 15px; }
 .chat-list-head .secondary-btn { height: 36px; padding: 0 16px; }
 @media (max-width: 900px) { .chat-layout { height: auto; } .chat-list-wrap { max-height: 300px; } }
+
+/* ---------------- REFUND REQUESTS (in the details of an order, and the tags) ---------------- */
+.badge[class*="badge-refund-"] { text-transform: none; }
+.badge-refund-requested { background: #fff3d6; color: #b9770e; }
+.badge-refund-approved { background: #e3f0fb; color: #2874a6; }
+.badge-refund-refunded { background: #e8f7ee; color: #1e8e4f; }
+.badge-refund-rejected { background: #fdeceb; color: #cf3a2c; }
+.detail-item .badge[class*="badge-refund-"] { margin-top: 6px; }
+.refund-card { border-color: rgba(252, 64, 140, 0.35); }
+.refund-head { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 8px 0 10px; }
+.refund-head b { font-size: 17px; }
+.refund-text { white-space: pre-wrap; overflow-wrap: anywhere; background: #fbf8fa; border: 1px solid #f0e8ee; border-radius: 12px; padding: 12px 14px; margin: 10px 0; font-size: 14px; line-height: 1.5; }
+.refund-photos { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0; }
+.refund-photo { border: 0; padding: 0; background: none; cursor: zoom-in; border-radius: 14px; overflow: hidden; }
+.refund-photo img { width: 110px; height: 110px; object-fit: cover; display: block; border-radius: 14px; border: 1px solid #eee; }
+.refund-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
