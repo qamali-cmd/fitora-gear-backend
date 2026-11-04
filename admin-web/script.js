@@ -2816,7 +2816,12 @@ async function openThread(threadId, quiet) {
       const day = new Date(m.created_at).toDateString();
       const separator = day !== lastDay ? `<div class="chat-day">${orderEsc(day === new Date().toDateString() ? 'Today' : new Date(m.created_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }))}</div>` : '';
       lastDay = day;
-      return `${separator}<div class="chat-bubble ${m.sender === 'admin' ? 'admin' : 'customer'}"><div class="chat-text">${orderEsc(m.body)}</div><div class="chat-meta">${m.sender === 'admin' && m.admin_name ? orderEsc(m.admin_name) + ' · ' : ''}${orderEsc(new Date(m.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))}</div></div>`;
+      // who wrote it: the name of the customer, or the name of the person of the shop who answered (with a small photo and a label)
+      const fromShop = m.sender === 'admin';
+      const who = fromShop ? (m.admin_name || 'Fitora Gear') : data.customer_name;
+      const avatar = fromShop ? avatarPicture(null, who) : avatarPicture(data.profile_photo, data.customer_name);
+      const kind = fromShop ? 'admin' : 'customer';
+      return `${separator}<div class="chat-msg ${kind}">${avatar}<div class="chat-bubble ${kind}"><div class="chat-who"><b>${orderEsc(who)}</b><span class="chat-role">${fromShop ? 'Shop' : 'Customer'}</span></div><div class="chat-text">${orderEsc(m.body)}</div><div class="chat-meta">${orderEsc(new Date(m.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))}</div></div></div>`;
     }).join('') || '<p class="chat-note">No messages yet.</p>';
     if (!quiet || atBottom) list.scrollTop = list.scrollHeight;
     const thread = chatState.threads.find(t => t.thread_id === threadId);

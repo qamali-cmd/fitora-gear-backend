@@ -808,3 +808,15 @@ td .stock-pill + .muted-small { margin-top: 4px; }
 .refund-photo { border: 0; padding: 0; background: none; cursor: zoom-in; border-radius: 14px; overflow: hidden; }
 .refund-photo img { width: 110px; height: 110px; object-fit: cover; display: block; border-radius: 14px; border: 1px solid #eee; }
 .refund-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+
+/* ---------------- MESSAGES: who wrote each message (name, photo, and label) ---------------- */
+.chat-msg { display: flex; align-items: flex-end; gap: 10px; max-width: 82%; }
+.chat-msg.customer { align-self: flex-start; }
+.chat-msg.admin { align-self: flex-end; flex-direction: row-reverse; }
+.chat-msg .avatar { width: 36px; height: 36px; font-size: 13px; }
+.chat-msg .chat-bubble { align-self: auto; max-width: none; min-width: 0; }
+.chat-who { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; font-size: 12.5px; }
+.chat-who b { font-weight: 800; }
+.chat-role { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; padding: 1px 8px; border-radius: 8px; background: #eef1f5; color: #566273; }
+.chat-bubble.admin .chat-role { background: rgba(255, 255, 255, 0.26); color: #fff; }
+.chat-bubble.admin .chat-who { justify-content: flex-end; }
